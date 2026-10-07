@@ -1,0 +1,25 @@
+{
+  "name": "glean-auth",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node server.mjs",
+    "build": "vite build && node scripts/write-pwa-assets.mjs",
+    "start": "npm run build && node scripts/start.mjs",
+    "check": "node --check server.mjs && node --check server/security.mjs && node --check server/realtime.mjs && node --check server/schoolSchedule.mjs && node --check server/push.mjs && node --check server/scheduledNotifications.mjs && node --check server/files.mjs && node --check src/app/agreements.js && node --check src/app/apiClient.js && node --check src/app/apiRoutes.js && node --check src/app/serverCache.js && node --check src/app/liveMessages.js && node --check src/app/accessibility.js && node --check src/app/e2ee.js && node --check src/app/dmApi.js && node --check src/app/developerMode.js && node --check src/app/invite.js && node --check src/app/presence.js && node --check src/app/pwa.js && node --check src/app/grade.js && node --check src/app/laredoSchools.js && node --check src/app/programs.js && node --check src/app/discordUsername.js && node --check src/app/username.js && node --check src/features/dm/banner.js && node --check src/features/dm/nameFonts.js && node --check src/features/dm/nameStyle.js && node --check src/features/dm/emojiData.js && node --check public/admin.js && node --check public/sw.js && node --check scripts/write-pwa-assets.mjs && node --check scripts/api-client-smoke.mjs && node --check scripts/developer-mode-smoke.mjs && node --check scripts/live-messages-smoke.mjs && node --check scripts/realtime-client-smoke.mjs && node --check scripts/scheduled-notifications-smoke.mjs && node --check scripts/school-schedule-smoke.mjs && node --check scripts/security-smoke.mjs && node --check scripts/agreements-smoke.mjs && node --check scripts/admin-access-smoke.mjs",
+    "test": "node scripts/device-link-smoke.mjs && node scripts/developer-mode-smoke.mjs && node scripts/api-client-smoke.mjs && node scripts/live-messages-smoke.mjs && node scripts/realtime-client-smoke.mjs && node scripts/scheduled-notifications-smoke.mjs && node scripts/school-schedule-smoke.mjs && node scripts/security-smoke.mjs && node scripts/moderation-smoke.mjs && node scripts/agreements-smoke.mjs && node scripts/admin-access-smoke.mjs && node scripts/server-smoke.mjs && node scripts/official-announcements-smoke.mjs"
+  },
+  "dependencies": {
+    "@samasante/liquid-glass": "^0.1.1",
+    "@vitejs/plugin-react": "latest",
+    "busboy": "^1.6.0",
+    "liquid-gooey": "^0.2.2",
+    "qrcode": "^1.5.4",
+    "react": "latest",
+    "react-dom": "latest",
+    "sharp": "^0.35.5",
+    "vite": "latest",
+    "web-push": "^3.6.7"
+  }
+}

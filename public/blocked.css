@@ -1,0 +1,47 @@
+* { box-sizing: border-box; }
+html, body { min-height: 100%; }
+body {
+  margin: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  color: #f4f7fb;
+  background: #07111d;
+  font: 16px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+.blocked-card {
+  width: min(100%, 520px);
+  padding: clamp(24px, 6vw, 40px);
+  border: 1px solid #263a50;
+  border-radius: 18px;
+  background: #0d1b2a;
+  text-align: center;
+}
+.blocked-mark {
+  display: grid;
+  width: 56px;
+  height: 56px;
+  margin: 0 auto 20px;
+  place-items: center;
+  border-radius: 14px;
+  background: #0787ee;
+  color: white;
+  font-size: 34px;
+  font-weight: 750;
+}
+h1 { margin: 0; font-size: clamp(26px, 7vw, 34px); }
+.blocked-copy { margin: 10px 0 26px; color: #b7c5d4; }
+.countdown {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+.countdown-unit {
+  padding: 14px 8px 12px;
+  border: 1px solid #2b4560;
+  border-radius: 12px;
+  background: #11243a;
+}
+.countdown-value { display: block; font-variant-numeric: tabular-nums; font-size: clamp(30px, 9vw, 42px); font-weight: 700; line-height: 1.15; }
+.countdown-label { color: #a8bbcd; font-size: 13px; }
+.blocked-footnote { margin: 22px 0 0; color: #92a5b8; font-size: 13px; }

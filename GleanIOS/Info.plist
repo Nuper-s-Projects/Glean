@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSSupportsLiveActivities</key><true/>
+	<key>CFBundleURLTypes</key>
+	<array><dict>
+		<key>CFBundleURLName</key><string>com.glean.ios</string>
+		<key>CFBundleURLSchemes</key><array><string>glean</string></array>
+	</dict></array>
+	<key>CFBundleDisplayName</key>
+	<string>Glean</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.glean.ios</string>
+	<key>CFBundleName</key>
+	<string>Glean</string>
+	<key>CFBundleShortVersionString</key>
+	<string>27.2</string>
+	<key>CFBundleVersion</key>
+	<string>27.2</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Glean uses your microphone for private voice calls.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Glean uses your camera for video calls and scanning secure device connection QR codes.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+		<string>screen-capture</string>
+	</array>
+	<key>UILaunchScreen</key>
+	<dict/>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+</dict>
+</plist>

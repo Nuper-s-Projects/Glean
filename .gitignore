@@ -1,0 +1,26 @@
+data/
+dist/
+node_modules/
+
+# Local secrets and environment overrides
+.env
+.env.*
+!.env.example
+
+# macOS and local editor metadata
+.DS_Store
+*.xcuserstate
+GleanIOS/**/xcuserdata/
+
+# Generated Xcode output
+GleanIOS/**/DerivedData/
+GleanIOS/**/build/
+
+# Local infrastructure and backup operations, not app source
+scripts/glean-s3-backup.service
+scripts/glean-s3-backup.sh
+scripts/glean-s3-backup.timer
+scripts/tune-origin.sh
+
+# Standalone demo artifact, not part of the shipped app
+/glean-loop-demo.html

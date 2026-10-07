@@ -1,0 +1,14 @@
+import Foundation
+
+enum NativeCatalog {
+    struct Choice: Decodable, Identifiable { let id: String; let name: String }
+    private struct Catalog: Decodable { let schools: [Choice]; let grades: [Choice] }
+    private static let source = #"{"schools":[{"id":"united-hs","name":"United High School"},{"id":"united-hs-9","name":"United 9th Grade Campus"},{"id":"alexander-hs","name":"John B. Alexander High School"},{"id":"alexander-hs-9","name":"Alexander 9th Grade Campus"},{"id":"lbj-hs","name":"Lyndon B. Johnson High School"},{"id":"lbj-hs-9","name":"LBJ 9th Grade Campus"},{"id":"united-south-hs","name":"United South High School"},{"id":"united-south-hs-9","name":"United South 9th Grade Campus"},{"id":"step-academy","name":"STEP Academy"},{"id":"martin-hs","name":"Raymond & Tirza Martin High School"},{"id":"nixon-hs","name":"J.W. Nixon High School"},{"id":"cigarroa-hs","name":"Dr. Leonides G. Cigarroa High School"},{"id":"garcia-echs","name":"Hector J. Garcia Early College High School"},{"id":"vmt-magnet","name":"Vidal M. Treviño Magnet"},{"id":"lara-academy","name":"F.S. Lara Academy"},{"id":"harmony-laredo","name":"Harmony Science Academy – Laredo"},{"id":"united-ms","name":"United Middle School"},{"id":"united-ms-6","name":"United 6th Grade Campus"},{"id":"clark-ms","name":"Clark Middle School"},{"id":"lbv-ms","name":"Lamar Bruni Vergara Middle School"},{"id":"trautmann-ms","name":"Trautmann Middle School"},{"id":"los-obispos-ms","name":"Los Obispos Middle School"},{"id":"washington-ms","name":"George Washington Middle School"},{"id":"united-south-ms","name":"United South Middle School"},{"id":"garcia-ms","name":"Salvador Garcia Middle School"},{"id":"herrera-ms","name":"Elias Herrera Middle School"},{"id":"ramirez-ms","name":"Juan R. Ramirez Middle School"},{"id":"perales-ms","name":"Raul Perales Middle School"},{"id":"molina-ms","name":"Ricardo Molina Middle School"},{"id":"gonzalez-ms","name":"Antonio Gonzalez Middle School"},{"id":"christen-ms","name":"Louis J. Christen Middle School"},{"id":"lamar-ms","name":"Mirabeau B. Lamar Middle School"},{"id":"memorial-ms","name":"Memorial Middle School"},{"id":"cigarroa-ms","name":"Dr. Joaquin G. Cigarroa Middle School"},{"id":"no_response","name":"I wish not to respond"}],"grades":[{"id":"below_hs","name":"Below High School"},{"id":"9","name":"9th grade"},{"id":"10","name":"10th grade"},{"id":"11","name":"11th grade"},{"id":"12","name":"12th grade"},{"id":"no_response","name":"I wish not to respond"}]}"#
+    private static let values = try! JSONDecoder().decode(Catalog.self, from: Data(source.utf8))
+    static var schools: [Choice] { values.schools }
+    static var grades: [Choice] { values.grades }
+    static let programs = [
+        Choice(id: "magnet", name: "MAGNET"),
+        Choice(id: "laredo-college", name: "Laredo College"),
+    ]
+}
