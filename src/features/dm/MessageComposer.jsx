@@ -9,7 +9,7 @@ import { Avatar } from './DmPrimitives';
 import { useImagePreview } from './ImagePreview';
 import { canRecordVoice, pickRecorderType, voiceFileFromBlob, VOICE_MAX_MS } from './voiceNote';
 import { apiRequest } from '../../app/apiClient';
-import { isIPhoneDevice, normalizeAccessibility } from '../../app/accessibility';
+import { normalizeAccessibility } from '../../app/accessibility';
 
 const MAX_ATTACHMENTS = 10;
 const MAX_ATTACHMENT_BYTES = 2 * 1024 * 1024 * 1024;
@@ -378,11 +378,9 @@ export default function MessageComposer({
   const [menuMounted, setMenuMounted] = useState(false);
   const [gifOpen, setGifOpen] = useState(false);
   const [pollError, setPollError] = useState('');
-  const isIPhone = isIPhoneDevice();
   const glassSettings = normalizeAccessibility(accessibility);
   const glassFrost = glassSettings.glassFrost;
   const composerGlassOptics = glassOptics(glassFrost, glassSettings.glassDepth, glassSettings.glassRefraction);
-  const ComposerSurface = isIPhone ? 'div' : Glass;
   const sessionRef = useRef(null);
   const menuCloseTimer = useRef(null);
   const menuOpenFrame = useRef(0);
@@ -705,10 +703,11 @@ export default function MessageComposer({
   };
 
   return (
-    <ComposerSurface
-      className={`dm-composer${recording ? ' is-recording' : ''}${isIPhone ? ' is-iphone-backdrop' : ''}`}
-      style={{ display: 'flex', '--dm-composer-opacity': isIPhone ? '50%' : `${24 + glassFrost * 0.52}%` }}
-      {...(isIPhone ? {} : { radius: 26, optics: composerGlassOptics })}
+    <Glass
+      className={`dm-composer${recording ? ' is-recording' : ''}`}
+      style={{ display: 'flex', '--dm-composer-opacity': `${24 + glassFrost * 0.52}%` }}
+      radius={26}
+      optics={composerGlassOptics}
     >
     <form className={`dm-composer-form${recording ? ' is-recording' : ''}`} onSubmit={handleSubmit} onBlur={onBlur} onDragOver={onDragOver} onDrop={onDrop}>
       {replyTo ? (
@@ -852,7 +851,7 @@ export default function MessageComposer({
         </div>
       ) : null}
     </form>
-    </ComposerSurface>
+    </Glass>
   );
 }
 

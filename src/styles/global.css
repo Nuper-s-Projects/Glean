@@ -863,7 +863,6 @@ label.glean-btn input {
 .dm-composer { position: absolute; z-index: 20; right: clamp(16px, 3vw, 36px); bottom: 18px; left: clamp(16px, 3vw, 36px); display: flex; min-height: 52px; margin: 0; padding: 6px 6px 6px 10px; background: color-mix(in srgb, var(--page-background) var(--dm-composer-opacity, 50%), transparent); border: 1px solid color-mix(in srgb, var(--dm-border) 45%, transparent); border-radius: 26px; box-shadow: 0 4px 18px rgba(0, 0, 0, .2); }
 .dm-composer[data-liquid-glass]::after, .dm-glass-live-preview[data-liquid-glass]::after { position: absolute; z-index: 2; inset: 0; padding: 2px; border-radius: inherit; background: transparent; content: ''; pointer-events: none; -webkit-backdrop-filter: blur(4px) saturate(1.45) brightness(1.08); backdrop-filter: blur(4px) saturate(1.45) brightness(1.08); -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor; mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); mask-composite: exclude; }
 .dm-composer[data-liquid-glass]::after { border-radius: inherit; }
-.dm-composer.is-iphone-backdrop { background: color-mix(in srgb, var(--page-background) 50%, transparent); -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); }
 .dm-composer:has(.dm-selected-files), .dm-composer:has(.dm-poll-builder) { min-height: 0; padding: 10px 10px 8px; border-radius: 26px; }
 .dm-composer-form { position: relative; display: flex; flex: 1 1 auto; flex-direction: column; gap: 8px; min-width: 0; min-height: 38px; margin: 0; padding: 0; background: transparent; border: 0; }
 .dm-composer-typing { display: flex; min-height: 18px; align-items: center; padding: 0 8px; color: var(--muted-text); font-size: 11px; }
@@ -1352,7 +1351,6 @@ label.glean-btn input {
 .dm-glass-live-preview small { display: block; margin-top: 3px; color: color-mix(in srgb, var(--text) 76%, transparent); font-size: 10px; font-weight: 500; }
 .dm-glass-live-preview > * { position: relative; z-index: 1; }
 .dm-glass-preview-hint { margin: 10px 0 0; color: var(--muted-text); font-size: 11px; line-height: 1.45; }
-.dm-glass-iphone-preview { display: grid; min-height: 74px; place-items: center; color: var(--text); font-size: 13px; font-weight: 600; background: color-mix(in srgb, var(--page-background) 44%, transparent); -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); }
 .dm-accessibility-save { min-height: 20px; margin-top: 30px; color: var(--muted-text); font-size: 12px; }
 .dm-accessibility-settings .dm-settings-error { margin-top: 12px; }
 .dm-accessibility-motion { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 0; border-top: 1px solid var(--dm-border); }
@@ -3368,20 +3366,11 @@ button.dm-file-attachment:disabled { cursor: default; }
 }
 .dm-settings-content .dm-security-form .dm-bio-actions { margin-top: 10px; }
 .dm-e2ee-recovery > .dm-e2ee-description,
-.dm-e2ee-recovery > .dm-e2ee-warning,
-.dm-e2ee-link-form > p { max-width: 650px; color: var(--muted-text); font-size: 13px; line-height: 1.55; }
+.dm-e2ee-recovery > .dm-e2ee-warning { max-width: 650px; color: var(--muted-text); font-size: 13px; line-height: 1.55; }
 .dm-e2ee-recovery > .dm-e2ee-description { margin: -8px 0 12px; }
 .dm-e2ee-recovery > .dm-e2ee-warning { margin: 0 0 18px; padding: 12px 14px; color: var(--text); background: color-mix(in srgb, #e2a43b 9%, var(--settings-inset)); border: 1px solid color-mix(in srgb, #e2a43b 28%, var(--settings-line)); border-radius: 10px; }
 .dm-e2ee-acknowledge { display: flex; align-items: flex-start; gap: 10px; max-width: 650px; margin: 2px 0 16px; color: var(--muted-text); font-size: 12px; line-height: 1.5; cursor: pointer; }
 .dm-e2ee-acknowledge input { width: 18px; height: 18px; flex: 0 0 auto; margin: 1px 0 0; accent-color: var(--accent); }
-.dm-e2ee-sync-code { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--settings-line); }
-.dm-e2ee-code-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 10px; }
-.dm-e2ee-code-row .dm-username-input { min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .02em; }
-.dm-e2ee-sync-code > small { display: block; max-width: 650px; margin-top: 2px; color: var(--muted-text); font-size: 11px; line-height: 1.45; }
-.dm-e2ee-link-form { max-width: 650px; margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--settings-line); }
-.dm-e2ee-link-form h3 { margin: 0 0 6px; font-size: 15px; font-weight: 600; }
-.dm-e2ee-link-form > p { margin: 0 0 14px; }
-@media (max-width: 520px) { .dm-e2ee-code-row { grid-template-columns: minmax(0, 1fr); } }
 .dm-delete-account-section { max-width: 760px; margin: 32px 0 16px; padding: 20px; background: color-mix(in srgb, #b42335 7%, var(--settings-inset)); border: 1px solid color-mix(in srgb, #e54858 38%, var(--settings-line)); border-radius: 16px; }
 .dm-delete-account-section h2 { margin: 0 0 8px; font-size: 17px; font-weight: 600; }
 .dm-delete-account-section p { margin: 0 0 16px; color: var(--muted-text); font-size: 13px; line-height: 1.55; }

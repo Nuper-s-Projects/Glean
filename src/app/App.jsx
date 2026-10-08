@@ -12,7 +12,7 @@ import { UserPopoutProvider } from '../features/dm/userPopout';
 import { ImagePreviewProvider } from '../features/dm/ImagePreview';
 import { DmCallProvider } from '../features/dm/DmCall';
 import { disableDesktopPush, enableDesktopPush, notificationPermission, startDesktopPush } from './desktopPush';
-import { applyUpdate, dismissInstallHint, dismissIosInstallHint, promptInstall, subscribePwa } from './pwa';
+import { applyUpdate, dismissInstallHint, promptInstall, subscribePwa } from './pwa';
 import { invalidateServersCache } from './dmApi';
 import { applyAccessibilitySettings } from './accessibility';
 import GleanErrorState from '../components/GleanErrorState';
@@ -76,7 +76,7 @@ export default function App() {
   const [routeMotion, setRouteMotion] = useState('');
   const [routeError, setRouteError] = useState(() => unknownRoutePath());
   const [pushHint, setPushHint] = useState(false);
-  const [pwa, setPwa] = useState(() => ({ standalone: false, ios: false, canInstall: false, updateReady: false, offline: false, showIosInstall: false, showChromeInstall: false }));
+  const [pwa, setPwa] = useState(() => ({ standalone: false, canInstall: false, updateReady: false, offline: false, showInstallHint: false }));
   const [showBackupLinks, setShowBackupLinks] = useState(false);
 
   useEffect(() => {
@@ -279,16 +279,11 @@ export default function App() {
           <span>A new Glean version is ready.</span>
           <button type="button" onClick={applyUpdate}>Reload</button>
         </div>
-      ) : hasAcceptedCurrentAgreements(account) && pwa.showChromeInstall ? (
+      ) : hasAcceptedCurrentAgreements(account) && pwa.showInstallHint ? (
         <div className="glean-push-hint">
           <span>Install Glean for a full-screen app, Home Screen icon, and better notifications.</span>
           <button type="button" onClick={() => promptInstall().catch(() => {})}>Install</button>
           <button type="button" onClick={dismissInstallHint} aria-label="Dismiss">×</button>
-        </div>
-      ) : hasAcceptedCurrentAgreements(account) && pwa.showIosInstall ? (
-        <div className="glean-push-hint">
-          <span>Add Glean to your Home Screen: tap Share, then Add to Home Screen.</span>
-          <button type="button" onClick={dismissIosInstallHint} aria-label="Dismiss">×</button>
         </div>
       ) : hasAcceptedCurrentAgreements(account) && pushHint ? (
         <div className="glean-push-hint">

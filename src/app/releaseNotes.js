@@ -1,16 +1,14 @@
 export const CURRENT_RELEASE = {
   version: '26.0.79',
   title: "What's new in Glean",
-  summary: 'Connect Glean web and iOS to read your private messages on both.',
+  summary: 'A faster, smoother Glean with improvements to messaging, calls, and accessibility.',
   changes: [
-    { label: 'iOS', text: 'Approve a secure connection in your browser, or scan a connection QR code from Settings → Security to unlock your DMs on iPhone.' },
     { label: 'Calls', text: 'Fixed DM calls getting stuck while connecting. Calls now use the configured network relay and wait for both devices to finish setup.' },
     { label: 'Connection', text: 'Account settings and announcements no longer interrupt the shared live connection used by calls and messages.' },
     { label: 'Performance', text: 'Server message notifications now calculate unread counts only for the affected server, and long message lists render more efficiently.' },
     { label: 'Admin', text: 'Nuper can hide the official Glean server from everyone and show it again later. Its messages, channels, and memberships are preserved.' },
     { label: 'Notifications', text: 'Mute any server from its web server-icon menu. Muted servers hide unread badges and stop their push notifications until you unmute them.' },
-    { label: 'Messages', text: 'Link the website and iOS app with a private code in Security settings to read the same encrypted messages. Sync each original device once to restore its older messages.' },
-    { label: 'Privacy', text: 'Synced private keys stay encrypted. Linking a device does not give the server access to your messages.' },
+    { label: 'Messages', text: 'Direct messages are encrypted on your device. Your private encryption keys are not readable by Glean servers.' },
     { label: 'Uploads', text: 'Attachments can be up to 2 GB per message, and profile pictures can be up to 200 MB.' },
     { label: 'Profile', text: 'GIF profile pictures now open the preview modal reliably.' },
     { label: 'Profile', text: 'Crop, zoom, tilt, and rotate GIFs in the profile-picture editor while keeping every frame animated.' },

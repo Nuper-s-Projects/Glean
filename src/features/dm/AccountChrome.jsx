@@ -3,7 +3,7 @@ import { disableDesktopPush, enableDesktopPush, notificationPermission } from '.
 import { promptInstall, subscribePwa } from '../../app/pwa';
 import { signOut } from '../../app/storage';
 import { changePassword, deleteAccount, getAccountSessions, getBlockedUsers, resetUserPassword, revokeAccountSession, revokeOtherSessions, sendPushAnnouncement, sendTestPush, setKeepInformationSecret, setPresenceHidden, setPresenceStatus, setPrivateNotesEnabled, setShowInspectServers, subscribeToDmEvents, unblockUser, updateAccountAccessibility, updateAccountAvatar, updateAccountBio, updateAccountCustomBadges, updateAccountDiscord, updateAccountGrade, updateAccountProgram, updateAccountProfileBackground, updateAccountSchool, updateAccountSocialLinks, updateAccountUsername } from '../../app/dmApi';
-import { applyAccessibilitySettings, DEFAULT_ACCESSIBILITY, isIPhoneDevice, normalizeAccessibility } from '../../app/accessibility';
+import { applyAccessibilitySettings, DEFAULT_ACCESSIBILITY, normalizeAccessibility } from '../../app/accessibility';
 import GleanButton from './GleanButton';
 import GradeQuestion from '../../components/GradeQuestion';
 import SchoolQuestion from '../../components/SchoolQuestion';
@@ -27,7 +27,7 @@ import { customBadgeTextColor, MAX_CUSTOM_BADGES, MAX_CUSTOM_BADGE_LABEL, normal
 import { isDeveloperModeEnabled, setDeveloperModeEnabled, subscribeDeveloperMode } from '../../app/developerMode';
 import { Glass } from '@samasante/liquid-glass';
 import { glassOptics } from './MessageComposer';
-import { deleteE2EEIdentity, ensureE2EEIdentity, resetE2EEIdentity, savedKeySyncCode, syncEncryptionKeys } from '../../app/e2ee';
+import { deleteE2EEIdentity, ensureE2EEIdentity, resetE2EEIdentity } from '../../app/e2ee';
 
 const AVATAR_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
 const AVATAR_MAX_BYTES = 200 * 1024 * 1024;
@@ -82,7 +82,7 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
   const [announcementDraft, setAnnouncementDraft] = useState('');
   const [announcementBusy, setAnnouncementBusy] = useState(false);
   const [announcementNote, setAnnouncementNote] = useState('');
-  const [pwa, setPwa] = useState(() => ({ standalone: false, ios: false, canInstall: false, showIosInstall: false }));
+  const [pwa, setPwa] = useState(() => ({ standalone: false, canInstall: false }));
   const [cropSource, setCropSource] = useState(null);
   const [cropError, setCropError] = useState('');
   const [bannerOpen, setBannerOpen] = useState(false);
@@ -111,9 +111,6 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
   const [dmKeyStatus, setDmKeyStatus] = useState('checking');
   const [dmKeyPassword, setDmKeyPassword] = useState('');
   const [dmKeyAcknowledged, setDmKeyAcknowledged] = useState(false);
-  const [dmKeyCodeInput, setDmKeyCodeInput] = useState('');
-  const [dmKeySyncCode, setDmKeySyncCode] = useState('');
-  const [dmKeyShowSyncCode, setDmKeyShowSyncCode] = useState(false);
   const [dmKeyBusy, setDmKeyBusy] = useState(false);
   const [dmKeyError, setDmKeyError] = useState('');
   const [dmKeyNote, setDmKeyNote] = useState('');
@@ -167,9 +164,6 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
     setDeleteError('');
     setDmKeyPassword('');
     setDmKeyAcknowledged(false);
-    setDmKeyCodeInput('');
-    setDmKeySyncCode('');
-    setDmKeyShowSyncCode(false);
     setDmKeyError('');
     setDmKeyNote('');
     setIsSettingsOpen(false);
@@ -270,9 +264,6 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
     setResetNote('');
     setDmKeyPassword('');
     setDmKeyAcknowledged(false);
-    setDmKeyCodeInput('');
-    setDmKeySyncCode('');
-    setDmKeyShowSyncCode(false);
     setDmKeyStatus('checking');
     setDmKeyError('');
     setDmKeyNote('');
@@ -291,9 +282,6 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
       ensureE2EEIdentity(account.id, account.username)
         .then((identity) => { if (!cancelled) setDmKeyStatus(identity.serverKeyMismatch ? 'mismatch' : 'ready'); })
         .catch((error) => { if (!cancelled) { setDmKeyStatus('error'); setDmKeyError(error.message || 'Could not check this browser’s DM key.'); } });
-      savedKeySyncCode(account.id)
-        .then((code) => { if (!cancelled) setDmKeySyncCode(code); })
-        .catch(() => { if (!cancelled) setDmKeySyncCode(''); });
     }
     return () => { cancelled = true; };
   }, [isSettingsOpen, settingsTab, account?.id, account?.username, loadSessions]);
@@ -380,50 +368,15 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
     setDmKeyError('');
     setDmKeyNote('');
     try {
-      const result = await resetE2EEIdentity(account.id, account.username, dmKeyPassword);
+      await resetE2EEIdentity(account.id, account.username, dmKeyPassword);
       setDmKeyStatus('ready');
-      setDmKeySyncCode(result.syncCode);
-      setDmKeyShowSyncCode(true);
       setDmKeyPassword('');
       setDmKeyAcknowledged(false);
-      setDmKeyNote(result.syncCodeSaved
-        ? 'Your new key is active. You can send DMs again. Save this code to link another browser.'
-        : 'Your new key is active and DMs are ready. Copy this code now to link another browser; it could not be saved on this device.');
+      setDmKeyNote('Your new key is active. You can send DMs again.');
     } catch (error) {
       setDmKeyError(error.message || 'Could not reset DM encryption.');
     } finally {
       setDmKeyBusy(false);
-    }
-  };
-
-  const linkDmEncryptionDevice = async (event) => {
-    event.preventDefault();
-    if (dmKeyBusy) return;
-    setDmKeyBusy(true);
-    setDmKeyError('');
-    setDmKeyNote('');
-    try {
-      const identity = await syncEncryptionKeys(account.id, account.username, dmKeyCodeInput.trim());
-      setDmKeyStatus(identity.serverKeyMismatch ? 'mismatch' : 'ready');
-      setDmKeySyncCode(dmKeyCodeInput.trim());
-      setDmKeyCodeInput('');
-      setDmKeyShowSyncCode(false);
-      setDmKeyNote(identity.serverKeyMismatch ? 'This code did not restore the active DM key.' : 'This browser is linked. Your DMs are ready.');
-    } catch (error) {
-      setDmKeyError(error.message || 'Could not link this browser.');
-    } finally {
-      setDmKeyBusy(false);
-    }
-  };
-
-  const copyDmKeySyncCode = async () => {
-    if (!dmKeySyncCode) return;
-    try {
-      await navigator.clipboard.writeText(dmKeySyncCode);
-      setDmKeyError('');
-      setDmKeyNote('Sync code copied. Keep it private.');
-    } catch {
-      setDmKeyError('Clipboard access is unavailable. Select the code and copy it manually.');
     }
   };
 
@@ -995,7 +948,7 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
                   </section>
                   <section className="dm-notify-settings">
                     <h2>Install Glean</h2>
-                    {pwa.standalone ? <p>Glean is installed on this device.</p> : pwa.canInstall ? <><p>Install Glean for a dedicated app window and easier access.</p><GleanButton type="button" onClick={() => promptInstall().catch(() => {})}>Install Glean</GleanButton></> : pwa.ios ? <p>On iPhone or iPad, tap Share, then Add to Home Screen.</p> : <p>Use your browser’s install or Add to Home Screen option to pin Glean as an app.</p>}
+                    {pwa.standalone ? <p>Glean is installed on this device.</p> : pwa.canInstall ? <><p>Install Glean for a dedicated app window and easier access.</p><GleanButton type="button" onClick={() => promptInstall().catch(() => {})}>Install Glean</GleanButton></> : <p>Use your browser’s install or Add to Home Screen option to pin Glean as an app.</p>}
                   </section>
                 </>
               ) : settingsTab === 'accessibility' ? (
@@ -1012,17 +965,7 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
                     <p className="dm-accessibility-description">System follows your device appearance. Light and Dark set Glean’s appearance directly.</p>
                   </div>
                   <div className="dm-accessibility-control dm-accessibility-control-glass">
-                    {isIPhoneDevice() ? (
-                      <>
-                        <div className="dm-accessibility-label"><span>Liquid Glass</span><output>Fixed backdrop blur</output></div>
-                        <p className="dm-accessibility-description">Glass effects use a fixed, lightweight backdrop blur on iPhone. The appearance slider is unavailable on this device.</p>
-                        <div className="dm-glass-preview-wrap" aria-label="Fixed iPhone backdrop blur preview">
-                          <img className="dm-glass-preview-image" src="/liquid-glass-preview.jpg" alt="" />
-                          <div className="dm-glass-iphone-preview">Backdrop blur preview</div>
-                        </div>
-                      </>
-                    ) : (
-                      <>
+                    <>
                         <div className="dm-accessibility-label"><label htmlFor="accessibility-glass">Liquid Glass</label><output htmlFor="accessibility-glass">{accessibility.glassFrost < 20 ? 'Clear' : accessibility.glassFrost > 80 ? 'Frosted' : `${accessibility.glassFrost}% frosted`}</output></div>
                         <p className="dm-accessibility-description">Tune the glass finish, lens depth, and refraction. These controls update the live preview and the message composer.</p>
                         <div className="dm-glass-presets" role="group" aria-label="Liquid Glass presets">
@@ -1053,8 +996,7 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
                           </Glass>
                         </div>
                         <p className="dm-glass-preview-hint">Preview updates as you move the slider. Your choice saves automatically.</p>
-                      </>
-                    )}
+                    </>
                   </div>
                   <div className="dm-accessibility-control">
                     <div className="dm-accessibility-label"><label htmlFor="accessibility-contrast">Contrast</label><output htmlFor="accessibility-contrast">{accessibility.contrast}%</output></div>
@@ -1096,7 +1038,7 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
                         ? 'This browser’s saved key does not match Glean’s active key, so it cannot send DMs yet.'
                         : dmKeyStatus === 'ready'
                           ? 'This browser has the active key for sending encrypted DMs.'
-                          : 'The browser could not verify its DM key. You can try linking it or start a fresh key.'}</p>
+                          : 'The browser could not verify its DM key. You can start a fresh key.'}</p>
                     <p className="dm-e2ee-warning">Resetting creates a key for future messages. Old encrypted messages stay on Glean, but this browser can only read them if it still has their original key. The reset does not delete message history.</p>
                     <form onSubmit={resetDmEncryption}>
                       <label className="dm-bio-label" htmlFor="dm-key-reset-password">Current password</label>
@@ -1108,29 +1050,6 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
                       <GleanButton type="submit" disabled={dmKeyBusy || !dmKeyPassword || !dmKeyAcknowledged}>
                         {dmKeyBusy ? 'Resetting key…' : 'Reset DM key and enable chat'}
                       </GleanButton>
-                    </form>
-                    {dmKeySyncCode ? (
-                      <div className="dm-e2ee-sync-code">
-                        {dmKeyShowSyncCode ? (
-                          <>
-                            <label className="dm-bio-label" htmlFor="dm-key-sync-code">Private browser sync code</label>
-                            <div className="dm-e2ee-code-row">
-                              <input id="dm-key-sync-code" className="dm-username-input" value={dmKeySyncCode} readOnly onFocus={(event) => event.currentTarget.select()} aria-describedby="dm-key-sync-warning" />
-                              <GleanButton type="button" variant="quiet" onClick={copyDmKeySyncCode}>Copy code</GleanButton>
-                            </div>
-                            <small id="dm-key-sync-warning">Keep it private. Anyone with this code can access the synced DM key. Glean never receives the code itself.</small>
-                          </>
-                        ) : (
-                          <GleanButton type="button" variant="quiet" onClick={() => setDmKeyShowSyncCode(true)}>Show saved browser sync code</GleanButton>
-                        )}
-                      </div>
-                    ) : null}
-                    <form className="dm-e2ee-link-form" onSubmit={linkDmEncryptionDevice}>
-                      <h3>Link this browser</h3>
-                      <p>Enter the private sync code from a browser that already has the key.</p>
-                      <label className="dm-bio-label" htmlFor="dm-key-link-code">43-character sync code</label>
-                      <input id="dm-key-link-code" className="dm-username-input" value={dmKeyCodeInput} onChange={(event) => setDmKeyCodeInput(event.target.value)} autoComplete="off" spellCheck="false" maxLength={43} pattern="[A-Za-z0-9_-]{43}" required />
-                      <GleanButton type="submit" variant="quiet" disabled={dmKeyBusy || dmKeyCodeInput.trim().length !== 43}>{dmKeyBusy ? 'Linking…' : 'Link and sync this browser'}</GleanButton>
                     </form>
                     {dmKeyNote ? <p className="dm-settings-note" role="status">{dmKeyNote}</p> : null}
                     {dmKeyError ? <p className="dm-settings-error" role="alert">{dmKeyError}</p> : null}

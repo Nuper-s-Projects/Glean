@@ -1,9 +1,5 @@
 export const DEFAULT_ACCESSIBILITY = Object.freeze({ theme: 'system', contrast: 100, saturation: 100, glassFrost: 50, glassDepth: 20, glassRefraction: 100 });
 
-export function isIPhoneDevice() {
-  return typeof navigator !== 'undefined' && /iPhone/i.test(navigator.userAgent || '');
-}
-
 export function normalizeAccessibility(value = {}) {
   const theme = ['system', 'light', 'dark'].includes(value.theme) ? value.theme : DEFAULT_ACCESSIBILITY.theme;
   const contrast = Number(value.contrast ?? value.accessibilityContrast ?? DEFAULT_ACCESSIBILITY.contrast);

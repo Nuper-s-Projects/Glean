@@ -19,18 +19,7 @@ function writeFlag(key, on) {
 
 export function isStandalone() {
   return window.matchMedia('(display-mode: standalone)').matches
-    || window.matchMedia('(display-mode: window-controls-overlay)').matches
-    || window.navigator.standalone === true;
-}
-
-export function isIosDevice() {
-  const ua = String(navigator.userAgent || '');
-  return /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-}
-
-function isIosSafari() {
-  const ua = String(navigator.userAgent || '');
-  return isIosDevice() && /Safari/.test(ua) && !/CriOS|FxiOS|EdgiOS|Chrome|Android/.test(ua);
+    || window.matchMedia('(display-mode: window-controls-overlay)').matches;
 }
 
 function emit() {
@@ -43,12 +32,10 @@ export function getPwaState() {
   const standalone = isStandalone();
   return {
     standalone,
-    ios: isIosSafari(),
     canInstall: Boolean(deferredPrompt) && !standalone,
     updateReady: Boolean(waitingWorker),
     offline,
-    showIosInstall: isIosSafari() && !standalone && !readFlag('glean.dismissIosInstall'),
-    showChromeInstall: Boolean(deferredPrompt) && !standalone && !readFlag('glean.dismissInstall'),
+    showInstallHint: Boolean(deferredPrompt) && !standalone && !readFlag('glean.dismissInstall'),
   };
 }
 
@@ -60,11 +47,6 @@ export function registerServiceWorker() {
 
 export function dismissInstallHint() {
   writeFlag('glean.dismissInstall', true);
-  emit();
-}
-
-export function dismissIosInstallHint() {
-  writeFlag('glean.dismissIosInstall', true);
   emit();
 }
 

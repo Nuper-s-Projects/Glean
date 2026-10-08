@@ -32,7 +32,7 @@ Community/server channels are intentionally **not** end-to-end encrypted because
 
 Current E2EE limitation: Glean uses one active encryption identity per account. It is strong device-bound E2EE, but it is not a Signal-style multi-device Double Ratchet implementation. Replacing a device identity can make older encrypted history unavailable on the new device. If multi-device forward secrecy/post-compromise security is required, the next upgrade should use a mature protocol such as Signal Protocol rather than extending this custom envelope design.
 
-Account settings can rotate the active DM key after verifying the account password. The browser generates the private key and a private sync code locally; only the public key and code-encrypted key envelope are sent to the server. The prior encrypted vault is archived and message rows are left unchanged. A reset enables new encrypted messages, but does not recover old messages when their original private key is missing.
+Account settings can rotate the active DM key after verifying the account password. The browser generates the private key and a private sync code locally; only the public key and code-encrypted key envelope are sent to the server. The web settings UI no longer exposes cross-device key linking. The prior encrypted vault is archived and message rows are left unchanged. A reset enables new encrypted messages, but does not recover old messages when their original private key is missing.
 
 ## Server and routing
 
