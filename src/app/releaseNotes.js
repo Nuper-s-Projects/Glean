@@ -1,8 +1,9 @@
 export const CURRENT_RELEASE = {
-  version: '26.0.79',
+  version: '26.0.80',
   title: "What's new in Glean",
-  summary: 'A faster, smoother Glean with improvements to messaging, calls, and accessibility.',
+  summary: 'A web-only Glean experience without iOS-specific integrations.',
   changes: [
+    { label: 'Web', text: 'Removed iOS-specific pairing, install prompts, and device-only display behavior. Web DM encryption and shared server APIs remain unchanged.' },
     { label: 'Calls', text: 'Fixed DM calls getting stuck while connecting. Calls now use the configured network relay and wait for both devices to finish setup.' },
     { label: 'Connection', text: 'Account settings and announcements no longer interrupt the shared live connection used by calls and messages.' },
     { label: 'Performance', text: 'Server message notifications now calculate unread counts only for the affected server, and long message lists render more efficiently.' },
