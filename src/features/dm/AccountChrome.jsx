@@ -322,7 +322,7 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
   };
 
   const changeAccessibility = (key, value) => {
-    saveAccessibilityPreferences(normalizeAccessibility({ ...accessibility, [key]: key === 'reduceMotion' || key === 'theme' ? value : Number(value) }));
+    saveAccessibilityPreferences(normalizeAccessibility({ ...accessibility, [key]: key === 'theme' ? value : Number(value) }));
   };
 
   const resetGlassOptics = () => {
@@ -1009,8 +1009,7 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
                     <div className="dm-accessibility-scale"><span>Grayscale</span><span>Vivid</span></div>
                   </div>
                   <div className="dm-accessibility-motion">
-                    <span><strong>Reduce motion</strong><small>Turn off animations and smooth scrolling in Glean.</small></span>
-                    <button className="dm-accessibility-switch" type="button" role="switch" aria-checked={accessibility.reduceMotion} onClick={() => changeAccessibility('reduceMotion', !accessibility.reduceMotion)}>{accessibility.reduceMotion ? 'On' : 'Off'}</button>
+                    <span><strong>Animations</strong><small>Always enabled in Glean. Your device’s Reduce Motion preference is still respected.</small></span>
                   </div>
                   <p className="dm-accessibility-save" role="status">{isSavingAccessibility ? 'Saving to your profile…' : accessibilitySaved ? 'Saved to your profile.' : 'Changes save automatically.'}</p>
                   {settingsError ? <p className="dm-settings-error" role="alert">{settingsError}</p> : null}

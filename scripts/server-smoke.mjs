@@ -1357,6 +1357,38 @@ try {
   const officialInvite = await nuper(`/servers/${official.id}/invites`, {
     method: 'POST', body: JSON.stringify({ expiresInHours: 1, maxUses: 0 }),
   });
+  const sharedInstallId = 'Q'.repeat(43);
+  const sharedInstallHeaders = { 'X-Glean-Install-Id': sharedInstallId };
+  const deviceBanTarget = await makeClient();
+  const deviceBanTargetSignup = await deviceBanTarget('/auth/signup', {
+    method: 'POST', headers: sharedInstallHeaders,
+    body: JSON.stringify({ username: 'device_ban_target', password: 'correct-horse-device-target' }),
+  });
+  await acceptCurrentAgreements(deviceBanTarget);
+  await deviceBanTarget(`/servers/${official.id}`);
+  const deviceBanAlt = await makeClient();
+  const deviceBanAltSignup = await deviceBanAlt('/auth/signup', {
+    method: 'POST', headers: sharedInstallHeaders,
+    body: JSON.stringify({ username: 'device_ban_alt', password: 'correct-horse-device-alt' }),
+  });
+  await acceptCurrentAgreements(deviceBanAlt);
+  const targetMember = (await nuper(`/servers/${official.id}`)).server.members.find((member) => Number(member.id) === Number(deviceBanTargetSignup.account.id));
+  if (!targetMember) throw new Error('Device-ban test account was not enrolled in the official server.');
+  const deviceBanResult = await nuper(`/servers/${official.id}/members/${deviceBanTargetSignup.account.id}/device-ban`, {
+    method: 'POST', body: JSON.stringify({ reason: 'device-ban smoke test' }),
+  });
+  if (deviceBanResult.deviceCount !== 1 || deviceBanResult.removedMembers.length !== 2) throw new Error('Device ban did not remove accounts sharing the installation.');
+  const altJoin = await deviceBanAlt.raw(`/invites/${officialInvite.invite.code}/join`, {
+    method: 'POST', headers: sharedInstallHeaders, body: '{}',
+  });
+  if (altJoin.status !== 403) throw new Error('An alternate account on a device-banned installation could join the server.');
+  const deviceBans = await nuper(`/servers/${official.id}/device-bans`);
+  if (deviceBans.deviceBans?.length !== 1) throw new Error('Device ban was not listed for moderators.');
+  await nuper(`/servers/${official.id}/device-bans/${deviceBans.deviceBans[0].deviceHash}`, { method: 'DELETE' });
+  const unbannedJoin = await deviceBanAlt.raw(`/invites/${officialInvite.invite.code}/join`, {
+    method: 'POST', headers: sharedInstallHeaders, body: '{}',
+  });
+  if (!unbannedJoin.ok) throw new Error('Unbanning a device did not restore invite access.');
   const kickAlice = await nuper(`/servers/${official.id}/members/${aliceSignup.account.id}/kick`, { method: 'POST', body: '{}' });
   if (kickAlice.action !== 'kick' || (await alice('/servers')).servers.some((item) => Number(item.id) === Number(official.id))) {
     throw new Error('The official server owner could not kick a member.');

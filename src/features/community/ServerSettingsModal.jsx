@@ -4,12 +4,14 @@ import {
   getFriends,
   getServerMembers,
   getServerBans,
+  getServerDeviceBans,
   getServerAuditLog,
   getServerInvites,
   removeServerIcon,
   revokeServerInvite,
   sendServerInvite,
   unbanServerMember,
+  unbanServerDevice,
   updateChannel,
   clearServerChannelMessages,
   updateServerChannelMessageCleanup,
@@ -264,6 +266,7 @@ export default function ServerSettingsModal({
   const [friendQuery, setFriendQuery] = useState('');
   const [inviteBusy, setInviteBusy] = useState('');
   const [bans, setBans] = useState([]);
+  const [deviceBans, setDeviceBans] = useState([]);
   const [auditRows, setAuditRows] = useState([]);
   const [auditCursor, setAuditCursor] = useState(null);
   const [auditBusy, setAuditBusy] = useState(false);
@@ -385,8 +388,12 @@ export default function ServerSettingsModal({
   useEffect(() => {
     if (tab !== 'bans' || !canManageMembers) return undefined;
     let cancelled = false;
-    getServerBans(server.id)
-      .then(({ bans: items }) => { if (!cancelled) setBans(items || []); })
+    Promise.all([getServerBans(server.id), getServerDeviceBans(server.id)])
+      .then(([{ bans: items }, { deviceBans: devices }]) => {
+        if (cancelled) return;
+        setBans(items || []);
+        setDeviceBans(devices || []);
+      })
       .catch((error) => onNotice?.(error.message));
     return () => { cancelled = true; };
   }, [tab, server.id, canManageMembers, onNotice]);
@@ -587,6 +594,20 @@ export default function ServerSettingsModal({
       await unbanServerMember(server.id, userId);
       setBans((current) => current.filter((item) => Number(item.userId) !== Number(userId)));
       onNotice?.('User unbanned.');
+    } catch (error) {
+      onNotice?.(error.message);
+    } finally {
+      setBanBusy('');
+    }
+  };
+
+  const liftDeviceBan = async (deviceHash) => {
+    if (banBusy) return;
+    setBanBusy(`device:${deviceHash}`);
+    try {
+      await unbanServerDevice(server.id, deviceHash);
+      setDeviceBans((current) => current.filter((item) => item.deviceHash !== deviceHash));
+      onNotice?.('Device ban removed.');
     } catch (error) {
       onNotice?.(error.message);
     } finally {
@@ -1048,7 +1069,7 @@ export default function ServerSettingsModal({
 
           {tab === 'members' ? (
             <div className="community-settings-section">
-              <p>{canManageMembers ? 'Kick removes them, but they can rejoin with an invite. Ban blocks rejoining until you unban them. Owners stay protected.' : 'People in this server.'}</p>
+              <p>{canManageMembers ? 'Kick removes them, but they can rejoin with an invite. Ban blocks their account. Device ban blocks known Glean installations across alternate accounts. Owners stay protected.' : 'People in this server.'}</p>
               <input className="community-settings-search" value={memberQuery} onChange={(event) => setMemberQuery(event.target.value)} placeholder="Search members" aria-label="Search members" />
               <div className="community-member-list" aria-busy={settingsMembersLoading}>
                 {members.map((member) => {
@@ -1093,7 +1114,7 @@ export default function ServerSettingsModal({
 
           {tab === 'bans' && canManageMembers ? (
             <div className="community-settings-section">
-              <p>Banned people cannot join with an invite until you unban them.</p>
+              <p>Banned accounts and installations cannot rejoin until you unban them.</p>
               <div className="community-member-list">
                 {bans.length ? bans.map((ban) => (
                   <div className="community-member-row" key={ban.userId}>
@@ -1111,6 +1132,26 @@ export default function ServerSettingsModal({
                     </div>
                   </div>
                 )) : <p>No bans.</p>}
+              </div>
+              <h3 className="community-device-bans-heading">Banned installations</h3>
+              <p className="community-device-bans-note">Installation IDs are random and scoped to this server, not hardware fingerprints. Clearing browser storage or using another browser/device creates a new ID.</p>
+              <div className="community-member-list">
+                {deviceBans.length ? deviceBans.map((ban) => (
+                  <div className="community-member-row" key={ban.deviceHash}>
+                    <div className="community-member-identity">
+                      <span className="community-device-ban-icon" aria-hidden="true">▣</span>
+                      <span>
+                        <strong>{ban.label}</strong>
+                        <small>{ban.reason || 'No reason'}{ban.bannedBy ? ` · by ${ban.bannedBy}` : ''}{ban.createdAt ? ` · ${formatJoinedDate(ban.createdAt)}` : ''}</small>
+                      </span>
+                    </div>
+                    <div className="community-member-actions">
+                      <button type="button" className="community-kick" onClick={() => liftDeviceBan(ban.deviceHash)} disabled={banBusy === `device:${ban.deviceHash}`}>
+                        {banBusy === `device:${ban.deviceHash}` ? 'Working…' : 'Unban device'}
+                      </button>
+                    </div>
+                  </div>
+                )) : <p>No device bans.</p>}
               </div>
             </div>
           ) : null}

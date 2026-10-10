@@ -1,8 +1,14 @@
 export const CURRENT_RELEASE = {
-  version: '26.0.80',
+  version: '26.0.81',
   title: "What's new in Glean",
-  summary: 'A web-only Glean experience without iOS-specific integrations.',
+  summary: 'A web-only Glean experience with a rebuilt Loop feed and smoother messaging, server, and media workflows.',
   changes: [
+    { label: 'Loop', text: 'Flow is a full-screen vertical video feed with randomized continuous playback and post-matched backgrounds.' },
+    { label: 'Captions', text: 'Optional auto-captions now use Whisper Large v3 for improved transcription accuracy and word-level timing.' },
+    { label: 'Media', text: 'Download videos as MP4 directly from the Loop post composer.' },
+    { label: 'Performance', text: 'Loop caches content and media for faster loading, and large member lists load incrementally as you scroll.' },
+    { label: 'Accessibility', text: 'Removed the progressive blur and dark gradient fade from Loop feeds.' },
+    { label: 'Moderation', text: 'Server moderators can act on members with kick, timeout, ban, and device-ban controls.' },
     { label: 'Web', text: 'Removed iOS-specific pairing, install prompts, and device-only display behavior. Web DM encryption and shared server APIs remain unchanged.' },
     { label: 'Calls', text: 'Fixed DM calls getting stuck while connecting. Calls now use the configured network relay and wait for both devices to finish setup.' },
     { label: 'Connection', text: 'Account settings and announcements no longer interrupt the shared live connection used by calls and messages.' },

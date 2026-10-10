@@ -1,3 +1,5 @@
+import { queueSessionSnapshot, removeSessionSnapshot } from './sessionSnapshots.js';
+
 const SERVERS_KEY = 'glean.servers';
 const SERVERS_TTL_MS = 12_000;
 let serversCached = null;
@@ -8,7 +10,7 @@ let serversEpoch = 0;
 export function rememberServers(payload) {
   serversCached = payload;
   serversCachedAt = Date.now();
-  try { sessionStorage.setItem(SERVERS_KEY, JSON.stringify(payload)); } catch { /* ignore */ }
+  queueSessionSnapshot(SERVERS_KEY, payload);
 }
 
 export function peekCachedServers() {
@@ -72,5 +74,5 @@ export function invalidateServersCache() {
   serversCached = null;
   serversCachedAt = 0;
   serversInFlight = null;
-  try { sessionStorage.removeItem(SERVERS_KEY); } catch { /* ignore */ }
+  removeSessionSnapshot(SERVERS_KEY);
 }

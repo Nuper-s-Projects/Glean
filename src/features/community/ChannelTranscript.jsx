@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { CommunityAvatar } from './CommunityAvatar';
 import { MessageAttachment } from '../dm/DmPrimitives';
 import { formatDateDivider, formatMessageTime, isGroupedMessage, shouldShowDivider } from '../dm/formatters';
@@ -13,6 +13,8 @@ import EmojiPicker from '../dm/EmojiPicker';
 function messageId(value) {
   return Number(value?.id ?? value);
 }
+
+const MESSAGE_CALLBACKS = ['onOpenAuthor', 'onModerationContextMenu', 'onReply', 'onEdit', 'onDelete', 'onEditDraft', 'onSubmitEdit', 'onCancelEdit', 'onToggleReaction', 'onOpenReactions', 'onVotePoll', 'onClosePoll'];
 
 const ChannelMessageRow = memo(function ChannelMessageRow({
   message,
@@ -154,6 +156,9 @@ function ChannelTranscript({
   onVotePoll,
   onClosePoll,
 }) {
+  const handlersRef = useRef(null);
+  handlersRef.current = { onOpenAuthor, onModerationContextMenu, onReply, onEdit, onDelete, onEditDraft, onSubmitEdit, onCancelEdit, onToggleReaction, onOpenReactions, onVotePoll, onClosePoll };
+  const stableHandlers = useMemo(() => Object.fromEntries(MESSAGE_CALLBACKS.map((name) => [name, (...args) => handlersRef.current[name]?.(...args)])), []);
   if (isLoading) {
     return <div className="community-chat-loading"><span className="community-spinner" />Loading messages…</div>;
   }
@@ -192,20 +197,9 @@ function ChannelTranscript({
           inspecting={inspecting}
           canPost={canPost}
           isEditing={Number(editingMessageId) === messageId(message)}
-          editDraft={editDraft}
-          reactionPickerId={reactionPickerId}
-          onOpenAuthor={onOpenAuthor}
-          onModerationContextMenu={onModerationContextMenu}
-          onReply={onReply}
-          onEdit={onEdit}
-          onDelete={onDelete}
-          onEditDraft={onEditDraft}
-          onSubmitEdit={onSubmitEdit}
-          onCancelEdit={onCancelEdit}
-          onToggleReaction={onToggleReaction}
-          onOpenReactions={onOpenReactions}
-          onVotePoll={onVotePoll}
-          onClosePoll={onClosePoll}
+          editDraft={Number(editingMessageId) === messageId(message) ? editDraft : ''}
+          reactionPickerId={Number(reactionPickerId) === messageId(message) ? reactionPickerId : null}
+          {...stableHandlers}
         />
       ))}
       <div data-chat-end aria-hidden="true" />

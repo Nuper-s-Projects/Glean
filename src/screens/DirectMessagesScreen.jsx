@@ -8,7 +8,7 @@ import AccountChrome from '../features/dm/AccountChrome';
 import { Avatar, MessageAttachment, PresenceWrap } from '../features/dm/DmPrimitives';
 import { formatDateDivider, formatMessageTime, isGroupedMessage, shouldShowDivider } from '../features/dm/formatters';
 import { MessageBody } from '../features/dm/MessageBody';
-import MessageComposer from '../features/dm/MessageComposer';
+import { IsolatedMessageComposer } from '../features/dm/MessageComposer';
 import { messageMentionsUser } from '../features/dm/mentions';
 import { useChatAutoscroll } from '../features/dm/useChatAutoscroll';
 import { useDmData } from '../features/dm/useDmData';
@@ -40,8 +40,6 @@ export default function DirectMessagesScreen({ account, goTo, onAccountUpdated, 
   const [discoverFilter, setDiscoverFilter] = useState('all');
   const [discoverAttributeFilters, setDiscoverAttributeFilters] = useState([]);
   const [isFriendInputActive, setIsFriendInputActive] = useState(false);
-  const [draft, setDraft] = useState('');
-  const [attachments, setAttachments] = useState([]);
   const [notice, setNotice] = useState('');
   const [dmContextMenu, setDmContextMenu] = useState(null);
   const [isSending, setIsSending] = useState(false);
@@ -113,7 +111,6 @@ export default function DirectMessagesScreen({ account, goTo, onAccountUpdated, 
     isLoading ? null : selectedId,
     messages.at(-1)?.id ?? messages.length,
   );
-  useEffect(() => { if (selectedConversation) updateTyping(Boolean(draft.trim())); }, [draft, selectedConversation, updateTyping]);
   useEffect(() => {
     setDirectory(mentionUsers);
   }, [mentionUsers, setDirectory]);
@@ -220,7 +217,7 @@ export default function DirectMessagesScreen({ account, goTo, onAccountUpdated, 
     refresh(true);
     const timer = window.setInterval(() => {
       if (document.visibilityState === 'visible') refresh();
-    }, 10_000);
+    }, 60_000);
     const onVisible = () => { if (document.visibilityState === 'visible') refresh(); };
     document.addEventListener('visibilitychange', onVisible);
     return () => {
@@ -398,14 +395,15 @@ export default function DirectMessagesScreen({ account, goTo, onAccountUpdated, 
 
   const submitMessage = async (event, extra) => {
     event.preventDefault();
-    const files = extra?.attachments ?? attachments;
+    const files = extra?.attachments || [];
+    const draft = extra?.draft || '';
     if (!selectedConversation || selectedConversation.blocked || (!draft.trim() && !files.length) || isSending) return;
     setIsSending(true);
     setNotice('');
     try {
       await submitDmMessage(draft, files, replyTo?.id || null);
-      setDraft('');
-      setAttachments([]);
+      extra?.setDraft('');
+      extra?.setAttachments([]);
       setReplyTo(null);
     } catch (error) { setNotice(error.message); } finally { setIsSending(false); }
   };
@@ -746,16 +744,14 @@ export default function DirectMessagesScreen({ account, goTo, onAccountUpdated, 
             <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" /></svg>
           </button>
         ) : null}
-        <MessageComposer
+        <IsolatedMessageComposer
           key={selectedConversation.id}
-          draft={draft}
-          onDraftChange={setDraft}
-          onSubmit={submitMessage}
+          resetKey={selectedConversation.id}
+          onSend={submitMessage}
+          onTyping={updateTyping}
           placeholder={selectedConversation.blocked ? "You can't message this person." : `Message ${selectedConversation.user.username}`}
           disabled={Boolean(selectedConversation.blocked)}
           isSending={isSending}
-          attachments={attachments}
-          onAttachmentsChange={setAttachments}
           onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) updateTyping(false); }}
           composerRef={composerRef}
           accessibility={account?.accessibility}

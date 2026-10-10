@@ -22,6 +22,7 @@ import { CONDUCT_VERSION, TERMS_VERSION } from './agreements';
 import { isDeveloperModeEnabled, subscribeDeveloperMode } from './developerMode';
 import DeveloperModeWindow from '../features/dm/DeveloperModeWindow';
 import BackupLinksModal from '../components/BackupLinksModal';
+import { loopReturnPath, loopSignInPath } from './loopEntry';
 
 const BACKUP_LINKS_DISMISSED_KEY = 'glean-backup-links-dismissed-v1';
 
@@ -61,6 +62,7 @@ function screenForRoute(route, props) {
 }
 
 export default function App() {
+  const pendingLoop = useRef(LOOP_ROUTES_ENABLED ? loopReturnPath(window.location) : null);
   const [displayedRoute, setDisplayedRoute] = useState(() => {
     const cached = peekCachedAccount();
     return resolveRoute(routeFromLocation() || (cached ? ROUTES.APP : ROUTES.SIGN_IN), cached);
@@ -129,9 +131,13 @@ export default function App() {
   }, []);
 
   const navigate = useCallback((nextRoute) => {
+    if (nextRoute === ROUTES.LOOP && !accountRef.current) pendingLoop.current = '/loop';
     const target = resolveRoute(nextRoute, accountRef.current);
+    const path = pendingLoop.current && [ROUTES.SIGN_IN,ROUTES.SIGN_UP,ROUTES.USERNAME].includes(target)
+      ? `${pathForRoute(target)}?${new URLSearchParams({next:pendingLoop.current})}` : pathForRoute(target);
+    if (![ROUTES.SIGN_IN,ROUTES.SIGN_UP,ROUTES.USERNAME,ROUTES.LOOP].includes(target)) pendingLoop.current = null;
     if (target === targetRoute.current) return;
-    window.history.pushState({}, '', pathForRoute(target));
+    window.history.pushState({}, '', path);
     transitionTo(target);
   }, [transitionTo]);
 
@@ -139,12 +145,16 @@ export default function App() {
     rememberAccount(nextAccount);
     accountRef.current = nextAccount;
     setAccount(nextAccount);
-    const target = resolveRoute(ROUTES.APP, nextAccount);
-    window.history.pushState({}, '', pathForRoute(target));
+    const target = resolveRoute(pendingLoop.current ? ROUTES.LOOP : ROUTES.APP, nextAccount);
+    const path = target === ROUTES.LOOP ? pendingLoop.current || '/loop'
+      : pendingLoop.current && target === ROUTES.USERNAME ? `${pathForRoute(target)}?${new URLSearchParams({next:pendingLoop.current})}` : pathForRoute(target);
+    if (target !== ROUTES.USERNAME) pendingLoop.current = null;
+    window.history.pushState({}, '', path);
     transitionTo(target);
   }, [transitionTo]);
 
   const completeSignOut = useCallback(() => {
+    pendingLoop.current = null;
     disableDesktopPush();
     invalidateServersCache();
     clearClientCaches();
@@ -176,9 +186,11 @@ export default function App() {
       setAccount(currentAccount);
       const requestedRoute = routeFromLocation();
       setRouteError(unknownRoutePath());
-      const initialRoute = requestedRoute || (currentAccount ? ROUTES.APP : ROUTES.SIGN_IN);
+      const initialRoute = pendingLoop.current && currentAccount && [ROUTES.SIGN_IN,ROUTES.SIGN_UP,ROUTES.USERNAME].includes(requestedRoute) ? ROUTES.LOOP : requestedRoute || (currentAccount ? ROUTES.APP : ROUTES.SIGN_IN);
       const target = resolveRoute(initialRoute, currentAccount);
-      if (window.location.pathname !== pathForRoute(target)) window.history.replaceState({}, '', pathForRoute(target));
+      const path = pendingLoop.current && [ROUTES.SIGN_IN,ROUTES.SIGN_UP,ROUTES.USERNAME].includes(target) ? `${pathForRoute(target)}?${new URLSearchParams({next:pendingLoop.current})}`
+        : target === ROUTES.LOOP && pendingLoop.current ? pendingLoop.current : pathForRoute(target);
+      if (target !== requestedRoute || window.location.pathname !== pathForRoute(target)) window.history.replaceState({}, '', path);
       targetRoute.current = target;
       setDisplayedRoute(target);
       setAuthReady(true);
@@ -193,8 +205,10 @@ export default function App() {
       setRouteError(nextRouteError);
       if (nextRouteError) return;
       const requestedRoute = routeFromLocation() || (accountRef.current ? ROUTES.APP : ROUTES.SIGN_IN);
-      const target = resolveRoute(requestedRoute, accountRef.current);
-      if (target !== requestedRoute || window.location.pathname !== pathForRoute(target)) window.history.replaceState({}, '', pathForRoute(target));
+      pendingLoop.current = LOOP_ROUTES_ENABLED ? loopReturnPath(window.location) : null;
+      const target = resolveRoute(pendingLoop.current && accountRef.current && [ROUTES.SIGN_IN,ROUTES.SIGN_UP,ROUTES.USERNAME].includes(requestedRoute) ? ROUTES.LOOP : requestedRoute, accountRef.current);
+      const path = target === ROUTES.SIGN_IN && pendingLoop.current ? loopSignInPath(pendingLoop.current) : pathForRoute(target);
+      if (target !== requestedRoute || window.location.pathname !== pathForRoute(target)) window.history.replaceState({}, '', path);
       transitionTo(target);
     };
     window.addEventListener('popstate', onRouteChange);

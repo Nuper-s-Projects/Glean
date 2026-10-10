@@ -24,6 +24,7 @@ import { createOfficialAnnouncements } from './server/officialAnnouncements.mjs'
 import { getManagedSchoolAccessState, getSchoolAccessState } from './server/schoolSchedule.mjs';
 import { createAppService } from './server/apps.mjs';
 import { createLoopService } from './server/loop.mjs';
+import { createVideoDownloadService } from './server/videoDownloads.mjs';
 import { moderateServerMessage } from './server/moderation/index.mjs';
 import { AGREEMENT_WAIT_SECONDS, CONDUCT_VERSION, TERMS_VERSION } from './src/app/agreements.js';
 
@@ -241,6 +242,22 @@ database.exec(`
     created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
     PRIMARY KEY (server_id, user_id)
   ) STRICT;
+  CREATE TABLE IF NOT EXISTS server_member_devices (
+    server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    device_hash TEXT NOT NULL CHECK(length(device_hash) = 64),
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    PRIMARY KEY (server_id, user_id, device_hash)
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS server_device_bans (
+    server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+    device_hash TEXT NOT NULL CHECK(length(device_hash) = 64),
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    PRIMARY KEY (server_id, device_hash)
+  ) STRICT;
   CREATE TABLE IF NOT EXISTS server_invites (
     code TEXT PRIMARY KEY,
     server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
@@ -304,6 +321,8 @@ database.exec(`
   CREATE INDEX IF NOT EXISTS channel_messages_channel_id_index ON channel_messages(channel_id, id);
   CREATE INDEX IF NOT EXISTS message_attachments_message_index ON message_attachments(message_id);
   CREATE INDEX IF NOT EXISTS server_bans_user_index ON server_bans(user_id, server_id);
+  CREATE INDEX IF NOT EXISTS server_member_devices_lookup_index ON server_member_devices(server_id, device_hash, user_id);
+  CREATE INDEX IF NOT EXISTS server_device_bans_server_index ON server_device_bans(server_id, created_at DESC);
   CREATE INDEX IF NOT EXISTS server_invites_server_index ON server_invites(server_id, created_at);
   CREATE INDEX IF NOT EXISTS server_audit_log_server_index ON server_audit_log(server_id, id DESC);
   CREATE INDEX IF NOT EXISTS channel_reactions_message_index ON channel_message_reactions(message_id, emoji);
@@ -1154,6 +1173,17 @@ const deleteChannelReaction = database.prepare('DELETE FROM channel_message_reac
 const findChannelReaction = database.prepare('SELECT 1 FROM channel_message_reactions WHERE message_id = ? AND user_id = ? AND emoji = ?');
 const isServerMember = database.prepare('SELECT 1 FROM server_members WHERE server_id = ? AND user_id = ?');
 const isServerBanned = database.prepare('SELECT 1 FROM server_bans WHERE server_id = ? AND user_id = ?');
+const isServerDeviceBanned = database.prepare('SELECT 1 FROM server_device_bans WHERE server_id = ? AND device_hash = ?');
+const recordServerMemberDevice = database.prepare(`INSERT INTO server_member_devices(server_id,user_id,device_hash,first_seen,last_seen)
+  VALUES(?,?,?,?,?) ON CONFLICT(server_id,user_id,device_hash) DO UPDATE SET last_seen=excluded.last_seen`);
+const listServerMemberDeviceHashes = database.prepare('SELECT device_hash FROM server_member_devices WHERE server_id=? AND user_id=? ORDER BY last_seen DESC');
+const listUsersSharingServerDevices = database.prepare(`SELECT DISTINCT user_id FROM server_member_devices
+  WHERE server_id=? AND device_hash IN (SELECT device_hash FROM server_member_devices WHERE server_id=? AND user_id=?)`);
+const insertServerDeviceBan = database.prepare('INSERT OR REPLACE INTO server_device_bans(server_id,device_hash,reason,created_at,created_by) VALUES(?,?,?,?,?)');
+const deleteServerDeviceBan = database.prepare('DELETE FROM server_device_bans WHERE server_id=? AND device_hash=?');
+const listServerDeviceBans = database.prepare(`SELECT server_device_bans.device_hash,server_device_bans.reason,server_device_bans.created_at,
+  COALESCE(users.username,'Deleted user') AS banned_by FROM server_device_bans
+  LEFT JOIN users ON users.id=server_device_bans.created_by WHERE server_device_bans.server_id=? ORDER BY server_device_bans.created_at DESC`);
 const isChannelMember = database.prepare('SELECT 1 FROM server_members JOIN server_channels ON server_channels.server_id = server_members.server_id WHERE server_channels.id = ? AND server_members.user_id = ?');
 const findChannel = database.prepare('SELECT server_channels.id, server_channels.server_id, server_channels.name, server_channels.voice, server_channels.position, server_channels.channel_kind, server_channels.locked, server_channels.slowmode, server_channels.topic, servers.moderation_enabled FROM server_channels JOIN servers ON servers.id = server_channels.server_id WHERE server_channels.id = ?');
 const officialAnnouncements = createOfficialAnnouncements(database);
@@ -1368,6 +1398,12 @@ function listPlatformAdminIds() {
 function canSeeServer(user, serverId) {
   if (officialAnnouncements.isServer(serverId) && isOfficialServerHidden()) return false;
   return Boolean(isServerMember.get(serverId, user.id) || (isPlatformAdmin(user) && findServerById.get(serverId)));
+}
+
+function serverDeviceHash(request, serverId) {
+  const installId = String(request.headers['x-glean-install-id'] || '').trim();
+  if (!/^[A-Za-z0-9_-]{43}$/.test(installId) || Buffer.from(installId, 'base64url').length !== 32) return null;
+  return createHash('sha256').update(`${Number(serverId)}:${installId}`).digest('hex');
 }
 
 function canSeeChannel(user, channelId) {
@@ -1692,7 +1728,7 @@ function createInviteRecord(serverId, userId, now, options = {}) {
   return code ? { code, serverId: Number(serverId), expiresAt, maxUses } : null;
 }
 
-function invitePreviewFor(invite, user, now) {
+function invitePreviewFor(invite, user, now, request = null) {
   const server = findServerById.get(invite.server_id);
   if (!server) return null;
   const members = listServerMemberIds.all(invite.server_id);
@@ -1705,7 +1741,9 @@ function invitePreviewFor(invite, user, now) {
   return {
     code: invite.code,
     expired,
-    banned: Boolean(isServerBanned.get(invite.server_id, user.id)),
+    banned: Boolean(isServerBanned.get(invite.server_id, user.id)
+      || (request && serverDeviceHash(request, invite.server_id)
+        && isServerDeviceBanned.get(invite.server_id, serverDeviceHash(request, invite.server_id)))),
     alreadyMember: Boolean(isServerMember.get(invite.server_id, user.id)),
     server: {
       ...publicServerSummary(server),
@@ -2134,6 +2172,7 @@ function broadcastPresence(userId) {
   if (record.published === status && !record.force) return;
   record.published = status;
   record.force = false;
+  loopService.presence.invalidate(userId);
   sendEvent(userId, 'presence', presencePayload(userId, userId));
   const payload = presencePayload(userId);
   broadcastEvent(presenceAudience(userId), 'presence', payload);
@@ -2771,6 +2810,7 @@ const realtimeHub = createRealtimeHub({
     syncPresenceFor(user.id);
   },
   onDisconnect(user, socket) {
+    loopService.presence.leave(socket);
     appService.handleDisconnect(user, socket);
     if (voiceJoinSockets.get(Number(user.id)) === socket) {
       voiceJoinSockets.delete(Number(user.id));
@@ -2785,6 +2825,7 @@ const realtimeHub = createRealtimeHub({
     setTimeout(() => broadcastPresence(user.id), 0);
   },
   onClientEvent(user, message, _reply, socket) {
+    if (loopRoutesEnabled && loopService.presence.handle(user, message, socket)) return;
     if (String(message?.event || '').startsWith('app-')) {
       appService.handleClientEvent(user, message, socket);
       return;
@@ -2877,6 +2918,7 @@ const realtimeHub = createRealtimeHub({
   },
 });
 
+const videoDownloadService = createVideoDownloadService({ dataDirectory, sendJson, readJson, requireSignedInUser, sendLocalFile, takeRateLimit });
 const loopService = createLoopService({
   database,
   uploadDirectory,
@@ -2887,7 +2929,9 @@ const loopService = createLoopService({
   currentUser,
   realtimeHub,
   isAdmin: isPlatformAdmin,
+  publicPresence,
   nameFile: () => `loop-${randomBase32(24)}`,
+  copyVideoDownload: (userId,id,storageName) => videoDownloadService.copyToPost(userId,id,uploadDirectory,storageName),
 });
 
 setInterval(() => {
@@ -3552,7 +3596,9 @@ async function handleApi(request, response) {
     const generatedEmail = `${normalizedUsername.toLowerCase()}@glean.io`;
     const result = insertUser.run(Number(nextAccountId.get().id), generatedEmail, hashPassword(password, salt), salt, normalizedUsername, now, now, cleanGrade, cleanSchool);
     const user = grantNamedPlatformAdmin({ id: Number(result.lastInsertRowid), email: generatedEmail, username: normalizedUsername, bio: '', created_at: now, last_visited_at: now, grade: cleanGrade, school: cleanSchool });
-    officialAnnouncements.enroll(user.id);
+    const officialServerId = officialAnnouncements.getServerId();
+    const officialDeviceHash = officialServerId ? serverDeviceHash(request, officialServerId) : null;
+    officialAnnouncements.enroll(user.id, officialDeviceHash);
     const session = createSession(response, user.id);
     return sendJson(response, 201, { account: publicAccount(user), ...session });
   }
@@ -3586,6 +3632,7 @@ async function handleApi(request, response) {
   }
 
   if (!loopRoutesEnabled && (path === '/api/loop' || path.startsWith('/api/loop/'))) return sendJson(response, 404, { error: 'Not found.' });
+  if (await videoDownloadService.route(request, response, path)) return;
   if (loopRoutesEnabled && path.startsWith('/api/loop/') && await loopService.route(request, response, path, now)) return;
 
   if (loopRoutesEnabled && method === 'GET' && path === '/api/loop/posts') {
@@ -4869,7 +4916,7 @@ async function handleApi(request, response) {
     if (!user) return;
     const invite = findInviteByCode(invitePreviewMatch[1]);
     if (!invite) return sendJson(response, 404, { error: 'That invite is invalid or has been revoked.' });
-    const preview = invitePreviewFor(invite, user, now);
+    const preview = invitePreviewFor(invite, user, now, request);
     if (!preview) return sendJson(response, 404, { error: 'Server not found.' });
     return sendJson(response, 200, preview);
   }
@@ -4882,15 +4929,21 @@ async function handleApi(request, response) {
     const invite = findInviteByCode(code);
     if (!invite || invite.expires_at <= now || (invite.max_uses > 0 && invite.uses >= invite.max_uses)) return sendJson(response, 410, { error: 'That invite is expired or has reached its use limit.' });
     if (isServerBanned.get(invite.server_id, user.id)) return sendJson(response, 403, { error: 'You are banned from this server.' });
+    const deviceHash = serverDeviceHash(request, invite.server_id);
+    if (deviceHash && isServerDeviceBanned.get(invite.server_id, deviceHash)) return sendJson(response, 403, { error: 'This Glean installation is banned from this server.' });
     const server = findServerById.get(invite.server_id);
     if (!server) return sendJson(response, 404, { error: 'Server not found.' });
-    if (isServerMember.get(invite.server_id, user.id)) return sendJson(response, 200, { server: { ...publicServerSummary(server), alreadyMember: true } });
+    if (isServerMember.get(invite.server_id, user.id)) {
+      if (deviceHash) recordServerMemberDevice.run(invite.server_id, user.id, deviceHash, now, now);
+      return sendJson(response, 200, { server: { ...publicServerSummary(server), alreadyMember: true } });
+    }
     const memberRole = findDefaultMemberRole.get(invite.server_id);
     if (!memberRole) return sendJson(response, 500, { error: 'This server has no member role.' });
     if (!incrementInviteUse.run(invite.code).changes) return sendJson(response, 410, { error: 'That invite is expired or has reached its use limit.' });
     try {
       insertMember.run(invite.server_id, user.id, memberRole.id, now, Number(nextMemberSortOrder.get(user.id).next));
       initChannelReadsForMember(invite.server_id, user.id);
+      if (deviceHash) recordServerMemberDevice.run(invite.server_id, user.id, deviceHash, now, now);
     } catch (error) {
       decrementInviteUse.run(invite.code);
       if (String(error.message).includes('UNIQUE')) return sendJson(response, 200, { server: { ...publicServerSummary(server), alreadyMember: true } });
@@ -4911,12 +4964,18 @@ async function handleApi(request, response) {
     const server = findServerById.get(serverId);
     if (!server || Number(server.is_public) !== 1) return sendJson(response, 404, { error: 'Public server not found.' });
     if (isServerBanned.get(serverId, user.id)) return sendJson(response, 403, { error: 'You are banned from this server.' });
-    if (isServerMember.get(serverId, user.id)) return sendJson(response, 200, { server: { ...publicServerSummary(server), alreadyMember: true } });
+    const deviceHash = serverDeviceHash(request, serverId);
+    if (deviceHash && isServerDeviceBanned.get(serverId, deviceHash)) return sendJson(response, 403, { error: 'This Glean installation is banned from this server.' });
+    if (isServerMember.get(serverId, user.id)) {
+      if (deviceHash) recordServerMemberDevice.run(serverId, user.id, deviceHash, now, now);
+      return sendJson(response, 200, { server: { ...publicServerSummary(server), alreadyMember: true } });
+    }
     const memberRole = findDefaultMemberRole.get(serverId);
     if (!memberRole) return sendJson(response, 500, { error: 'This server has no member role.' });
     try {
       insertMember.run(serverId, user.id, memberRole.id, now, Number(nextMemberSortOrder.get(user.id).next));
       initChannelReadsForMember(serverId, user.id);
+      if (deviceHash) recordServerMemberDevice.run(serverId, user.id, deviceHash, now, now);
     } catch (error) {
       if (String(error.message).includes('UNIQUE') && isServerMember.get(serverId, user.id)) {
         return sendJson(response, 200, { server: { ...publicServerSummary(server), alreadyMember: true } });
@@ -5020,6 +5079,11 @@ async function handleApi(request, response) {
     const serverId = Number(serverMatch[1]);
     if (!canSeeServer(user, serverId)) return sendJson(response, 404, { error: 'Server not found.' });
     const member = findServerMember.get(serverId, user.id);
+    const deviceHash = serverDeviceHash(request, serverId);
+    if (member && deviceHash) {
+      if (isServerDeviceBanned.get(serverId, deviceHash)) return sendJson(response, 403, { error: 'This Glean installation is banned from this server.' });
+      recordServerMemberDevice.run(serverId, user.id, deviceHash, now, now);
+    }
     const inspecting = !member && isPlatformAdmin(user);
     const unread = member ? channelUnreadMapForServer(user.id, serverId) : new Map();
     const memberLimit = 50;
@@ -5189,6 +5253,33 @@ async function handleApi(request, response) {
         bannedBy: ban.banned_by || null,
       })),
     });
+  }
+
+  const serverDeviceBansMatch = path.match(/^\/api\/servers\/(\d+)\/device-bans$/);
+  if (method === 'GET' && serverDeviceBansMatch) {
+    const user = requireSignedInUser(request, response);
+    if (!user) return;
+    const serverId = Number(serverDeviceBansMatch[1]);
+    if (!canServerPermission(user, serverId, 'manageMembers')) return sendJson(response, 403, { error: 'Manage members permission required.' });
+    return sendJson(response, 200, { deviceBans: listServerDeviceBans.all(serverId).map((ban) => ({
+      deviceHash: ban.device_hash,
+      label: `Installation ${ban.device_hash.slice(0, 10)}`,
+      reason: ban.reason || '',
+      createdAt: ban.created_at,
+      bannedBy: ban.banned_by || null,
+    })) });
+  }
+
+  const serverDeviceUnbanMatch = path.match(/^\/api\/servers\/(\d+)\/device-bans\/([a-f0-9]{64})$/i);
+  if (method === 'DELETE' && serverDeviceUnbanMatch) {
+    const user = requireSignedInUser(request, response);
+    if (!user) return;
+    const serverId = Number(serverDeviceUnbanMatch[1]);
+    const deviceHash = serverDeviceUnbanMatch[2].toLowerCase();
+    if (!canServerPermission(user, serverId, 'manageMembers')) return sendJson(response, 403, { error: 'Manage members permission required.' });
+    if (!deleteServerDeviceBan.run(serverId, deviceHash).changes) return sendJson(response, 404, { error: 'That installation is not banned.' });
+    writeServerAudit(serverId, user, 'member.device-unbanned', { targetType: 'device', targetId: deviceHash.slice(0, 10), targetName: `Installation ${deviceHash.slice(0, 10)}` });
+    return sendJson(response, 200, { ok: true });
   }
 
   const serverUnbanMatch = path.match(/^\/api\/servers\/(\d+)\/bans\/(\d+)$/);
@@ -5524,6 +5615,54 @@ async function handleApi(request, response) {
     sendEvent(targetUserId, 'server-membership', { serverId, action });
     notifyServerMembers(serverId, 'server-updated', { serverId, action: `member-${action}` });
     return sendJson(response, 200, { ok: true, action });
+  }
+
+  const memberDeviceBanMatch = path.match(/^\/api\/servers\/(\d+)\/members\/(\d+)\/device-ban$/);
+  if (method === 'POST' && memberDeviceBanMatch) {
+    const user = requireSignedInUser(request, response);
+    if (!user) return;
+    const serverId = Number(memberDeviceBanMatch[1]);
+    const targetUserId = Number(memberDeviceBanMatch[2]);
+    const actor = findServerMember.get(serverId, user.id);
+    const target = findServerMember.get(serverId, targetUserId);
+    if (!canServerPermission(user, serverId, 'manageMembers')) return sendJson(response, 403, { error: 'Manage members permission required.' });
+    if (!target || target.permissions === 'owner' || (actor?.permissions === 'moderator' && target.permissions === 'moderator')) return sendJson(response, 403, { error: 'You cannot moderate this member.' });
+    const deviceHashes = listServerMemberDeviceHashes.all(serverId, targetUserId).map((item) => item.device_hash);
+    if (!deviceHashes.length) return sendJson(response, 409, { error: 'No Glean installation is known for this member yet. Ask them to open the server and try again.' });
+    const currentDeviceHash = serverDeviceHash(request, serverId);
+    if (currentDeviceHash && deviceHashes.includes(currentDeviceHash)) return sendJson(response, 409, { error: 'This installation is also being used by your moderator account, so it cannot be banned.' });
+    const linkedUsers = listUsersSharingServerDevices.all(serverId, serverId, targetUserId).map((item) => Number(item.user_id));
+    for (const linkedUserId of linkedUsers) {
+      const linkedMember = findServerMember.get(serverId, linkedUserId);
+      if (linkedUserId !== targetUserId && (linkedMember?.permissions === 'owner' || linkedMember?.permissions === 'moderator')) {
+        return sendJson(response, 409, { error: 'This installation is shared with a server owner or moderator. Remove that account from the installation before device-banning it.' });
+      }
+    }
+    let input = {};
+    try { input = await readJson(request, 2048); } catch (error) { return sendJson(response, 400, { error: error.message }); }
+    const reason = typeof input.reason === 'string' ? input.reason.trim().slice(0, 500) : '';
+    const removedMembers = linkedUsers.map((linkedUserId) => {
+      const linkedMember = findServerMember.get(serverId, linkedUserId);
+      return linkedMember ? { userId: linkedUserId, roleId: Number(linkedMember.role_id) } : null;
+    }).filter(Boolean);
+    const targetName = listServerMembers.all(serverId).find((item) => Number(item.user_id) === targetUserId)?.username || `User ${targetUserId}`;
+    withTransaction(() => {
+      for (const deviceHash of deviceHashes) insertServerDeviceBan.run(serverId, deviceHash, reason, now, user.id);
+      for (const { userId: linkedUserId } of removedMembers) {
+        deleteServerTimeout.run(serverId, linkedUserId);
+        removeServerMember.run(serverId, linkedUserId);
+      }
+    });
+    for (const { userId: linkedUserId } of removedMembers) {
+      leaveVoiceRooms(linkedUserId, null, serverId);
+      sendEvent(linkedUserId, 'server-membership', { serverId, action: 'device-ban' });
+    }
+    writeServerAudit(serverId, user, 'member.device-banned', {
+      targetType: 'member', targetId: targetUserId, targetName,
+      details: { installationsBanned: deviceHashes.length, accountsRemoved: removedMembers.length },
+    });
+    notifyServerMembers(serverId, 'server-updated', { serverId, action: 'member-device-ban' });
+    return sendJson(response, 200, { ok: true, deviceCount: deviceHashes.length, removedMembers });
   }
 
   const memberTimeoutMatch = path.match(/^\/api\/servers\/(\d+)\/members\/(\d+)\/timeout$/);

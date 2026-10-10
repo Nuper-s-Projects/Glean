@@ -3,11 +3,12 @@ import { createServer } from 'vite';
 
 let timerId = 0;
 const sockets = [];
+const windowListeners = new Map();
 
 globalThis.window = {
   location: { protocol: 'http:', host: 'glean.local' },
-  addEventListener() {},
-  removeEventListener() {},
+  addEventListener(name, handler) { windowListeners.set(name, handler); },
+  removeEventListener(name) { windowListeners.delete(name); },
   setInterval() { return ++timerId; },
   clearInterval() {},
   setTimeout() { return ++timerId; },
@@ -45,7 +46,11 @@ class FakeWebSocket {
   }
 
   send(value) { this.sent.push(value); }
-  close() { this.readyState = FakeWebSocket.CLOSING; }
+  close(code) {
+    if (code !== undefined && code !== 1000 && !(code >= 3000 && code <= 4999)) throw new Error('Invalid browser WebSocket close code');
+    this.closeCode = code;
+    this.readyState = FakeWebSocket.CLOSING;
+  }
 }
 globalThis.WebSocket = FakeWebSocket;
 
@@ -77,6 +82,14 @@ try {
   secondary = null;
   connection.send('dm-call-hangup', { conversationId: 8 });
   assert.equal(JSON.parse(sockets[0].sent.at(-1)).event, 'dm-call-hangup', 'closing a helper must not close the call socket');
+  windowListeners.get('offline')();
+  assert.equal(sockets[0].closeCode, 4001, 'network loss uses a browser-valid application close code');
+  windowListeners.get('online')();
+  assert.equal(sockets.length, 2, 'network restoration opens a fresh socket');
+  sockets[1].readyState = FakeWebSocket.OPEN;
+  sockets[1].dispatch('open');
+  windowListeners.get('online')();
+  assert.equal(sockets[1].closeCode, 4001, 'restoring an already-open connection also uses a valid code');
 } finally {
   secondary?.close();
   connection?.close();

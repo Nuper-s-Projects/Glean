@@ -69,7 +69,7 @@ export function useUserPopout() {
   return useContext(UserPopoutContext);
 }
 
-export function UserPopoutProvider({ account, children }) {
+export function UserPopoutProvider({ account, children, inlineUser = null, onMessage, profileFooter }) {
   const [popout, setPopout] = useState(null);
   const [copied, setCopied] = useState('');
   const [busy, setBusy] = useState('');
@@ -79,6 +79,10 @@ export function UserPopoutProvider({ account, children }) {
   const popoutRef = useRef(null);
   const [coords, setCoords] = useState({ top: 0, left: 0 });
   popoutRef.current = popout;
+
+  useEffect(() => {
+    if (inlineUser) setPopout({ user: mergeUser(inlineUser, [], account), anchor: null });
+  }, [inlineUser, account]);
 
   const close = useCallback(() => {
     setPopout(null);
@@ -122,7 +126,7 @@ export function UserPopoutProvider({ account, children }) {
   }, [popout]);
 
   useEffect(() => {
-    if (!popout) return undefined;
+    if (!popout?.anchor) return undefined;
     const onPointer = (event) => {
       if (event.target.closest?.('.dm-banner-backdrop')) return;
       if (cardRef.current?.contains(event.target) || popout.anchor?.contains?.(event.target)) return;
@@ -189,6 +193,11 @@ export function UserPopoutProvider({ account, children }) {
     setBusy('message');
     setNotice('');
     try {
+      if (onMessage) {
+        await onMessage(user.id);
+        setBusy('');
+        return;
+      }
       const { conversation } = await openDirectConversation(user.username);
       try { sessionStorage.setItem('glean.openConversationId', String(conversation.id)); } catch { /* ignore */ }
       window.dispatchEvent(new CustomEvent('glean-open-dm', { detail: { username: user.username, conversationId: conversation.id } }));
@@ -314,9 +323,9 @@ export function UserPopoutProvider({ account, children }) {
       {children}
       {user ? (
         <section
-          className={`dm-contact-profile is-floating${profileBackgroundStyle ? ' has-profile-background' : ''}${inLaredoCollege ? ' has-lc-ribbon' : ''}${inMagnet ? ' has-magnet-ribbon' : ''}`}
+          className={`dm-contact-profile ${inlineUser ? 'loop-glean-profile' : 'is-floating'}${profileBackgroundStyle ? ' has-profile-background' : ''}${inLaredoCollege ? ' has-lc-ribbon' : ''}${inMagnet ? ' has-magnet-ribbon' : ''}`}
           ref={cardRef}
-          style={{ top: coords.top, left: coords.left, ...(profileBackgroundStyle || {}) }}
+          style={{ ...(inlineUser ? {} : { top: coords.top, left: coords.left }), ...(profileBackgroundStyle || {}) }}
           aria-label={`${user.username || 'User'}'s profile`}
         >
           {inMagnet ? (
@@ -371,6 +380,7 @@ export function UserPopoutProvider({ account, children }) {
             </div>
           </div>
           <div className="dm-contact-body">
+            {profileFooter}
             <div className="dm-contact-section">
               <h3>About me</h3>
               <p className="dm-contact-bio">{user.bio || 'No bio yet.'}</p>

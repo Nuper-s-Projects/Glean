@@ -1,5 +1,8 @@
 import { existsSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
+import { createLoopCaptions, captionVtt } from './loopCaptions.mjs';
+import { createLoopPresence } from './loopPresence.mjs';
+import { createLoopFlow } from './loopFlow.mjs';
 
 const IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
 const VIDEO_TYPES = new Set(['video/mp4', 'video/webm', 'video/quicktime']);
@@ -14,22 +17,45 @@ function cleanTags(value) {
   return [...new Set(source.map((tag) => String(tag).trim().replace(/^#/, '').toLowerCase()).filter((tag) => /^[a-z0-9_]{1,32}$/.test(tag)))].slice(0, 10);
 }
 
-export function createLoopService({ database, uploadDirectory, parseMultipart, sendLocalFile, sendJson, readJson, currentUser, realtimeHub, isAdmin, nameFile }) {
+export function createLoopService({ database, uploadDirectory, parseMultipart, sendLocalFile, sendJson, readJson, currentUser, realtimeHub, isAdmin, nameFile, publicPresence = () => 'online', captionOptions = {}, copyVideoDownload = null }) {
   for (const sql of [
     'ALTER TABLE loop_posts ADD COLUMN edited_at TEXT',
     'ALTER TABLE loop_posts ADD COLUMN deleted_at TEXT',
     'ALTER TABLE loop_posts ADD COLUMN original_post_id INTEGER REFERENCES loop_posts(id) ON DELETE SET NULL',
     "ALTER TABLE loop_posts ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE users ADD COLUMN loop_background_json TEXT NOT NULL DEFAULT '{}'",
+    'ALTER TABLE loop_post_comments ADD COLUMN parent_id INTEGER REFERENCES loop_post_comments(id) ON DELETE SET NULL',
+    'ALTER TABLE loop_post_comments ADD COLUMN deleted_at TEXT',
   ]) { try { database.exec(sql); } catch (error) { if (!String(error.message).includes('duplicate column')) throw error; } }
 
   database.exec(`
+    CREATE TABLE IF NOT EXISTS loop_accounts (
+      user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      connected_at TEXT NOT NULL,
+      consent_version INTEGER NOT NULL
+    ) STRICT;
+    CREATE INDEX IF NOT EXISTS loop_comment_thread_idx ON loop_post_comments(post_id,parent_id,id);
+    CREATE TABLE IF NOT EXISTS loop_notification_preferences (
+      user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      settings_json TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS loop_post_polls (
+      post_id INTEGER PRIMARY KEY REFERENCES loop_posts(id) ON DELETE CASCADE,
+      question TEXT NOT NULL, options_json TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS loop_poll_votes (
+      post_id INTEGER NOT NULL REFERENCES loop_post_polls(post_id) ON DELETE CASCADE,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      option_index INTEGER NOT NULL CHECK(option_index BETWEEN 0 AND 5),
+      PRIMARY KEY(post_id, user_id)
+    ) STRICT;
     CREATE TABLE IF NOT EXISTS loop_post_media (
       id INTEGER PRIMARY KEY, post_id INTEGER NOT NULL REFERENCES loop_posts(id) ON DELETE CASCADE,
       storage_name TEXT NOT NULL UNIQUE, original_name TEXT NOT NULL, mime_type TEXT NOT NULL,
       size_bytes INTEGER NOT NULL, position INTEGER NOT NULL DEFAULT 0
     ) STRICT;
     CREATE INDEX IF NOT EXISTS loop_post_media_post_idx ON loop_post_media(post_id, position, id);
+    CREATE INDEX IF NOT EXISTS loop_posts_author_idx ON loop_posts(user_id, id DESC) WHERE deleted_at IS NULL;
     CREATE TABLE IF NOT EXISTS loop_bookmarks (
       post_id INTEGER NOT NULL REFERENCES loop_posts(id) ON DELETE CASCADE,
       user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, created_at TEXT NOT NULL,
@@ -79,18 +105,26 @@ export function createLoopService({ database, uploadDirectory, parseMultipart, s
     ) STRICT;
     CREATE INDEX IF NOT EXISTS loop_messages_conversation_idx ON loop_messages(conversation_id, id DESC);
   `);
+  for (const sql of [
+    'ALTER TABLE loop_notifications ADD COLUMN comment_id INTEGER REFERENCES loop_post_comments(id) ON DELETE SET NULL',
+    'ALTER TABLE loop_notifications ADD COLUMN event_key TEXT',
+  ]) { try { database.exec(sql); } catch (error) { if (!String(error.message).includes('duplicate column')) throw error; } }
+  database.exec('CREATE UNIQUE INDEX IF NOT EXISTS loop_notification_event_idx ON loop_notifications(event_key) WHERE event_key IS NOT NULL');
+  const captions = createLoopCaptions({ database, uploadDirectory, realtimeHub, ...captionOptions });
 
+  const postVisibility = `NOT EXISTS(SELECT 1 FROM loop_blocks b WHERE (b.user_id=? AND b.target_id=p.user_id) OR (b.user_id=p.user_id AND b.target_id=?))
+      AND NOT EXISTS(SELECT 1 FROM loop_mutes m WHERE m.user_id=? AND m.target_id=p.user_id)`;
+  const flowPage = createLoopFlow(database, postVisibility);
   const postSelect = (where = '1=1') => `
     SELECT p.*, u.username, u.avatar_url, u.bio,
       (SELECT COUNT(*) FROM loop_post_likes l WHERE l.post_id=p.id) likes,
-      (SELECT COUNT(*) FROM loop_post_comments c WHERE c.post_id=p.id) comments,
+      (SELECT COUNT(*) FROM loop_post_comments c WHERE c.post_id=p.id AND c.deleted_at IS NULL) comments,
       (SELECT COUNT(*) FROM loop_posts r WHERE r.original_post_id=p.id AND r.deleted_at IS NULL) reposts,
       EXISTS(SELECT 1 FROM loop_post_likes l WHERE l.post_id=p.id AND l.user_id=?) liked,
       EXISTS(SELECT 1 FROM loop_bookmarks b WHERE b.post_id=p.id AND b.user_id=?) bookmarked
     FROM loop_posts p JOIN users u ON u.id=p.user_id
     WHERE p.deleted_at IS NULL AND ${where}
-      AND NOT EXISTS(SELECT 1 FROM loop_blocks b WHERE (b.user_id=? AND b.target_id=p.user_id) OR (b.user_id=p.user_id AND b.target_id=?))
-      AND NOT EXISTS(SELECT 1 FROM loop_mutes m WHERE m.user_id=? AND m.target_id=p.user_id)`;
+      AND ${postVisibility}`;
 
   function mediaFor(ids) {
     if (!ids.length) return new Map();
@@ -98,7 +132,7 @@ export function createLoopService({ database, uploadDirectory, parseMultipart, s
     const map = new Map();
     for (const row of rows) {
       const list = map.get(Number(row.post_id)) || [];
-      list.push({ id: Number(row.id), name: row.original_name, mimeType: row.mime_type, size: Number(row.size_bytes), url: `/api/v1/loop/media/${row.id}` });
+      list.push({ id: Number(row.id), name: row.original_name, mimeType: row.mime_type, size: Number(row.size_bytes), url: `/api/v1/loop/media/${row.id}`, captions: captions.publicStatus(Number(row.id)) });
       map.set(Number(row.post_id), list);
     }
     return map;
@@ -106,10 +140,26 @@ export function createLoopService({ database, uploadDirectory, parseMultipart, s
 
   function publicPosts(rows, viewerId) {
     const map = mediaFor(rows.map((row) => Number(row.id)));
+    const polls = new Map();
+    if (rows.length) {
+      const ids = rows.map(row => Number(row.id));
+      const marks = ids.map(() => '?').join(',');
+      for (const row of database.prepare(`SELECT * FROM loop_post_polls WHERE post_id IN (${marks})`).all(...ids)) {
+        polls.set(Number(row.post_id), { question: row.question, options: safeJson(row.options_json, []).map((text, index) => ({ index, text, votes: 0, voted: false })), voterCount: 0 });
+      }
+      for (const row of database.prepare(`SELECT post_id, option_index, COUNT(*) votes, MAX(user_id=?) voted FROM loop_poll_votes WHERE post_id IN (${marks}) GROUP BY post_id,option_index`).all(viewerId, ...ids)) {
+        const poll = polls.get(Number(row.post_id));
+        if (!poll?.options[row.option_index]) continue;
+        poll.options[row.option_index].votes = Number(row.votes);
+        poll.options[row.option_index].voted = Boolean(row.voted);
+        poll.voterCount += Number(row.votes);
+      }
+    }
     return rows.map((row) => ({
       id: Number(row.id), author: { id: Number(row.user_id), username: row.username || 'Unknown', avatarUrl: row.avatar_url || null },
       content: row.body, createdAt: row.created_at, editedAt: row.edited_at || null,
       tags: cleanTags(safeJson(row.tags_json, [])), media: map.get(Number(row.id)) || [],
+      poll: polls.get(Number(row.id)) || null,
       originalPostId: row.original_post_id ? Number(row.original_post_id) : null,
       likes: Number(row.likes || 0), comments: Number(row.comments || 0), reposts: Number(row.reposts || 0),
       liked: Boolean(row.liked), bookmarked: Boolean(row.bookmarked), own: Number(row.user_id) === Number(viewerId),
@@ -121,11 +171,46 @@ export function createLoopService({ database, uploadDirectory, parseMultipart, s
     return row ? publicPosts([row], viewerId)[0] : null;
   }
 
-  function notify(userId, actorId, type, postId, body, now) {
-    if (!userId || Number(userId) === Number(actorId)) return;
-    const result = database.prepare('INSERT INTO loop_notifications(user_id,actor_id,type,post_id,body,created_at) VALUES(?,?,?,?,?,?)').run(userId, actorId, type, postId || null, body || '', now);
-    realtimeHub.send(userId, 'loop-notification', { id: Number(result.lastInsertRowid), type, postId: postId || null });
+  const notificationDefaults = { comments: true, replies: true, likes: true, follows: true, mentions: true, reposts: true };
+  function preferences(userId) {
+    return { ...notificationDefaults, ...safeJson(database.prepare('SELECT settings_json FROM loop_notification_preferences WHERE user_id=?').get(userId)?.settings_json, {}) };
   }
+  function blocked(a, b) {
+    return Boolean(database.prepare('SELECT 1 FROM loop_blocks WHERE (user_id=? AND target_id=?) OR (user_id=? AND target_id=?)').get(a,b,b,a));
+  }
+  function notify(userId, actorId, type, postId, body, now, commentId = null) {
+    if (!userId || Number(userId) === Number(actorId)) return;
+    const setting = { comment:'comments', reply:'replies', like:'likes', follow:'follows', mention:'mentions', repost:'reposts' }[type];
+    if (!preferences(userId)[setting] || blocked(userId, actorId) || database.prepare('SELECT 1 FROM loop_mutes WHERE user_id=? AND target_id=?').get(userId,actorId)) return;
+    if (postId) {
+      const post = database.prepare('SELECT user_id FROM loop_posts WHERE id=? AND deleted_at IS NULL').get(postId);
+      if (!post || blocked(userId, post.user_id) || database.prepare('SELECT 1 FROM loop_mutes WHERE user_id=? AND target_id=?').get(userId,post.user_id)) return;
+    }
+    const key = `${userId}:${actorId}:${type}:${postId || 0}:${commentId || 0}`;
+    const result = database.prepare('INSERT OR IGNORE INTO loop_notifications(user_id,actor_id,type,post_id,body,created_at,comment_id,event_key) VALUES(?,?,?,?,?,?,?,?)').run(userId,actorId,type,postId || null,body || '',now,commentId,key);
+    if (result.changes) realtimeHub.send(userId, 'loop-notification', { id: Number(result.lastInsertRowid), type, postId: postId || null, commentId });
+    return true;
+  }
+  function mentionUsers(content) {
+    const names = [...new Set([...content.matchAll(/(?:^|[\s(])@([^\s@]{1,32})/gu)].map(match => match[1].replace(/[.,!?;:)]+$/, '').toLowerCase()))].slice(0,10);
+    if (!names.length) return [];
+    return database.prepare(`SELECT id,username FROM users WHERE lower(username) IN (${names.map(() => '?').join(',')})`).all(...names);
+  }
+  function notifyMentions(content, actorId, postId, now, commentId = null, skip = new Set()) {
+    for (const target of mentionUsers(content)) if (!skip.has(Number(target.id))) notify(target.id,actorId,'mention',postId,commentId ? 'mentioned you in a comment' : 'mentioned you in a post',now,commentId);
+  }
+
+  const connectedAccount = database.prepare('SELECT 1 FROM loop_accounts WHERE user_id=?');
+  const presence = createLoopPresence({
+    canJoin: id => Boolean(connectedAccount.get(id)),
+    notify: (ids, event, payload) => realtimeHub.broadcast(ids, event, payload),
+    visibleUsers: (ids, viewerId) => database.prepare(`
+      SELECT u.id,u.username,u.avatar_url FROM users u JOIN loop_accounts a ON a.user_id=u.id
+      WHERE u.id IN (SELECT value FROM json_each(?)) AND u.presence_hidden=0 AND u.keep_information_secret=0
+      AND NOT EXISTS(SELECT 1 FROM loop_blocks b WHERE (b.user_id=? AND b.target_id=u.id) OR (b.target_id=? AND b.user_id=u.id))
+      ORDER BY u.id
+    `).all(JSON.stringify(ids),viewerId,viewerId).map(row => ({ id:Number(row.id), username:row.username, avatarUrl:row.avatar_url || null, presence:publicPresence(row.id) })).filter(row => row.presence !== 'offline'),
+  });
 
   const auth = (request, response) => {
     const user = currentUser(request);
@@ -139,47 +224,154 @@ export function createLoopService({ database, uploadDirectory, parseMultipart, s
     if (!user) return true;
     const method = request.method;
     const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
+    if (path === '/api/loop/connection' && (method === 'GET' || method === 'POST')) {
+      let created = false;
+      if (method === 'POST') {
+        const body = await readJson(request);
+        if (body?.confirmed !== true || body?.consentVersion !== 1) return sendJson(response,400,{error:'Confirm the account connection before continuing.'}),true;
+        const result = database.prepare('INSERT INTO loop_accounts(user_id,connected_at,consent_version) VALUES(?,?,1) ON CONFLICT(user_id) DO NOTHING').run(user.id,now);
+        created = Boolean(result.changes);
+      }
+      const connection = database.prepare('SELECT connected_at,consent_version FROM loop_accounts WHERE user_id=?').get(user.id);
+      return sendJson(response,created ? 201 : 200,{connected:Boolean(connection),connectedAt:connection?.connected_at || null,consentVersion:connection?.consent_version || 1,account:{id:Number(user.id),username:user.username,avatarUrl:user.avatar_url || null}}),true;
+    }
+    if (!database.prepare('SELECT 1 FROM loop_accounts WHERE user_id=?').get(user.id)) return sendJson(response,403,{error:'Connect your Glean account to Glean Loop before continuing.',loopConnectionRequired:true}),true;
+
+    if (method === 'GET' && path === '/api/loop/online') {
+      const after = Number(url.searchParams.get('after') || 0);
+      const limit = Number(url.searchParams.get('limit') || 30);
+      if (!Number.isSafeInteger(after) || after < 0 || !Number.isInteger(limit) || limit < 1 || limit > 100) return sendJson(response,400,{error:'Choose a valid online people page.'}),true;
+      const people = presence.list(user.id);
+      const remaining = people.filter(person => person.id > after);
+      const page = remaining.slice(0,limit);
+      return sendJson(response,200,{users:page,total:people.length,page:{hasMore:remaining.length>limit,nextAfter:remaining.length>limit ? page.at(-1).id : null}}),true;
+    }
+
+    if (method === 'GET' && path === '/api/loop/captions/config') return sendJson(response,200,{available:captions.available(),maxDurationSeconds:1800}),true;
+    const captionMatch = path.match(/^\/api\/loop\/media\/(\d+)\/captions(?:\.vtt)?$/);
+    if (captionMatch && (method === 'GET' || method === 'POST')) {
+      const id = Number(captionMatch[1]);
+      const media = database.prepare('SELECT * FROM loop_post_media WHERE id=?').get(id);
+      const post = media && loadPost(Number(media.post_id),user.id);
+      if (!post) return sendJson(response,404,{error:'Video unavailable.'}),true;
+      const record = captions.get(id);
+      if (method === 'POST') {
+        if (!post.own) return sendJson(response,403,{error:'Only the uploader can retry captions.'}),true;
+        if (!record || record.status !== 'failed') return sendJson(response,409,{error:'There are no failed captions to retry.'}),true;
+        if (!captions.available()) return sendJson(response,503,{error:'Auto captions are temporarily unavailable.'}),true;
+        if (record.attempts >= 3) return sendJson(response,429,{error:'Caption retry limit reached for this video.'}),true;
+        database.prepare("UPDATE loop_media_captions SET status='queued',error='',updated_at=? WHERE media_id=?").run(now,id);
+        captions.kick(); return sendJson(response,202,{captions:captions.publicStatus(id)}),true;
+      }
+      if (path.endsWith('.vtt')) {
+        if (record?.status !== 'ready') return sendJson(response,404,{error:'Captions are not ready.'}),true;
+        response.writeHead(200,{'Content-Type':'text/vtt; charset=utf-8','Cache-Control':'private, max-age=3600','X-Content-Type-Options':'nosniff'});
+        response.end(captionVtt(safeJson(record.cues_json,[]))); return true;
+      }
+      return sendJson(response,200,{captions:captions.publicStatus(id)}),true;
+    }
+
+    if (method === 'GET' && path === '/api/loop/flow') {
+      let result;
+      try { result = flowPage(Number(user.id), url.searchParams); }
+      catch (failure) { if (failure.status !== 400) throw failure; return sendJson(response,400,{error:failure.message}),true; }
+      const rows = result.ids.length ? database.prepare(postSelect(`p.id IN (${result.ids.map(() => '?').join(',')})`)).all(user.id,user.id,...result.ids,user.id,user.id,user.id) : [];
+      const posts = new Map(publicPosts(rows,user.id).map(post => [post.id,post]));
+      return sendJson(response,200,{posts:result.ids.map(id => posts.get(id)).filter(Boolean),page:result.page}),true;
+    }
 
     if (method === 'GET' && path === '/api/loop/posts') {
+      if (url.searchParams.has('ids')) {
+        const raw = url.searchParams.get('ids').split(',');
+        if (!raw.length || raw.length > 60 || raw.some(id => !/^\d+$/.test(id) || !Number.isSafeInteger(Number(id)) || Number(id) < 1)) {
+          return sendJson(response, 400, { error: 'Choose between 1 and 60 valid post IDs.' }), true;
+        }
+        const ids = [...new Set(raw.map(Number))];
+        // Refresh already-loaded posts after reconnect without losing history.
+        // The same viewer block/mute and deletion checks apply as to the feed.
+        const rows = database.prepare(`${postSelect(`p.id IN (${ids.map(() => '?').join(',')})`)} ORDER BY p.id DESC`)
+          .all(user.id, user.id, ...ids, user.id, user.id, user.id);
+        return sendJson(response, 200, { posts: publicPosts(rows, user.id) }), true;
+      }
       const limit = Math.min(30, Math.max(1, Number(url.searchParams.get('limit')) || 12));
       const before = Math.max(0, Number(url.searchParams.get('before')) || 0);
       const author = Math.max(0, Number(url.searchParams.get('author')) || 0);
       const query = String(url.searchParams.get('q') || '').trim().slice(0, 80);
       const tag = String(url.searchParams.get('tag') || '').replace(/^#/, '').toLowerCase();
       const bookmarked = url.searchParams.get('bookmarked') === '1';
-      const clauses = ['(?=0 OR p.id<?)', '(?=0 OR p.user_id=?)', "(?='' OR lower(p.body) LIKE '%'||lower(?)||'%' OR lower(u.username) LIKE '%'||lower(?)||'%')", "(?='' OR EXISTS(SELECT 1 FROM json_each(p.tags_json) WHERE value=?))", '(?=0 OR EXISTS(SELECT 1 FROM loop_bookmarks x WHERE x.post_id=p.id AND x.user_id=?))'];
+      const feed = url.searchParams.get('feed') || 'everyone';
+      if (!['everyone','following'].includes(feed)) return sendJson(response,400,{error:'Choose Everyone or Following.'}),true;
+      const type = String(url.searchParams.get('type') || 'all');
+      if (!['all', 'text', 'photo', 'gif', 'video', 'audio', 'poll'].includes(type)) return sendJson(response, 400, { error: 'Choose a valid post type.' }), true;
+      const clauses = ['(?=0 OR p.id<?)', author ? 'p.user_id=?' : '(?=0 OR p.user_id=?)', "(?='' OR lower(p.body) LIKE '%'||lower(?)||'%' OR lower(u.username) LIKE '%'||lower(?)||'%' OR EXISTS(SELECT 1 FROM loop_post_polls x WHERE x.post_id=p.id AND lower(x.question) LIKE '%'||lower(?)||'%'))", "(?='' OR EXISTS(SELECT 1 FROM json_each(p.tags_json) WHERE value=?))", '(?=0 OR EXISTS(SELECT 1 FROM loop_bookmarks x WHERE x.post_id=p.id AND x.user_id=?))'];
+      const mediaTypes = { text: 'NOT EXISTS(SELECT 1 FROM loop_post_media f WHERE f.post_id=p.id)', photo: "EXISTS(SELECT 1 FROM loop_post_media f WHERE f.post_id=p.id AND f.mime_type LIKE 'image/%' AND f.mime_type!='image/gif')", gif: "EXISTS(SELECT 1 FROM loop_post_media f WHERE f.post_id=p.id AND f.mime_type='image/gif')", video: "EXISTS(SELECT 1 FROM loop_post_media f WHERE f.post_id=p.id AND f.mime_type LIKE 'video/%')", audio: "EXISTS(SELECT 1 FROM loop_post_media f WHERE f.post_id=p.id AND f.mime_type LIKE 'audio/%')" };
+      if (type === 'poll') clauses.push('EXISTS(SELECT 1 FROM loop_post_polls x WHERE x.post_id=p.id)');
+      else if (type !== 'all') clauses.push(mediaTypes[type]);
+      if (type === 'text') clauses.push('NOT EXISTS(SELECT 1 FROM loop_post_polls x WHERE x.post_id=p.id)');
+      if (feed === 'following') clauses.push('EXISTS(SELECT 1 FROM loop_follows f WHERE f.follower_id=? AND f.followed_id=p.user_id)');
       const sql = `${postSelect(clauses.join(' AND '))} ORDER BY p.id DESC LIMIT ?`;
-      const rows = database.prepare(sql).all(user.id, user.id, before, before, author, author, query, query, query, tag, tag, bookmarked ? 1 : 0, user.id, user.id, user.id, user.id, limit + 1);
+      const rows = database.prepare(sql).all(user.id, user.id, before, before, ...(author ? [author] : [0, 0]), query, query, query, query, tag, tag, bookmarked ? 1 : 0, user.id, ...(feed === 'following' ? [user.id] : []), user.id, user.id, user.id, limit + 1);
       const hasMore = rows.length > limit;
       const page = rows.slice(0, limit);
-      return sendJson(response, 200, { posts: publicPosts(page, user.id), page: { hasMore, nextBefore: hasMore ? Number(page.at(-1)?.id || 0) : null } }), true;
+      const tags = author ? database.prepare(`SELECT value tag, COUNT(*) count FROM loop_posts p, json_each(p.tags_json) WHERE p.user_id=? AND p.deleted_at IS NULL AND NOT EXISTS(SELECT 1 FROM loop_blocks b WHERE (b.user_id=? AND b.target_id=p.user_id) OR (b.user_id=p.user_id AND b.target_id=?)) AND NOT EXISTS(SELECT 1 FROM loop_mutes m WHERE m.user_id=? AND m.target_id=p.user_id) GROUP BY value ORDER BY count DESC,value LIMIT 50`).all(author, user.id, user.id, user.id).map(row => ({ tag: row.tag, count: Number(row.count) })) : undefined;
+      return sendJson(response, 200, { posts: publicPosts(page, user.id), ...(tags ? { tags } : {}), page: { hasMore, nextBefore: hasMore ? Number(page.at(-1)?.id || 0) : null } }), true;
     }
 
     if (method === 'POST' && path === '/api/loop/posts') {
-      let content = '', tags = [], originalPostId = null, files = [];
+      let content = '', tags = [], originalPostId = null, files = [], pollInput = null, autoCaptions = false, videoDownloadId = null;
       if (String(request.headers['content-type'] || '').startsWith('multipart/form-data')) {
         const parsed = await parseMultipart(request, { directory: uploadDirectory, nameFile });
         files = parsed.files; content = String(parsed.fields.content || '').trim(); tags = cleanTags(parsed.fields.tags); originalPostId = Number(parsed.fields.originalPostId) || null;
+        if (parsed.fields.poll) pollInput = safeJson(parsed.fields.poll, false);
+        autoCaptions = parsed.fields.autoCaptions === 'true';
+        videoDownloadId = parsed.fields.videoDownloadId ?? null;
       } else {
         const body = await readJson(request); content = String(body.content || '').trim(); tags = cleanTags(body.tags); originalPostId = Number(body.originalPostId) || null;
+        pollInput = body.poll ?? null;
+        videoDownloadId = body.videoDownloadId ?? null;
       }
+      const discardFiles = () => { for (const file of files) try { unlinkSync(join(uploadDirectory,file.storageName)); } catch {} };
+      if (videoDownloadId !== null && (typeof videoDownloadId !== 'string' || !/^[a-f0-9-]{36}$/.test(videoDownloadId) || files.length)) { discardFiles(); return sendJson(response,400,{error:'Use one prepared video without other attachments.'}),true; }
       const valid = files.every((file) => IMAGE_TYPES.has(file.type) || VIDEO_TYPES.has(file.type) || AUDIO_TYPES.has(file.type));
       const imageOnly = files.every((file) => IMAGE_TYPES.has(file.type));
       if (!valid || (files.length > 1 && !imageOnly)) { for (const file of files) try { unlinkSync(join(uploadDirectory,file.storageName)); } catch {} return sendJson(response,400,{error:'Add up to 10 images, or one GIF, video, or audio file.'}), true; }
-      if (!content && !files.length && !originalPostId) return sendJson(response,400,{error:'Write something or add media before posting.'}), true;
-      if (content.length > 2000) return sendJson(response,400,{error:'Loop posts can be up to 2,000 characters.'}), true;
-      if (originalPostId && !database.prepare('SELECT 1 FROM loop_posts WHERE id=? AND deleted_at IS NULL').get(originalPostId)) return sendJson(response,404,{error:'That post no longer exists.'}), true;
+      let poll = null;
+      if (pollInput !== null) {
+        const question = typeof pollInput?.question === 'string' ? pollInput.question.trim() : '';
+        const options = Array.isArray(pollInput?.options) ? pollInput.options.map(option => typeof option === 'string' ? option.trim() : '') : [];
+        if (!question || question.length > 200 || options.length < 2 || options.length > 6 || options.some(option => !option || option.length > 100) || new Set(options.map(option => option.toLowerCase())).size !== options.length) {
+          for (const file of files) try { unlinkSync(join(uploadDirectory, file.storageName)); } catch {}
+          return sendJson(response, 400, { error: 'Add a poll question (up to 200 characters) and 2–6 different choices (up to 100 characters each).' }), true;
+        }
+        poll = { question, options };
+      }
+      if (content.length > 2000) { discardFiles(); return sendJson(response,400,{error:'Loop posts can be up to 2,000 characters.'}), true; }
+      if (originalPostId && !database.prepare('SELECT 1 FROM loop_posts WHERE id=? AND deleted_at IS NULL').get(originalPostId)) { discardFiles(); return sendJson(response,404,{error:'That post no longer exists.'}), true; }
+      if (videoDownloadId !== null) {
+        if (!copyVideoDownload) return sendJson(response,503,{error:'Prepared video attachments are temporarily unavailable.'}),true;
+        try { files = [await copyVideoDownload(user.id,videoDownloadId,nameFile())]; }
+        catch (failure) { if (![400,404,409,503].includes(failure.status)) throw failure; return sendJson(response,failure.status,{error:failure.message}),true; }
+        if (request.aborted || response.destroyed) { discardFiles(); return true; }
+      }
+      if (autoCaptions) {
+        const failure = files.length !== 1 || !VIDEO_TYPES.has(files[0].type) ? {status:400,error:'Auto captions require one video.'} : captions.canQueue(user.id);
+        if (failure) { discardFiles(); return sendJson(response,failure.status,{error:failure.error}),true; }
+      }
+      if (!content && !files.length && !originalPostId && !poll) return sendJson(response,400,{error:'Write something, add media, or create a poll before posting.'}), true;
       let postId;
-      database.exec('BEGIN IMMEDIATE');
       try {
+        database.exec('BEGIN IMMEDIATE');
         const type = files[0] ? (IMAGE_TYPES.has(files[0].type) ? (files[0].type === 'image/gif' ? 'gif' : 'photo') : VIDEO_TYPES.has(files[0].type) ? 'video' : 'none') : 'none';
         postId = Number(database.prepare('INSERT INTO loop_posts(user_id,body,media_type,client_id,created_at,original_post_id,tags_json) VALUES(?,?,?,?,?,?,?)').run(user.id,content,type,null,now,originalPostId,JSON.stringify(tags)).lastInsertRowid);
         const insert = database.prepare('INSERT INTO loop_post_media(post_id,storage_name,original_name,mime_type,size_bytes,position) VALUES(?,?,?,?,?,?)');
-        files.forEach((file,index) => insert.run(postId,file.storageName,String(file.name).slice(0,240),file.type,file.size,index));
+        files.forEach((file,index) => { const result=insert.run(postId,file.storageName,String(file.name).slice(0,240),file.type,file.size,index); if (autoCaptions) captions.queue(Number(result.lastInsertRowid),now); });
+        if (poll) database.prepare('INSERT INTO loop_post_polls(post_id,question,options_json) VALUES(?,?,?)').run(postId, poll.question, JSON.stringify(poll.options));
         database.exec('COMMIT');
       } catch (error) { try { database.exec('ROLLBACK'); } catch {} for (const file of files) try { unlinkSync(join(uploadDirectory,file.storageName)); } catch {} throw error; }
       if (originalPostId) { const owner = database.prepare('SELECT user_id FROM loop_posts WHERE id=?').get(originalPostId); notify(owner?.user_id,user.id,'repost',originalPostId,'reposted your post',now); }
+      notifyMentions(content,user.id,postId,now);
       const post = loadPost(postId,user.id); realtimeHub.broadcastAll('loop-post-created',{ postId });
+      if (autoCaptions) captions.kick();
       return sendJson(response,201,{post}), true;
     }
 
@@ -202,16 +394,28 @@ export function createLoopService({ database, uploadDirectory, parseMultipart, s
       const postId = Number(postMatch[1]); const row = database.prepare('SELECT * FROM loop_posts WHERE id=? AND deleted_at IS NULL').get(postId);
       if (!row) return sendJson(response,404,{error:'Post not found.'}), true;
       if (Number(row.user_id)!==Number(user.id) && !isAdmin(user)) return sendJson(response,403,{error:'You cannot change this post.'}), true;
-      if (method === 'DELETE') { database.prepare('UPDATE loop_posts SET deleted_at=? WHERE id=?').run(now,postId); realtimeHub.broadcastAll('loop-post-deleted',{postId}); return sendJson(response,200,{ok:true}), true; }
+      if (method === 'DELETE') { database.prepare('UPDATE loop_posts SET deleted_at=? WHERE id=?').run(now,postId); database.prepare('DELETE FROM loop_media_captions WHERE media_id IN (SELECT id FROM loop_post_media WHERE post_id=?)').run(postId); realtimeHub.broadcastAll('loop-post-deleted',{postId}); return sendJson(response,200,{ok:true}), true; }
       const body = await readJson(request); const content = String(body.content ?? row.body).trim(); const tags = cleanTags(body.tags ?? safeJson(row.tags_json,[]));
-      if (!content && !mediaFor([postId]).get(postId)?.length && !row.original_post_id) return sendJson(response,400,{error:'A post cannot be empty.'}), true;
+      if (!content && !mediaFor([postId]).get(postId)?.length && !row.original_post_id && !database.prepare('SELECT 1 FROM loop_post_polls WHERE post_id=?').get(postId)) return sendJson(response,400,{error:'A post cannot be empty.'}), true;
       database.prepare('UPDATE loop_posts SET body=?,tags_json=?,edited_at=? WHERE id=?').run(content.slice(0,2000),JSON.stringify(tags),now,postId);
       realtimeHub.broadcastAll('loop-post-updated',{postId}); return sendJson(response,200,{post:loadPost(postId,user.id)}), true;
     }
 
+    const voteMatch = path.match(/^\/api\/loop\/posts\/(\d+)\/poll\/vote$/);
+    if (method === 'POST' && voteMatch) {
+      const postId = Number(voteMatch[1]);
+      const post = loadPost(postId, user.id);
+      if (!post?.poll) return sendJson(response, 404, { error: 'Poll not found.' }), true;
+      const { optionIndex } = await readJson(request);
+      if (!Number.isInteger(optionIndex) || optionIndex < 0 || optionIndex >= post.poll.options.length) return sendJson(response, 400, { error: 'Choose a valid poll option.' }), true;
+      database.prepare('INSERT INTO loop_poll_votes(post_id,user_id,option_index) VALUES(?,?,?) ON CONFLICT(post_id,user_id) DO UPDATE SET option_index=excluded.option_index').run(postId, user.id, optionIndex);
+      realtimeHub.broadcastAll('loop-post-updated', { postId });
+      return sendJson(response, 200, { post: loadPost(postId, user.id) }), true;
+    }
+
     const toggleMatch = path.match(/^\/api\/loop\/posts\/(\d+)\/(like|bookmark)$/);
     if (method === 'POST' && toggleMatch) {
-      const postId=Number(toggleMatch[1]); const post=database.prepare('SELECT user_id FROM loop_posts WHERE id=? AND deleted_at IS NULL').get(postId);
+      const postId=Number(toggleMatch[1]); const visible=loadPost(postId,user.id); const post=visible ? {user_id:visible.author.id} : null;
       if (!post) return sendJson(response,404,{error:'Post not found.'}), true;
       const table=toggleMatch[2]==='like'?'loop_post_likes':'loop_bookmarks'; const found=database.prepare(`SELECT 1 FROM ${table} WHERE post_id=? AND user_id=?`).get(postId,user.id);
       if(found) database.prepare(`DELETE FROM ${table} WHERE post_id=? AND user_id=?`).run(postId,user.id); else database.prepare(`INSERT INTO ${table}(post_id,user_id,created_at) VALUES(?,?,?)`).run(postId,user.id,now);
@@ -234,17 +438,37 @@ export function createLoopService({ database, uploadDirectory, parseMultipart, s
 
     const commentsMatch = path.match(/^\/api\/loop\/posts\/(\d+)\/comments$/);
     if (commentsMatch && method === 'GET') {
-      const rows=database.prepare(`SELECT c.id,c.body,c.created_at,c.user_id,u.username,u.avatar_url FROM loop_post_comments c JOIN users u ON u.id=c.user_id WHERE c.post_id=? ORDER BY c.id`).all(Number(commentsMatch[1]));
-      return sendJson(response,200,{comments:rows.map((r)=>({id:Number(r.id),content:r.body,createdAt:r.created_at,own:Number(r.user_id)===Number(user.id),author:{id:Number(r.user_id),username:r.username,avatarUrl:r.avatar_url||null}}))}), true;
+      const postId = Number(commentsMatch[1]);
+      if (!loadPost(postId,user.id)) return sendJson(response,404,{error:'Post not found.'}),true;
+      const parent = Number(url.searchParams.get('parent')) || null;
+      if (parent && !database.prepare('SELECT 1 FROM loop_post_comments WHERE id=? AND post_id=?').get(parent,postId)) return sendJson(response,404,{error:'Thread not found.'}),true;
+      const focus = Number(url.searchParams.get('focus')) || 0;
+      const after = focus ? Math.max(0,focus-1) : Math.max(0,Number(url.searchParams.get('after')) || 0);
+      const rows = database.prepare(`SELECT c.*,u.username,u.avatar_url,
+        (SELECT COUNT(*) FROM loop_post_comments child WHERE child.parent_id=c.id) reply_count
+        FROM loop_post_comments c JOIN users u ON u.id=c.user_id
+        WHERE c.post_id=? AND c.parent_id IS ? AND c.id>?
+        AND NOT EXISTS(SELECT 1 FROM loop_blocks b WHERE (b.user_id=? AND b.target_id=c.user_id) OR (b.user_id=c.user_id AND b.target_id=?))
+        ORDER BY c.id LIMIT 21`).all(postId,parent,after,user.id,user.id);
+      const page = rows.slice(0,20);
+      return sendJson(response,200,{comments:page.map(r => ({id:Number(r.id),parentId:r.parent_id ? Number(r.parent_id) : null,content:r.deleted_at ? '' : r.body,deleted:Boolean(r.deleted_at),replyCount:Number(r.reply_count),createdAt:r.created_at,own:Number(r.user_id)===Number(user.id),author:{id:Number(r.user_id),username:r.username,avatarUrl:r.avatar_url || null}})),page:{hasMore:rows.length>20,nextAfter:rows.length>20 ? Number(page.at(-1).id) : null}}),true;
     }
     if (commentsMatch && method === 'POST') {
-      const postId=Number(commentsMatch[1]); const post=database.prepare('SELECT user_id FROM loop_posts WHERE id=? AND deleted_at IS NULL').get(postId); if(!post) return sendJson(response,404,{error:'Post not found.'}), true;
+      const postId=Number(commentsMatch[1]); const visible=loadPost(postId,user.id); const post=visible ? {user_id:visible.author.id} : null; if(!post) return sendJson(response,404,{error:'Post not found.'}), true;
       const body=await readJson(request); const content=String(body.content||'').trim(); if(!content||content.length>1000) return sendJson(response,400,{error:'Comments must be 1 to 1,000 characters.'}), true;
-      const id=Number(database.prepare('INSERT INTO loop_post_comments(post_id,user_id,body,created_at) VALUES(?,?,?,?)').run(postId,user.id,content,now).lastInsertRowid);
-      notify(post.user_id,user.id,'comment',postId,'commented on your post',now); realtimeHub.broadcastAll('loop-comment-created',{postId,commentId:id}); return sendJson(response,201,{id}), true;
+      const parentId = body.parentId ?? null;
+      if (parentId !== null && (!Number.isSafeInteger(parentId) || parentId <= 0)) return sendJson(response,400,{error:'Choose a valid comment to reply to.'}),true;
+      const parent = parentId ? database.prepare('SELECT * FROM loop_post_comments WHERE id=? AND post_id=? AND deleted_at IS NULL').get(parentId,postId) : null;
+      if (parentId && (!parent || blocked(user.id,parent.user_id))) return sendJson(response,404,{error:'Comment unavailable.'}),true;
+      const id=Number(database.prepare('INSERT INTO loop_post_comments(post_id,user_id,body,created_at,parent_id) VALUES(?,?,?,?,?)').run(postId,user.id,content,now,parentId).lastInsertRowid);
+      const notified = new Set();
+      if (parent && notify(parent.user_id,user.id,'reply',postId,'replied to your comment',now,id)) notified.add(Number(parent.user_id));
+      if (!notified.has(Number(post.user_id)) && notify(post.user_id,user.id,'comment',postId,parent ? 'replied in your post’s discussion' : 'commented on your post',now,id)) notified.add(Number(post.user_id));
+      notifyMentions(content,user.id,postId,now,id,notified);
+      realtimeHub.broadcastAll('loop-comment-created',{postId,commentId:id,parentId}); return sendJson(response,201,{id,parentId}), true;
     }
     const commentDelete=path.match(/^\/api\/loop\/comments\/(\d+)$/);
-    if(commentDelete&&method==='DELETE'){const row=database.prepare('SELECT * FROM loop_post_comments WHERE id=?').get(Number(commentDelete[1]));if(!row)return sendJson(response,404,{error:'Comment not found.'}),true;if(Number(row.user_id)!==Number(user.id)&&!isAdmin(user))return sendJson(response,403,{error:'You cannot delete this comment.'}),true;database.prepare('DELETE FROM loop_post_comments WHERE id=?').run(row.id);realtimeHub.broadcastAll('loop-comment-deleted',{postId:Number(row.post_id),commentId:Number(row.id)});return sendJson(response,200,{ok:true}),true;}
+    if(commentDelete&&method==='DELETE'){const row=database.prepare('SELECT * FROM loop_post_comments WHERE id=? AND deleted_at IS NULL').get(Number(commentDelete[1]));if(!row)return sendJson(response,404,{error:'Comment not found.'}),true;if(Number(row.user_id)!==Number(user.id)&&!isAdmin(user))return sendJson(response,403,{error:'You cannot delete this comment.'}),true;database.prepare("UPDATE loop_post_comments SET deleted_at=?,body='' WHERE id=?").run(now,row.id);database.prepare('DELETE FROM loop_notifications WHERE comment_id=?').run(row.id);realtimeHub.broadcastAll('loop-comment-deleted',{postId:Number(row.post_id),commentId:Number(row.id),parentId:row.parent_id});return sendJson(response,200,{ok:true}),true;}
 
     if(method==='GET'&&path==='/api/loop/trending'){const tags=database.prepare(`SELECT value tag,COUNT(*) count FROM loop_posts,json_each(loop_posts.tags_json) WHERE deleted_at IS NULL GROUP BY value ORDER BY count DESC,value LIMIT 12`).all();return sendJson(response,200,{tags:tags.map((x)=>({tag:x.tag,count:Number(x.count)}))}),true;}
     if(method==='GET'&&path==='/api/loop/users'){const q=String(url.searchParams.get('q')||'').trim();const rows=database.prepare(`SELECT id,username,avatar_url,bio FROM users WHERE username IS NOT NULL AND id!=? AND (?='' OR lower(username) LIKE '%'||lower(?)||'%') AND NOT EXISTS(SELECT 1 FROM loop_blocks WHERE (user_id=? AND target_id=users.id) OR (user_id=users.id AND target_id=?)) ORDER BY username LIMIT 30`).all(user.id,q,q,user.id,user.id);return sendJson(response,200,{users:rows.map((r)=>({id:Number(r.id),username:r.username,avatarUrl:r.avatar_url||null,bio:r.bio||''}))}),true;}
@@ -253,13 +477,47 @@ export function createLoopService({ database, uploadDirectory, parseMultipart, s
     if(method==='GET'&&profileMatch){const id=Number(profileMatch[1]);const row=database.prepare(`SELECT id,username,avatar_url,bio,loop_background_json,created_at,(SELECT COUNT(*) FROM loop_follows WHERE followed_id=users.id) followers,(SELECT COUNT(*) FROM loop_follows WHERE follower_id=users.id) following,EXISTS(SELECT 1 FROM loop_follows WHERE follower_id=? AND followed_id=users.id) followed FROM users WHERE id=?`).get(user.id,id);if(!row)return sendJson(response,404,{error:'User not found.'}),true;return sendJson(response,200,{profile:{id,username:row.username,avatarUrl:row.avatar_url||null,bio:row.bio||'',background:safeJson(row.loop_background_json,{}),followers:Number(row.followers),following:Number(row.following),followed:Boolean(row.followed),own:id===Number(user.id)}}),true;}
     if(method==='PATCH'&&path==='/api/loop/profile'){const body=await readJson(request);const background={color:/^#[0-9a-f]{6}$/i.test(body.background?.color||'')?body.background.color:'#0c2439',imageUrl:String(body.background?.imageUrl||'').slice(0,500)};database.prepare('UPDATE users SET loop_background_json=? WHERE id=?').run(JSON.stringify(background),user.id);return sendJson(response,200,{background}),true;}
     const followMatch=path.match(/^\/api\/loop\/users\/(\d+)\/follow$/);
-    if(method==='POST'&&followMatch){const target=Number(followMatch[1]);if(target===Number(user.id))return sendJson(response,400,{error:'You cannot follow yourself.'}),true;const found=database.prepare('SELECT 1 FROM loop_follows WHERE follower_id=? AND followed_id=?').get(user.id,target);if(found)database.prepare('DELETE FROM loop_follows WHERE follower_id=? AND followed_id=?').run(user.id,target);else database.prepare('INSERT INTO loop_follows(follower_id,followed_id,created_at) VALUES(?,?,?)').run(user.id,target,now);if(!found)notify(target,user.id,'follow',null,'followed you',now);return sendJson(response,200,{followed:!found}),true;}
+    if(method==='POST'&&followMatch){const target=Number(followMatch[1]);if(target===Number(user.id))return sendJson(response,400,{error:'You cannot follow yourself.'}),true;if(!database.prepare('SELECT 1 FROM users WHERE id=?').get(target)||blocked(user.id,target))return sendJson(response,404,{error:'User unavailable.'}),true;const found=database.prepare('SELECT 1 FROM loop_follows WHERE follower_id=? AND followed_id=?').get(user.id,target);if(found)database.prepare('DELETE FROM loop_follows WHERE follower_id=? AND followed_id=?').run(user.id,target);else database.prepare('INSERT INTO loop_follows(follower_id,followed_id,created_at) VALUES(?,?,?)').run(user.id,target,now);if(!found)notify(target,user.id,'follow',null,'followed you',now);realtimeHub.send(user.id,'loop-follow-updated',{targetId:target,followed:!found});return sendJson(response,200,{followed:!found}),true;}
 
-    if(method==='GET'&&path==='/api/loop/notifications'){const rows=database.prepare(`SELECT n.*,u.username,u.avatar_url FROM loop_notifications n LEFT JOIN users u ON u.id=n.actor_id WHERE n.user_id=? ORDER BY n.id DESC LIMIT 80`).all(user.id);return sendJson(response,200,{notifications:rows.map((r)=>({id:Number(r.id),type:r.type,body:r.body,postId:r.post_id?Number(r.post_id):null,read:Boolean(r.read_at),createdAt:r.created_at,actor:r.actor_id?{id:Number(r.actor_id),username:r.username,avatarUrl:r.avatar_url||null}:null}))}),true;}
-    if(method==='POST'&&path==='/api/loop/notifications/read'){database.prepare('UPDATE loop_notifications SET read_at=COALESCE(read_at,?) WHERE user_id=?').run(now,user.id);return sendJson(response,200,{ok:true}),true;}
+    const visibleNotifications = `n.user_id=?
+      AND (n.post_id IS NULL OR EXISTS(SELECT 1 FROM loop_posts p WHERE p.id=n.post_id AND p.deleted_at IS NULL AND NOT EXISTS(SELECT 1 FROM loop_blocks b WHERE (b.user_id=n.user_id AND b.target_id=p.user_id) OR (b.target_id=n.user_id AND b.user_id=p.user_id)) AND NOT EXISTS(SELECT 1 FROM loop_mutes m WHERE m.user_id=n.user_id AND m.target_id=p.user_id)))
+      AND NOT EXISTS(SELECT 1 FROM loop_blocks b WHERE (b.user_id=n.user_id AND b.target_id=n.actor_id) OR (b.user_id=n.actor_id AND b.target_id=n.user_id))
+      AND NOT EXISTS(SELECT 1 FROM loop_mutes m WHERE m.user_id=n.user_id AND m.target_id=n.actor_id)`;
+    if(method==='GET'&&path==='/api/loop/notifications'){
+      const before = Math.max(0,Number(url.searchParams.get('before')) || 0);
+      const rows=database.prepare(`SELECT n.*,u.username,u.avatar_url,c.body preview FROM loop_notifications n LEFT JOIN users u ON u.id=n.actor_id LEFT JOIN loop_post_comments c ON c.id=n.comment_id WHERE ${visibleNotifications} AND (?=0 OR n.id<?) ORDER BY n.id DESC LIMIT 31`).all(user.id,before,before);
+      const page = rows.slice(0,30);
+      const unreadCount = Number(database.prepare(`SELECT COUNT(*) count FROM loop_notifications n WHERE ${visibleNotifications} AND n.read_at IS NULL`).get(user.id).count);
+      return sendJson(response,200,{unreadCount,notifications:page.map(r=>({id:Number(r.id),type:r.type,body:r.body,preview:r.preview?.slice(0,180) || '',postId:r.post_id?Number(r.post_id):null,commentId:r.comment_id?Number(r.comment_id):null,read:Boolean(r.read_at),createdAt:r.created_at,actor:r.actor_id?{id:Number(r.actor_id),username:r.username,avatarUrl:r.avatar_url||null}:null})),page:{hasMore:rows.length>30,nextBefore:rows.length>30 ? Number(page.at(-1).id) : null}}),true;
+    }
+    if(method==='POST'&&path==='/api/loop/notifications/read'){
+      const body = await readJson(request);
+      if (body.ids !== undefined) {
+        if (!Array.isArray(body.ids) || !body.ids.length || body.ids.length>100 || body.ids.some(id=>!Number.isSafeInteger(id)||id<=0)) return sendJson(response,400,{error:'Choose valid notifications.'}),true;
+        database.prepare(`UPDATE loop_notifications SET read_at=COALESCE(read_at,?) WHERE user_id=? AND id IN (${body.ids.map(()=>'?').join(',')})`).run(now,user.id,...body.ids);
+      } else database.prepare('UPDATE loop_notifications SET read_at=COALESCE(read_at,?) WHERE user_id=?').run(now,user.id);
+      realtimeHub.send(user.id,'loop-notifications-read',{});
+      return sendJson(response,200,{ok:true}),true;
+    }
+    if(path==='/api/loop/notification-preferences' && method==='GET') return sendJson(response,200,{preferences:preferences(user.id)}),true;
+    if(path==='/api/loop/notification-preferences' && method==='PATCH') {
+      const body = await readJson(request);
+      if (!body || typeof body!=='object' || Array.isArray(body) || Object.keys(body).some(key=>!Object.hasOwn(notificationDefaults,key)||typeof body[key]!=='boolean')) return sendJson(response,400,{error:'Notification preferences must be on or off.'}),true;
+      const settings = {...preferences(user.id),...body};
+      database.prepare('INSERT INTO loop_notification_preferences(user_id,settings_json) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET settings_json=excluded.settings_json').run(user.id,JSON.stringify(settings));
+      return sendJson(response,200,{preferences:settings}),true;
+    }
+    const threadMatch = path.match(/^\/api\/loop\/comments\/(\d+)\/thread$/);
+    if (method==='GET' && threadMatch) {
+      const comment = database.prepare('SELECT * FROM loop_post_comments WHERE id=?').get(Number(threadMatch[1]));
+      if (!comment || !loadPost(Number(comment.post_id),user.id) || blocked(user.id,comment.user_id)) return sendJson(response,404,{error:'Comment unavailable.'}),true;
+      const ancestors = []; let current = comment;
+      while (current?.parent_id && ancestors.length<100) { ancestors.unshift(Number(current.parent_id)); current=database.prepare('SELECT parent_id FROM loop_post_comments WHERE id=? AND post_id=?').get(current.parent_id,comment.post_id); }
+      return sendJson(response,200,{postId:Number(comment.post_id),ancestors,commentId:Number(comment.id)}),true;
+    }
 
     const safetyMatch=path.match(/^\/api\/loop\/users\/(\d+)\/(block|mute)$/);
-    if(method==='POST'&&safetyMatch){const target=Number(safetyMatch[1]);if(target===Number(user.id))return sendJson(response,400,{error:'You cannot do that to yourself.'}),true;const table=safetyMatch[2]==='block'?'loop_blocks':'loop_mutes';const found=database.prepare(`SELECT 1 FROM ${table} WHERE user_id=? AND target_id=?`).get(user.id,target);if(found)database.prepare(`DELETE FROM ${table} WHERE user_id=? AND target_id=?`).run(user.id,target);else database.prepare(`INSERT INTO ${table}(user_id,target_id,created_at) VALUES(?,?,?)`).run(user.id,target,now);return sendJson(response,200,{active:!found}),true;}
+    if(method==='POST'&&safetyMatch){const target=Number(safetyMatch[1]);if(target===Number(user.id))return sendJson(response,400,{error:'You cannot do that to yourself.'}),true;const table=safetyMatch[2]==='block'?'loop_blocks':'loop_mutes';const found=database.prepare(`SELECT 1 FROM ${table} WHERE user_id=? AND target_id=?`).get(user.id,target);if(found)database.prepare(`DELETE FROM ${table} WHERE user_id=? AND target_id=?`).run(user.id,target);else database.prepare(`INSERT INTO ${table}(user_id,target_id,created_at) VALUES(?,?,?)`).run(user.id,target,now);presence.invalidate();return sendJson(response,200,{active:!found}),true;}
     if(method==='POST'&&path==='/api/loop/reports'){const body=await readJson(request);const reason=String(body.reason||'').trim().slice(0,500);const postId=Number(body.postId)||null;const targetId=Number(body.userId)||null;if(!reason||(!postId&&!targetId))return sendJson(response,400,{error:'Choose what to report and include a reason.'}),true;const id=Number(database.prepare('INSERT INTO loop_reports(reporter_id,target_user_id,post_id,reason,created_at) VALUES(?,?,?,?,?)').run(user.id,targetId,postId,reason,now).lastInsertRowid);return sendJson(response,201,{id}),true;}
     if(method==='GET'&&path==='/api/loop/moderation/reports'){if(!isAdmin(user))return sendJson(response,403,{error:'Moderator access required.'}),true;return sendJson(response,200,{reports:database.prepare('SELECT * FROM loop_reports ORDER BY id DESC LIMIT 100').all()}),true;}
     const reviewMatch = path.match(/^\/api\/loop\/moderation\/reports\/(\d+)$/);
@@ -279,5 +537,5 @@ export function createLoopService({ database, uploadDirectory, parseMultipart, s
     return false;
   }
 
-  return { route };
+  return { route, presence };
 }

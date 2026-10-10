@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, memo } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, memo } from 'react';
 import { Liquid } from 'liquid-gooey';
 import { Glass } from '@samasante/liquid-glass';
 import { AttachIcon, CloseIcon, MegaphoneIcon, MicIcon, PlusIcon, PollIcon, SendIcon } from './icons';
@@ -153,16 +153,13 @@ function isTypingField(node) {
 
 function useReducedMotionPreference() {
   const [reduced, setReduced] = useState(() => typeof window !== 'undefined'
-    && (window.matchMedia('(prefers-reduced-motion: reduce)').matches || document.documentElement.classList.contains('glean-reduce-motion')));
+    && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
   useEffect(() => {
     const media = window.matchMedia('(prefers-reduced-motion: reduce)');
-    const update = () => setReduced(media.matches || document.documentElement.classList.contains('glean-reduce-motion'));
-    const observer = new MutationObserver(update);
-    observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+    const update = () => setReduced(media.matches);
     media.addEventListener('change', update);
     update();
     return () => {
-      observer.disconnect();
       media.removeEventListener('change', update);
     };
   }, []);
@@ -380,7 +377,10 @@ export default function MessageComposer({
   const [pollError, setPollError] = useState('');
   const glassSettings = normalizeAccessibility(accessibility);
   const glassFrost = glassSettings.glassFrost;
-  const composerGlassOptics = glassOptics(glassFrost, glassSettings.glassDepth, glassSettings.glassRefraction);
+  const composerGlassOptics = useMemo(
+    () => glassOptics(glassFrost, glassSettings.glassDepth, glassSettings.glassRefraction),
+    [glassFrost, glassSettings.glassDepth, glassSettings.glassRefraction],
+  );
   const sessionRef = useRef(null);
   const menuCloseTimer = useRef(null);
   const menuOpenFrame = useRef(0);

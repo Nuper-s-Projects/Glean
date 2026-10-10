@@ -85,7 +85,7 @@ export function usePresence(userId, fallback = 'offline') {
 
 export function usePresenceHidden(userId, fallback = false) {
   const [, bump] = useState(0);
-  useEffect(() => subscribePresence(() => bump((value) => value + 1)), []);
+  useEffect(() => subscribeUserPresence(userId, () => bump((value) => value + 1)), [userId]);
   return presenceHiddenOf(userId, fallback);
 }
 

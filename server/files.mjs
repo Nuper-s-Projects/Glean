@@ -25,9 +25,17 @@ function parseBytesRange(header, size) {
 }
 
 export function sendLocalFile(request, response, filePath, { type, extra = {}, gzipText = false } = {}) {
-  const size = statSync(filePath).size;
+  const info = statSync(filePath);
+  const size = info.size;
+  const etag = `W/"${size.toString(16)}-${info.mtimeMs.toString(16)}"`;
   const range = request.method !== 'HEAD' ? parseBytesRange(request.headers.range, size) : null;
-  const base = { 'Content-Type': type, 'Accept-Ranges': 'bytes', ...extra };
+  const base = { 'Content-Type': type, 'Accept-Ranges': 'bytes', ETag: etag, ...extra };
+  // Routes authorize before reaching this helper. Revalidate unchanged files
+  // without retransferring uploads; leave range requests and streaming intact.
+  if (['GET', 'HEAD'].includes(request.method) && !request.headers.range
+    && String(request.headers['if-none-match'] || '').split(',').map(value => value.trim()).includes(etag)) {
+    response.writeHead(304, base); return response.end();
+  }
   const finish = (stream) => pipeline(stream, response).catch(() => { if (!response.writableEnded) response.destroy(); });
   if (range) {
     response.writeHead(206, {

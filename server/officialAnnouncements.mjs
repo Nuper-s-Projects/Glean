@@ -75,7 +75,12 @@ export function createOfficialAnnouncements(database) {
         FROM users
         WHERE NOT EXISTS (SELECT 1 FROM server_bans WHERE server_id=? AND user_id=users.id)
           AND NOT EXISTS (SELECT 1 FROM official_announcements_kicks WHERE server_id=? AND user_id=users.id)
-        ON CONFLICT(server_id,user_id) DO NOTHING`).run(server.id, server.owner_id, ownerRole, memberRole, now, server.id, server.id);
+          AND NOT EXISTS (
+            SELECT 1 FROM server_member_devices devices
+            JOIN server_device_bans bans ON bans.server_id=devices.server_id AND bans.device_hash=devices.device_hash
+            WHERE devices.server_id=? AND devices.user_id=users.id
+          )
+        ON CONFLICT(server_id,user_id) DO NOTHING`).run(server.id, server.owner_id, ownerRole, memberRole, now, server.id, server.id, server.id);
       database.exec('RELEASE official_announcements');
       serverId = Number(server.id); ownerId = Number(server.owner_id);
       serverCreatedAt = server.created_at;
@@ -86,15 +91,21 @@ export function createOfficialAnnouncements(database) {
       throw error;
     }
   }
-  function enroll(userId) {
+  function enroll(userId, deviceHash = null) {
     if (!currentServer()) ensureAll();
     if (!serverId || database.prepare('SELECT 1 FROM server_bans WHERE server_id=? AND user_id=?').get(serverId, userId)
-      || database.prepare('SELECT 1 FROM official_announcements_kicks WHERE server_id=? AND user_id=?').get(serverId, userId)) return false;
+      || database.prepare('SELECT 1 FROM official_announcements_kicks WHERE server_id=? AND user_id=?').get(serverId, userId)
+      || (deviceHash && database.prepare('SELECT 1 FROM server_device_bans WHERE server_id=? AND device_hash=?').get(serverId, deviceHash))) return false;
     const roleId = Number(userId) === ownerId
       ? database.prepare("SELECT id FROM server_roles WHERE server_id=? AND permissions='owner' ORDER BY id LIMIT 1").get(serverId).id
       : memberRoleId;
     const result = database.prepare('INSERT OR IGNORE INTO server_members(server_id,user_id,role_id,joined_at) VALUES(?,?,?,?)')
       .run(serverId, userId, roleId, new Date().toISOString());
+    if (deviceHash) {
+      const seenAt = new Date().toISOString();
+      database.prepare(`INSERT INTO server_member_devices(server_id,user_id,device_hash,first_seen,last_seen) VALUES(?,?,?,?,?)
+        ON CONFLICT(server_id,user_id,device_hash) DO UPDATE SET last_seen=excluded.last_seen`).run(serverId, userId, deviceHash, seenAt, seenAt);
+    }
     return Boolean(result.changes);
   }
   function kick(userId, actorId, kickedAt = new Date().toISOString()) {
@@ -111,6 +122,7 @@ export function createOfficialAnnouncements(database) {
   ensureAll();
   return {
     ensureAll, enroll, kick, clearKick,
+    getServerId: () => currentServer() ? serverId : null,
     isServer: (id) => Number(id) === serverId && currentServer(),
     isRequiredChannel: (id) => channelId !== null && Number(id) === channelId && currentServer(),
     canPost: (userId) => Number(userId) === ownerId,

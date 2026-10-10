@@ -4,6 +4,7 @@ import { API_PREFIX, apiRequest as request } from './apiClient';
 import { isDeveloperModeEnabled, recordDeveloperTraffic } from './developerMode.js';
 import { apiRoutes } from './apiRoutes';
 import { prepareUploadFiles } from './imageUpload';
+import { invalidateLoopEvent } from './loopCache.js';
 import {
   clearServersRequest,
   getFreshCachedServers,
@@ -145,8 +146,11 @@ export async function joinServerByInvite(code) {
 }
 export async function getServerBans(serverId) { return request(`/servers/${serverId}/bans`); }
 export async function unbanServerMember(serverId, userId) { return request(`/servers/${serverId}/bans/${userId}`, { method: 'DELETE' }); }
+export async function getServerDeviceBans(serverId) { return request(`/servers/${serverId}/device-bans`); }
+export async function unbanServerDevice(serverId, deviceHash) { return request(`/servers/${serverId}/device-bans/${deviceHash}`, { method: 'DELETE' }); }
 export async function assignMemberRole(serverId, userId, roleId) { return request(`/servers/${serverId}/members/${userId}/role`, { method: 'POST', body: JSON.stringify({ roleId }) }); }
 export async function moderateMember(serverId, userId, action, reason = '') { return request(`/servers/${serverId}/members/${userId}/${action}`, { method: 'POST', body: JSON.stringify({ reason }) }); }
+export async function banMemberDevice(serverId, userId, reason = '') { return request(`/servers/${serverId}/members/${userId}/device-ban`, { method: 'POST', body: JSON.stringify({ reason }) }); }
 export async function timeoutMember(serverId, userId, payload = {}) { return request(`/servers/${serverId}/members/${userId}/timeout`, { method: 'POST', body: JSON.stringify(payload) }); }
 export async function disconnectVoiceMember(serverId, userId) { return request(`/servers/${serverId}/voice-members/${userId}/disconnect`, { method: 'POST', body: '{}' }); }
 export async function getChannelMessages(id, { before = null, limit = 50 } = {}) {
@@ -447,6 +451,7 @@ function createRealtimeSession(key) {
   };
 
   const notifyEvent = (eventName, payload) => {
+    invalidateLoopEvent(eventName, payload);
     for (const subscriber of subscribers) safeCall(subscriber.onEvent, eventName, payload);
   };
 
@@ -540,7 +545,7 @@ function createRealtimeSession(key) {
     notifyStatus('reconnecting');
     const staleSocket = socket;
     socket = null;
-    if (staleSocket && staleSocket.readyState < WebSocket.CLOSING) staleSocket.close(1001, 'network offline');
+    if (staleSocket && staleSocket.readyState < WebSocket.CLOSING) staleSocket.close(4001, 'network offline');
   };
 
   const onOnline = () => {
@@ -549,7 +554,7 @@ function createRealtimeSession(key) {
     reconnectTimer = null;
     const staleSocket = socket;
     socket = null;
-    if (staleSocket && staleSocket.readyState < WebSocket.CLOSING) staleSocket.close(1001, 'network restored');
+    if (staleSocket && staleSocket.readyState < WebSocket.CLOSING) staleSocket.close(4001, 'network restored');
     connect();
   };
 

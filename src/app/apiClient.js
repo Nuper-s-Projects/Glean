@@ -1,5 +1,7 @@
 import { estimateBodyBytes, isDeveloperModeEnabled, recordDeveloperTraffic } from './developerMode.js';
 import { reportNetworkActivity } from './pwa.js';
+import { getInstallId } from './installIdentity.js';
+import { invalidateLoopMutation, loopCache } from './loopCache.js';
 
 export const API_PREFIX = '/api/v1';
 
@@ -35,6 +37,7 @@ export async function apiRequest(path, options = {}) {
   const { timeoutMs, retries, signal, ...fetchOptions } = options;
   const isFormData = typeof FormData !== 'undefined' && fetchOptions.body instanceof FormData;
   const method = String(fetchOptions.method || 'GET').toUpperCase();
+  if (method !== 'GET') invalidateLoopMutation(path);
   const maxRetries = retries ?? (method === 'GET' ? 1 : 0);
   const timeout = timeoutMs ?? (isFormData ? 175_000 : 30_000);
 
@@ -51,12 +54,14 @@ export async function apiRequest(path, options = {}) {
 
     try {
       const uploadBytes = isDeveloperModeEnabled() ? estimateBodyBytes(fetchOptions.body) : 0;
+      const installId = getInstallId();
       const response = await fetch(`${API_PREFIX}${path}`, {
         credentials: 'same-origin',
         ...fetchOptions,
         cache: method === 'GET' ? 'no-store' : fetchOptions.cache,
         headers: {
           ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
+          ...(installId ? { 'X-Glean-Install-Id': installId } : {}),
           ...fetchOptions.headers,
         },
         signal: controller.signal,
@@ -65,11 +70,13 @@ export async function apiRequest(path, options = {}) {
       const { payload, downloaded } = await readPayload(response);
       recordDeveloperTraffic('http', { uploaded: uploadBytes, downloaded });
       if (!response.ok) {
+        if (response.status === 401 || response.status === 403) loopCache.invalidate();
         throw new ApiError(payload.error || `Request failed (${response.status}).`, {
           status: response.status,
           requestId: payload.requestId || response.headers.get('x-request-id'),
         });
       }
+      if (method !== 'GET') invalidateLoopMutation(path);
       return payload;
     } catch (error) {
       if (signal?.aborted) throw signal.reason || error;

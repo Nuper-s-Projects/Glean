@@ -1,6 +1,9 @@
-import { apiRequest } from './apiClient';
+import { apiRequest } from './apiClient.js';
+import { queueSessionSnapshot, removeSessionSnapshot } from './sessionSnapshots.js';
+import { loopCache } from './loopCache.js';
 const ACCOUNT_KEY = 'glean.account';
 const DM_SIDEBAR_KEY = 'glean.dmSidebar';
+let dmSidebarCache;
 
 export async function createAccount(username, password) {
   const { account } = await apiRequest('/auth/signup', { method: 'POST', body: JSON.stringify({ username, password }) });
@@ -22,6 +25,7 @@ export function peekCachedAccount() {
 }
 
 export function rememberAccount(account) {
+  loopCache.setAccount(account?.id);
   try {
     if (account?.id) sessionStorage.setItem(ACCOUNT_KEY, JSON.stringify(account));
     else sessionStorage.removeItem(ACCOUNT_KEY);
@@ -30,8 +34,9 @@ export function rememberAccount(account) {
 
 export function peekCachedDmSidebar(accountId) {
   try {
-    const parsed = JSON.parse(sessionStorage.getItem(DM_SIDEBAR_KEY) || '');
-    if (Number(parsed?.accountId) !== Number(accountId)) return null;
+    if (dmSidebarCache === undefined) dmSidebarCache = JSON.parse(sessionStorage.getItem(DM_SIDEBAR_KEY) || 'null');
+    const parsed = dmSidebarCache;
+    if (!parsed || Number(parsed.accountId) !== Number(accountId)) return null;
     if (!Array.isArray(parsed.friends) || !Array.isArray(parsed.conversations)) return null;
     return parsed;
   } catch {
@@ -40,17 +45,15 @@ export function peekCachedDmSidebar(accountId) {
 }
 
 export function rememberDmSidebar(accountId, payload) {
-  try {
-    sessionStorage.setItem(DM_SIDEBAR_KEY, JSON.stringify({ accountId, ...payload }));
-  } catch { /* ignore */ }
+  dmSidebarCache = { accountId, ...payload };
+  queueSessionSnapshot(DM_SIDEBAR_KEY, dmSidebarCache);
 }
 
 export function clearClientCaches() {
+  dmSidebarCache = null;
   rememberAccount(null);
-  try {
-    sessionStorage.removeItem(DM_SIDEBAR_KEY);
-    sessionStorage.removeItem('glean.servers');
-  } catch { /* ignore */ }
+  removeSessionSnapshot(DM_SIDEBAR_KEY);
+  removeSessionSnapshot('glean.servers');
 }
 
 export async function getCurrentAccount() {

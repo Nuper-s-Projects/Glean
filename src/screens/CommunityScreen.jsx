@@ -16,6 +16,7 @@ import {
   joinServerByInvite,
   markChannelRead,
   moderateMember,
+  banMemberDevice,
   leaveServer,
   peekCachedServers,
   patchCachedServerUnreadSummary,
@@ -491,6 +492,7 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
   const [settingsStartPage, setSettingsStartPage] = useState(false);
   const [showServerMenu, setShowServerMenu] = useState(false);
   const [moderationMenu, setModerationMenu] = useState(null);
+  const moderationMenuRef = useRef(null);
   const [mobileChatOpen, setMobileChatOpen] = useState(false);
   const [notice, setNotice] = useState('');
   const [dialogError, setDialogError] = useState('');
@@ -787,6 +789,20 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
     window.addEventListener('click', close);
     window.addEventListener('keydown', (event) => { if (event.key === 'Escape') close(); }, { once: true });
     return () => window.removeEventListener('click', close);
+  }, [moderationMenu]);
+
+  useEffect(() => {
+    if (!moderationMenu || !moderationMenuRef.current) return undefined;
+    const frame = requestAnimationFrame(() => {
+      const menu = moderationMenuRef.current;
+      if (!menu) return;
+      const bounds = menu.getBoundingClientRect();
+      const margin = 8;
+      const x = Math.max(margin, Math.min(moderationMenu.x, window.innerWidth - bounds.width - margin));
+      const y = Math.max(margin, Math.min(moderationMenu.y, window.innerHeight - bounds.height - margin));
+      if (x !== moderationMenu.x || y !== moderationMenu.y) setModerationMenu((current) => current ? { ...current, x, y } : current);
+    });
+    return () => cancelAnimationFrame(frame);
   }, [moderationMenu]);
 
   useEffect(() => {
@@ -1649,6 +1665,43 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
     }
   };
 
+  const deviceBan = async (member) => {
+    if (!activeServer || !member || !canManageMembers) return false;
+    const confirmed = window.confirm(
+      `Ban the known Glean installation(s) used by ${member.username} from ${activeServer.name}? Accounts using those installations will be removed and blocked from rejoining. People sharing the same browser installation may also be affected.`,
+    );
+    if (!confirmed) return false;
+    try {
+      const { deviceCount, removedMembers = [] } = await banMemberDevice(activeServer.id, member.id);
+      const removedIds = new Set(removedMembers.map((item) => Number(item.userId)));
+      let loadedRemoved = 0;
+      setActiveServer((current) => {
+        if (!current || Number(current.id) !== Number(activeServer.id)) return current;
+        const members = current.members || [];
+        loadedRemoved = members.filter((item) => removedIds.has(Number(item.id))).length;
+        const memberCounts = { ...(current.memberCounts || {}) };
+        removedMembers.forEach((item) => {
+          const roleKey = String(item.roleId ?? '');
+          if (roleKey && Object.hasOwn(memberCounts, roleKey)) memberCounts[roleKey] = Math.max(0, Number(memberCounts[roleKey]) - 1);
+        });
+        return {
+          ...current,
+          memberTotal: Math.max(0, Number(current.memberTotal ?? members.length) - removedMembers.length),
+          memberCounts,
+          members: members.filter((item) => !removedIds.has(Number(item.id))),
+          membersPage: { ...(current.membersPage || {}), nextOffset: Math.max(0, Number(current.membersPage?.nextOffset ?? members.length) - loadedRemoved) },
+        };
+      });
+      setMembersNextOffset((current) => Math.max(0, current - loadedRemoved));
+      setModerationMenu(null);
+      setNotice(`${member.username}'s ${deviceCount} known installation${deviceCount === 1 ? '' : 's'} banned. ${removedMembers.length} linked account${removedMembers.length === 1 ? '' : 's'} removed.`);
+      return true;
+    } catch (error) {
+      setNotice(error.message || 'Could not ban this installation.');
+      return false;
+    }
+  };
+
   const timeout = async (member, seconds) => {
     if (!activeServer || !member || !canManageMembers) return { ok: false };
     try {
@@ -1667,12 +1720,12 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
 
   const openModerationMenu = useCallback((event, member, voice = false) => {
     if (!activeServer) return;
-    const self = voice && Number(member?.id) === Number(account?.id);
-    const canAct = voice ? (self || canManageMembers || canManageVoice) : canManageMembers;
+    const self = Number(member?.id) === Number(account?.id);
+    const canAct = voice ? (self || canManageMembers || canManageVoice) : canManageMembers && !self;
     if (!canAct) return;
     event.preventDefault();
     event.stopPropagation();
-    setModerationMenu({ x: Math.min(event.clientX, window.innerWidth - 190), y: Math.min(event.clientY, window.innerHeight - 180), member, voice, self });
+    setModerationMenu({ x: event.clientX, y: event.clientY, member, voice, self });
   }, [activeServer?.id, account?.id, canManageMembers, canManageVoice]);
   const openMemberModerationMenu = useCallback((event, member) => {
     const loadedMember = activeServer?.members?.find((item) => Number(item.id) === Number(member?.id));
@@ -2125,9 +2178,10 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
         />
       ) : null}
       {moderationMenu ? (
-        <div className="community-moderation-menu" style={{ left: moderationMenu.x, top: moderationMenu.y }} role="menu" onMouseDown={(event) => event.stopPropagation()}>
+        <div ref={moderationMenuRef} className="community-moderation-menu" style={{ left: moderationMenu.x, top: moderationMenu.y }} role="menu" onMouseDown={(event) => event.stopPropagation()}>
           {!moderationMenu.self && canManageMembers ? <button type="button" role="menuitem" onClick={() => { setModerationMenu(null); moderate(moderationMenu.member, 'kick'); }}>Kick</button> : null}
           {!moderationMenu.self && canManageMembers ? <button type="button" role="menuitem" className="is-danger" onClick={() => { setModerationMenu(null); moderate(moderationMenu.member, 'ban'); }}>Ban</button> : null}
+          {!moderationMenu.voice && !moderationMenu.self && canManageMembers ? <button type="button" role="menuitem" className="is-danger" onClick={() => { setModerationMenu(null); void deviceBan(moderationMenu.member); }}>Ban device</button> : null}
           {!moderationMenu.voice && canManageMembers && moderationMenu.member.timeoutUntil && Date.parse(moderationMenu.member.timeoutUntil) > Date.now() ? <button type="button" role="menuitem" onClick={() => { setModerationMenu(null); timeout(moderationMenu.member, 0); }}>Remove timeout</button> : null}
           {!moderationMenu.voice && canManageMembers && !(moderationMenu.member.timeoutUntil && Date.parse(moderationMenu.member.timeoutUntil) > Date.now()) ? <button type="button" role="menuitem" onClick={() => { setModerationMenu(null); timeout(moderationMenu.member, 600); }}>Timeout (10 minutes)</button> : null}
           {moderationMenu.voice && moderationMenu.self ? <button type="button" role="menuitem" onClick={() => { setModerationMenu(null); leaveVoice(); setNotice('You disconnected from voice.'); }}>Disconnect from call</button> : null}

@@ -25,6 +25,9 @@ export function applyAccessibilitySettings(value) {
   else document.documentElement.setAttribute('data-theme', settings.theme);
   if (settings.theme === 'system') document.documentElement.style.removeProperty('color-scheme');
   else document.documentElement.style.colorScheme = settings.theme;
+  // The legacy account preference no longer controls animations.
+  const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true;
+  document.documentElement.classList.toggle('glean-reduce-motion', reduceMotion);
   const screen = document.querySelector('.screen-transition');
   if (!screen) return;
   screen.style.setProperty('--glean-accessibility-contrast', `${settings.contrast}%`);
@@ -33,8 +36,5 @@ export function applyAccessibilitySettings(value) {
   document.documentElement.style.setProperty('--glean-liquid-glass-depth', String(settings.glassDepth / 100));
   document.documentElement.style.setProperty('--glean-liquid-glass-refraction', String(settings.glassRefraction / 100));
   screen.classList.toggle('has-accessibility-adjustments', settings.contrast !== 100 || settings.saturation !== 100);
-  const systemPrefersReducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true;
-  const reduceMotion = settings.reduceMotion || systemPrefersReducedMotion;
   screen.classList.toggle('is-reduced-motion', reduceMotion);
-  document.documentElement.classList.toggle('glean-reduce-motion', reduceMotion);
 }
