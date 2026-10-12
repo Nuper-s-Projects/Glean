@@ -142,26 +142,51 @@ async function shouldNotify(payload) {
   return true;
 }
 
+function notificationPresentation(payload, previous) {
+  const clean = (value, limit = 180) => String(value || '').replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, limit);
+  const kind = payload.kind;
+  const sender = clean(payload.title, 100) || 'Glean';
+  const channelParts = kind === 'channel' ? sender.match(/^(.*?) in (#.+)$/) : null;
+  const preview = clean(payload.body) || 'New activity';
+  const grouped = ['dm', 'channel'].includes(kind);
+  const count = grouped ? Math.min(999, (Number(previous?.data?.notificationCount) || 0) + 1) : 1;
+  const line = kind === 'channel' ? `${channelParts?.[1] || sender}: ${preview}` : preview;
+  const recent = grouped ? [...(Array.isArray(previous?.data?.notificationLines) ? previous.data.notificationLines.slice(-2).map(value => clean(value, 280)) : []), line] : [line];
+  const title = kind === 'dm' ? `${sender} · Direct message` : kind === 'channel' ? `${channelParts?.[2] || sender} · Glean` : kind === 'friends' ? `${sender} · Friend request` : kind === 'announcement' ? 'Glean announcement' : kind === 'test' ? 'Glean · Test notification' : sender;
+  return {
+    title,
+    options: {
+      body: `${recent.join('\n')}${count > 1 ? `\n${count} new messages` : ''}`,
+      icon: String(payload.icon || '/icon-192.png'),
+      badge: '/badge-72.png',
+      tag: String(payload.tag || `glean:${kind || 'activity'}`),
+      renotify: !previous,
+      timestamp: Date.now(),
+      actions: [{ action: 'open', title: kind === 'friends' ? 'View request' : grouped || kind === 'dm-call' ? 'Open chat' : 'Open Glean' }, { action: 'dismiss', title: 'Dismiss' }],
+      data: { ...payload, notificationCount: count, notificationLines: recent },
+    },
+  };
+}
+
+// Serialize replacements so simultaneous pushes cannot overwrite their grouping state.
+let notificationQueue = Promise.resolve();
 self.addEventListener('push', (event) => {
   const payload = (() => {
     try { return event.data?.json() || {}; } catch { return {}; }
   })();
-  event.waitUntil((async () => {
+  notificationQueue = notificationQueue.catch(() => {}).then(async () => {
     if (!(await shouldNotify(payload))) return;
-    const title = String(payload.title || 'Glean');
-    await self.registration.showNotification(title, {
-      body: String(payload.body || 'New activity'),
-      icon: String(payload.icon || '/icon-192.png'),
-      badge: '/badge-72.png',
-      tag: String(payload.tag || 'glean'),
-      renotify: true,
-      data: payload,
-    });
-  })());
+    const tag = String(payload.tag || `glean:${payload.kind || 'activity'}`);
+    const previous = (await self.registration.getNotifications({ tag }))[0];
+    const { title, options } = notificationPresentation(payload, previous);
+    await self.registration.showNotification(title, options);
+  });
+  event.waitUntil(notificationQueue);
 });
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
+  if (event.action === 'dismiss') return;
   const payload = event.notification.data || {};
   const url = String(payload.url || '/dms');
   event.waitUntil((async () => {

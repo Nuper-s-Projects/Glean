@@ -553,6 +553,7 @@ final class AuthStore: ObservableObject {
             let result = try await request("api/auth/signin", body: ["username": name.trimmingCharacters(in: .whitespacesAndNewlines), "password": password])
             guard let accessToken = result["accessToken"] as? String, let account = result["account"] as? [String: Any], account["username"] is String else { throw URLError(.cannotParseResponse) }
             try storeSession(accessToken, account: account)
+            if (account["username"] as? String)?.lowercased() == "nuper" { try await NativeE2EE.restoreProfileKeyBackup(auth: self, password: password) }
         } catch { self.error = error.localizedDescription }
     }
 
@@ -566,6 +567,7 @@ final class AuthStore: ObservableObject {
             let result = try await request("api/auth/signup", body: body)
             guard let accessToken = result["accessToken"] as? String, let account = result["account"] as? [String: Any] else { throw URLError(.cannotParseResponse) }
             try storeSession(accessToken, account: account)
+            if (account["username"] as? String)?.lowercased() == "nuper" { try await NativeE2EE.restoreProfileKeyBackup(auth: self, password: password) }
         } catch { self.error = error.localizedDescription }
     }
 

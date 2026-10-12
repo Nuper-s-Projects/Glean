@@ -7,13 +7,13 @@ import {
   editDirectMessage,
   getConversations,
   getFriends,
-  getPeople,
   getMessages,
   markConversationRead,
   openDirectConversation,
   registerE2EEKey,
   removeDirectMessage,
   sendEncryptedMessage,
+  sendMessage,
   sendFriendRequest,
   setConversationPinned,
   sendTyping,
@@ -23,6 +23,7 @@ import {
 import { decryptMessage, ensureE2EEIdentity, prepareEncryptedMessage } from '../../app/e2ee';
 import { peekCachedDmSidebar, rememberDmSidebar } from '../../app/storage';
 import { createLiveMessageJournal } from '../../app/liveMessages';
+import { preserveReadableMessages, recentHistorySnapshot, reconcileSentMessage } from './conversationState';
 
 function conversationPreview(message) {
   if (!message) return 'No messages yet';
@@ -44,20 +45,21 @@ export function useDmData(account, reportError, onUnread = null) {
   const [friends, setFriends] = useState(() => cachedSidebar?.friends || []);
   const [requests, setRequests] = useState(() => cachedSidebar?.requests || []);
   const [sent, setSent] = useState(() => cachedSidebar?.sent || []);
-  const [people, setPeople] = useState([]);
+  const [peopleRevision, setPeopleRevision] = useState(0);
   const [conversations, setConversations] = useState(() => cachedSidebar?.conversations || []);
   const [selectedId, setSelectedId] = useState(null);
   const [messages, setMessages] = useState([]);
+  const [transcriptId, setTranscriptId] = useState(null);
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
   const [messagesError, setMessagesError] = useState('');
   const [messageHistoryRetry, setMessageHistoryRetry] = useState(0);
   const [isLoading, setIsLoading] = useState(() => !cachedSidebar);
-  const [isLoadingPeople, setIsLoadingPeople] = useState(false);
   const [hasMoreMessages, setHasMoreMessages] = useState(false);
   const [isLoadingOlder, setIsLoadingOlder] = useState(false);
   const [typingByConversation, setTypingByConversation] = useState({});
   const [connectionState, setConnectionState] = useState('connecting');
   const [identity, setIdentity] = useState(null);
+  const [identityReady, setIdentityReady] = useState(false);
   const realtimeRef = useRef(null);
   const selectedIdRef = useRef(selectedId);
   const accountIdRef = useRef(account?.id);
@@ -67,6 +69,12 @@ export function useDmData(account, reportError, onUnread = null) {
   const sidebarRefreshRef = useRef(null);
   const sidebarRefreshQueuedRef = useRef(false);
   const liveMessageJournalRef = useRef(null);
+  const transcriptCacheRef = useRef(new Map());
+  const pendingSendsRef = useRef(new Map());
+  const sendLocksRef = useRef(new Set());
+  const liveEventVersionsRef = useRef(new Map());
+  const olderLockRef = useRef(null);
+  const previewCacheRef = useRef(new Map());
   if (!liveMessageJournalRef.current) liveMessageJournalRef.current = createLiveMessageJournal();
   selectedIdRef.current = selectedId;
   accountIdRef.current = account?.id;
@@ -84,7 +92,7 @@ export function useDmData(account, reportError, onUnread = null) {
   }, []);
 
   const selectedConversation = useMemo(
-    () => conversations.find((conversation) => conversation.id === selectedId) || null,
+    () => conversations.find((conversation) => Number(conversation.id) === Number(selectedId)) || null,
     [conversations, selectedId],
   );
 
@@ -108,8 +116,17 @@ export function useDmData(account, reportError, onUnread = null) {
         const previewIdentity = identityRef.current;
         const previews = await Promise.all(nextConversations.map(async conversation => {
           if (!conversation.lastEncryptedMessage) return conversation;
+          const message = conversation.lastEncryptedMessage;
+          const previewKey = `${conversation.id}:${message.id}:${previewIdentity?.fingerprint || ''}:${message.crypto?.ciphertext || ''}`;
+          const cachedPreview = previewCacheRef.current.get(previewKey);
+          if (cachedPreview !== undefined) return { ...conversation, lastMessage: cachedPreview };
           const decrypted = await decryptMessage(previewIdentity, conversation.lastEncryptedMessage, conversation.id);
-          return { ...conversation, lastMessage: conversationPreview(decrypted) };
+          const preview = conversationPreview(decrypted);
+          if (decrypted.decryptionFailed === false) {
+            previewCacheRef.current.set(previewKey, preview);
+            while (previewCacheRef.current.size > 256) previewCacheRef.current.delete(previewCacheRef.current.keys().next().value);
+          }
+          return { ...conversation, lastMessage: preview };
         }));
         latestConversations = previews.map((conversation) => {
           const latest = unreadRevisionsRef.current.get(Number(conversation.id));
@@ -144,21 +161,12 @@ export function useDmData(account, reportError, onUnread = null) {
   }, [recordConversationUpdate]);
 
   const refreshPeople = useCallback(async () => {
-    const directory = await getPeople().catch(() => ({ people: [] }));
-    peopleLoadedRef.current = true;
-    setPeople(directory.people || []);
-    return directory.people || [];
+    setPeopleRevision(current => current + 1);
   }, []);
 
   const loadPeople = useCallback(async () => {
-    if (peopleLoadedRef.current) return;
-    setIsLoadingPeople(true);
-    try {
-      await refreshPeople();
-    } finally {
-      setIsLoadingPeople(false);
-    }
-  }, [refreshPeople]);
+    peopleLoadedRef.current = true;
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -177,14 +185,24 @@ export function useDmData(account, reportError, onUnread = null) {
         if (cancelled) return;
         if (registration.changed) reportError(new Error('This browser created a new encryption identity. Older encrypted messages may require your previous device.'));
       })
-      .catch((error) => { if (!cancelled) reportError(error); });
+      .catch((error) => { if (!cancelled) reportError(error); })
+      .finally(() => { if (!cancelled) setIdentityReady(true); });
     return () => { cancelled = true; };
   }, [account?.id, refreshSidebar, reportError]);
+
+  // The first sidebar request may finish before the account key is restored.
+  // Retry encrypted previews after React has committed the ready identity/ref.
+  useEffect(() => {
+    if (!identity?.privateKey || Number(identity.accountId) !== Number(account?.id)) return;
+    refreshSidebar().catch(reportError);
+  }, [account?.id, identity, refreshSidebar, reportError]);
 
   useEffect(() => {
     const synced = event => {
       if (Number(event.detail?.accountId) !== Number(account?.id)) return;
       ensureE2EEIdentity(account.id, account.username).then(next => {
+        transcriptCacheRef.current.clear();
+        previewCacheRef.current.clear();
         setIdentity(next);
         setMessageHistoryRetry(value => value + 1);
         refreshSidebar().catch(reportError);
@@ -196,31 +214,36 @@ export function useDmData(account, reportError, onUnread = null) {
 
   useEffect(() => {
     if (!selectedId) {
+      setTranscriptId(null);
       setMessages([]);
       setIsLoadingMessages(false);
       setMessagesError('');
       setHasMoreMessages(false);
       return undefined;
     }
+    if (!identityReady) { setIsLoadingMessages(true); return undefined; }
     let cancelled = false;
-    setMessages([]);
-    setIsLoadingMessages(true);
+    const controller = new AbortController();
+    const cached = transcriptCacheRef.current.get(Number(selectedId));
+    setTranscriptId(selectedId);
+    setMessages(cached?.messages || []);
+    setHasMoreMessages(Boolean(cached?.hasMore));
+    setIsLoadingMessages(!cached);
     setMessagesError('');
     setIsLoadingOlder(false);
-    setConversations((current) => current.map((item) => item.id === selectedId ? { ...item, unreadCount: 0 } : item));
     const messageScope = `dm:${Number(selectedId)}`;
     const snapshotRevision = liveMessageJournalRef.current.revision();
-    getMessages(selectedId, { limit: 50 }).then(async ({ messages: nextMessages, page }) => {
+    getMessages(selectedId, { limit: 50, signal: controller.signal }).then(async ({ messages: nextMessages, page }) => {
       const decrypted = await Promise.all(nextMessages.map((message) => decryptMessage(identity, message, selectedId)));
       if (!cancelled && Number(selectedIdRef.current) === Number(selectedId)) {
         setMessages((current) => liveMessageJournalRef.current.mergeSnapshot(
           messageScope,
           current,
-          decrypted,
+          recentHistorySnapshot(current, preserveReadableMessages(decrypted, current), Boolean(page?.hasMore)),
           snapshotRevision,
           { isPending: (message) => !(Number.isSafeInteger(Number(message.id)) && Number(message.id) > 0) },
         ));
-        setHasMoreMessages(Boolean(page?.hasMore));
+        setHasMoreMessages(cached ? cached.hasMore : Boolean(page?.hasMore));
         markConversationReadAndApply(selectedId, decrypted[decrypted.length - 1]?.id).catch(() => {});
       }
     }).catch((error) => {
@@ -233,9 +256,18 @@ export function useDmData(account, reportError, onUnread = null) {
     document.addEventListener('visibilitychange', onVisible);
     return () => {
       cancelled = true;
+      controller.abort();
       document.removeEventListener('visibilitychange', onVisible);
     };
-  }, [selectedId, identity, markConversationReadAndApply, messageHistoryRetry]);
+  }, [selectedId, identity, identityReady, markConversationReadAndApply, messageHistoryRetry]);
+
+  useEffect(() => {
+    if (!selectedId || Number(transcriptId) !== Number(selectedId) || isLoadingMessages || messagesError) return;
+    const cache = transcriptCacheRef.current;
+    cache.delete(Number(selectedId));
+    cache.set(Number(selectedId), { messages, hasMore: hasMoreMessages });
+    while (cache.size > 8) cache.delete(cache.keys().next().value);
+  }, [selectedId, transcriptId, messages, hasMoreMessages, isLoadingMessages, messagesError]);
 
   const identityRef = useRef(identity);
   identityRef.current = identity;
@@ -251,17 +283,16 @@ export function useDmData(account, reportError, onUnread = null) {
       if (conversationId && Number(selectedIdRef.current) === conversationId) {
         try {
           const snapshotRevision = liveMessageJournalRef.current.revision();
-          const { messages: latest } = await getMessages(conversationId, { limit: 50 });
+          const { messages: latest, page } = await getMessages(conversationId, { limit: 50 });
           const decrypted = await Promise.all(latest.map((message) => decryptMessage(identityRef.current, message, conversationId)));
           if (Number(selectedIdRef.current) === conversationId) {
             setMessages((current) => liveMessageJournalRef.current.mergeSnapshot(
               `dm:${conversationId}`,
               current,
-              decrypted,
+              recentHistorySnapshot(current, preserveReadableMessages(decrypted, current), Boolean(page?.hasMore)),
               snapshotRevision,
               {
                 isPending: (message) => !(Number.isSafeInteger(Number(message.id)) && Number(message.id) > 0),
-                retainCurrent: true,
               },
             ));
           }
@@ -296,13 +327,13 @@ export function useDmData(account, reportError, onUnread = null) {
         const conversationId = Number(payload.conversationId);
         const selected = conversationId === Number(selectedIdRef.current);
         const action = payload.action || 'created';
-        liveMessageJournalRef.current.record(
-          `dm:${conversationId}`,
-          action,
-          action === 'deleted' ? null : payload.message,
-          payload.message.id,
-        );
+        const eventKey = `${conversationId}:${payload.message.id}`;
+        const eventVersion = Symbol();
+        liveEventVersionsRef.current.set(eventKey, eventVersion);
+        while (liveEventVersionsRef.current.size > 1024) liveEventVersionsRef.current.delete(liveEventVersionsRef.current.keys().next().value);
         if (action === 'deleted') {
+          liveMessageJournalRef.current.record(`dm:${conversationId}`, action, null, payload.message.id);
+          transcriptCacheRef.current.delete(conversationId);
           if (selected) setMessages((current) => current.filter((item) => Number(item.id) !== Number(payload.message.id)));
           refreshSidebar().catch(() => {});
           return;
@@ -324,17 +355,27 @@ export function useDmData(account, reportError, onUnread = null) {
             return current.map((item) => Number(item.id) === conversationId ? { ...item, ...conversationPatch } : item);
           });
         }
+        const decrypted = await decryptMessage(identityRef.current, payload.message, conversationId);
+        if (liveEventVersionsRef.current.get(eventKey) !== eventVersion) return;
+        liveMessageJournalRef.current.record(`dm:${conversationId}`, action, decrypted);
+        if (mine && decrypted.clientMessageId) {
+          for (const job of pendingSendsRef.current.values()) {
+            if (job.conversationId === conversationId && job.encrypted?.envelope.clientMessageId === decrypted.clientMessageId) job.confirmed = decrypted;
+          }
+        }
+        if (action !== 'edited') {
+          const patch = { lastMessage: conversationPreview(decrypted), lastMessageAt: decrypted.createdAt };
+          recordConversationUpdate(conversationId, patch);
+          setConversations(current => current.map(item => Number(item.id) === conversationId ? { ...item, ...patch } : item));
+        }
+        const cached = transcriptCacheRef.current.get(conversationId);
+        if (cached) transcriptCacheRef.current.set(conversationId, { ...cached, messages: reconcileSentMessage(cached.messages, null, decrypted) });
         if (selected) {
-          const decrypted = await decryptMessage(identityRef.current, payload.message, conversationId);
-          setConversations(current => current.map(item => Number(item.id) === conversationId ? { ...item, lastMessage: conversationPreview(decrypted) } : item));
           setMessages((current) => {
             if (Number(selectedIdRef.current) !== conversationId) return current;
             const duplicateIndex = current.findIndex((item) =>
               (decrypted.clientMessageId && item.clientMessageId === decrypted.clientMessageId)
-              || Number(item.id) === Number(decrypted.id)
-              || (String(item.id).startsWith('pending-')
-                && Number(item.sender?.id) === Number(decrypted.sender?.id)
-                && item.body === decrypted.body),
+              || Number(item.id) === Number(decrypted.id),
             );
             if (duplicateIndex >= 0) {
               const copy = [...current];
@@ -403,9 +444,14 @@ export function useDmData(account, reportError, onUnread = null) {
   }, [refreshSidebar]);
 
   const requestFriendship = useCallback(async (username) => {
-    await sendFriendRequest(username);
+    const result = await sendFriendRequest(username);
     await refreshSidebar();
     if (peopleLoadedRef.current) await refreshPeople();
+    if (result.accepted && result.conversationId) {
+      setSelectedId(Number(result.conversationId));
+      return { ...result, isBot: true };
+    }
+    return result;
   }, [refreshPeople, refreshSidebar]);
 
   const acceptFriendship = useCallback(async (requestId) => {
@@ -445,7 +491,7 @@ export function useDmData(account, reportError, onUnread = null) {
 
   const submitMessage = useCallback(async (body, attachments, replyToMessageId = null) => {
     if (!selectedConversation || !account) return null;
-    const clientMessageId = `plain-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    const clientMessageId = crypto.randomUUID();
     const replyParent = replyToMessageId
       ? messages.find((item) => Number(item.id) === Number(replyToMessageId))
       : null;
@@ -466,36 +512,88 @@ export function useDmData(account, reportError, onUnread = null) {
       encrypted: false,
       status: 'sending',
     };
+    const job = { conversationId: Number(selectedConversation.id), body, attachments, replyToMessageId, optimistic, encrypted: null };
+    pendingSendsRef.current.set(optimistic.id, job);
     setMessages((current) => [...current, optimistic]);
-    try {
-      const activeIdentity = await ensureE2EEIdentity(account.id, account.username);
-      const latest = (await getConversations()).conversations.find(item => Number(item.id) === Number(selectedConversation.id));
-      if (!latest) throw new Error('Conversation not found.');
-      const encrypted = await prepareEncryptedMessage(activeIdentity, latest, body, attachments);
-      const response = await sendEncryptedMessage(selectedConversation.id, { ...encrypted, replyToMessageId });
-      if (response.message) response.message = await decryptMessage(activeIdentity, response.message, selectedConversation.id);
-      if (response.duplicate) {
-        setMessages((current) => current.map((message) => message.clientMessageId === optimistic.clientMessageId ? { ...message, id: response.messageId, status: 'sent' } : message));
-        return response;
-      }
-      setMessages((current) => [
-        ...current.filter((message) => message.clientMessageId !== optimistic.clientMessageId && Number(message.id) !== Number(response.message.id)),
-        { ...response.message, status: 'sent' },
-      ]);
-      setConversations((current) => current.map((conversation) => conversation.id === selectedConversation.id
-        ? { ...conversation, lastMessage: body || 'Attachment', lastMessageAt: response.message.createdAt, unreadCount: 0 }
-        : conversation));
-      return response.message;
-    } catch (error) {
-      setMessages((current) => current.map((message) => message.clientMessageId === optimistic.clientMessageId ? { ...message, status: 'failed' } : message));
-      throw error;
-    }
+    return deliverMessage(job);
   }, [account, messages, selectedConversation]);
+
+  const deliverMessage = async (job) => {
+    const { conversationId, optimistic, body, attachments, replyToMessageId } = job;
+    if (sendLocksRef.current.has(optimistic.id)) return null;
+    sendLocksRef.current.add(optimistic.id);
+    const patchStatus = (status) => {
+      if (Number(selectedIdRef.current) === conversationId) setMessages(current => current.map(message => message.id === optimistic.id ? { ...message, status } : message));
+      const cached = transcriptCacheRef.current.get(conversationId);
+      if (cached) transcriptCacheRef.current.set(conversationId, { ...cached, messages: cached.messages.map(message => message.id === optimistic.id ? { ...message, status } : message) });
+    };
+    patchStatus('sending');
+    try {
+      const latest = (await getConversations()).conversations.find(item => Number(item.id) === conversationId);
+      if (!latest || latest.blocked) throw new Error('This conversation is unavailable.');
+      if (latest.user.isBot) {
+        const response = await sendMessage(conversationId, body, attachments, replyToMessageId);
+        const message = response.message;
+        if (!message || !Number.isSafeInteger(Number(message.id))) throw new Error('Nura did not confirm the message. Please retry.');
+        liveMessageJournalRef.current.record(`dm:${conversationId}`, 'created', message);
+        if (Number(selectedIdRef.current) === conversationId) setMessages(current => reconcileSentMessage(current, optimistic.id, message));
+        const cached = transcriptCacheRef.current.get(conversationId);
+        if (cached) transcriptCacheRef.current.set(conversationId, { ...cached, messages: reconcileSentMessage(cached.messages, optimistic.id, message) });
+        pendingSendsRef.current.delete(optimistic.id);
+        setConversations(current => current.map(conversation => Number(conversation.id) === conversationId
+          ? { ...conversation, lastMessage: body || 'Image', lastMessageAt: message.createdAt, unreadCount: 0 }
+          : conversation));
+        return message;
+      }
+      const activeIdentity = await ensureE2EEIdentity(account.id, account.username);
+      if (!job.encrypted) {
+        job.encrypted = await prepareEncryptedMessage(activeIdentity, latest, body, attachments);
+        optimistic.clientMessageId = job.encrypted.envelope.clientMessageId;
+        if (Number(selectedIdRef.current) === conversationId) setMessages(current => current.map(message => message.id === optimistic.id ? { ...message, clientMessageId: optimistic.clientMessageId } : message));
+      }
+      const response = await sendEncryptedMessage(conversationId, { ...job.encrypted, replyToMessageId });
+      const message = response.message
+        ? await decryptMessage(activeIdentity, response.message, conversationId)
+        : { ...optimistic, id: response.messageId };
+      if (!Number.isSafeInteger(Number(message.id))) throw new Error('The message was not confirmed. Please retry.');
+      liveMessageJournalRef.current.record(`dm:${conversationId}`, 'created', message);
+      if (Number(selectedIdRef.current) === conversationId) setMessages(current => reconcileSentMessage(current, optimistic.id, message));
+      const cached = transcriptCacheRef.current.get(conversationId);
+      if (cached) transcriptCacheRef.current.set(conversationId, { ...cached, messages: reconcileSentMessage(cached.messages, optimistic.id, message) });
+      pendingSendsRef.current.delete(optimistic.id);
+      setConversations((current) => current.map((conversation) => Number(conversation.id) === conversationId
+        ? { ...conversation, lastMessage: body || 'Attachment', lastMessageAt: message.createdAt, unreadCount: 0 }
+        : conversation));
+      return message;
+    } catch (error) {
+      if (job.confirmed) {
+        pendingSendsRef.current.delete(optimistic.id);
+        return job.confirmed;
+      }
+      patchStatus('failed');
+      throw error;
+    } finally {
+      sendLocksRef.current.delete(optimistic.id);
+    }
+  };
+
+  const retryMessage = (messageId) => {
+    const job = pendingSendsRef.current.get(messageId);
+    if (!job) return Promise.reject(new Error('This send can no longer be retried. Copy the message and send it again.'));
+    return deliverMessage(job);
+  };
+
+  const discardFailedMessage = (messageId) => {
+    if (sendLocksRef.current.has(messageId)) return;
+    pendingSendsRef.current.delete(messageId);
+    setMessages(current => current.filter(message => message.id !== messageId));
+  };
 
   const editMessage = useCallback(async (messageId, body) => {
     if (!selectedConversation) return null;
     const { message } = await editDirectMessage(selectedConversation.id, messageId, body);
-    setMessages((current) => current.map((item) => Number(item.id) === Number(message.id) ? { ...item, ...message, status: 'sent' } : item));
+    if (Number(selectedIdRef.current) === Number(selectedConversation.id)) setMessages((current) => current.map((item) => Number(item.id) === Number(message.id) ? { ...item, ...message, status: 'sent' } : item));
+    transcriptCacheRef.current.delete(Number(selectedConversation.id));
     refreshSidebar().catch(() => {});
     return message;
   }, [refreshSidebar, selectedConversation]);
@@ -503,15 +601,18 @@ export function useDmData(account, reportError, onUnread = null) {
   const removeMessage = useCallback(async (messageId) => {
     if (!selectedConversation) return;
     await removeDirectMessage(selectedConversation.id, messageId);
-    setMessages((current) => current.filter((item) => Number(item.id) !== Number(messageId)));
+    liveMessageJournalRef.current.record(`dm:${Number(selectedConversation.id)}`, 'deleted', null, messageId);
+    transcriptCacheRef.current.delete(Number(selectedConversation.id));
+    if (Number(selectedIdRef.current) === Number(selectedConversation.id)) setMessages((current) => current.filter((item) => Number(item.id) !== Number(messageId)));
     refreshSidebar().catch(() => {});
   }, [refreshSidebar, selectedConversation]);
 
   const loadOlder = useCallback(async () => {
-    if (!selectedId || !hasMoreMessages || isLoadingOlder) return;
+    if (!selectedId || !hasMoreMessages || isLoadingOlder || olderLockRef.current === selectedId) return;
     const firstServerMessage = messages.find((message) => Number.isInteger(message.id));
     if (!firstServerMessage) return;
     setIsLoadingOlder(true);
+    olderLockRef.current = selectedId;
     const requestedConversationId = selectedId;
     const messageScope = `dm:${Number(requestedConversationId)}`;
     const snapshotRevision = liveMessageJournalRef.current.revision();
@@ -535,21 +636,22 @@ export function useDmData(account, reportError, onUnread = null) {
     } catch (error) {
       if (Number(selectedIdRef.current) === Number(requestedConversationId)) reportError(error);
     } finally {
+      if (olderLockRef.current === requestedConversationId) olderLockRef.current = null;
       if (Number(selectedIdRef.current) === Number(requestedConversationId)) setIsLoadingOlder(false);
     }
   }, [hasMoreMessages, identity, isLoadingOlder, messages, reportError, selectedId]);
 
   const updateTyping = useCallback((typing) => {
-    if (!selectedConversation) return;
+    if (!selectedId) return;
     const realtime = realtimeRef.current;
-    if (realtime?.send) realtime.send('typing', { conversationId: selectedConversation.id, typing });
-    else sendTyping(selectedConversation.id, typing).catch(() => {});
-  }, [selectedConversation]);
+    if (realtime?.send) realtime.send('typing', { conversationId: selectedId, typing });
+    else sendTyping(selectedId, typing).catch(() => {});
+  }, [selectedId]);
 
   return {
-    friends, requests, sent, people, conversations, messages, selectedId, selectedConversation, isLoading, isLoadingPeople, loadPeople,
+    friends, requests, sent, peopleRevision, conversations, messages: Number(transcriptId) === Number(selectedId) ? messages : [], selectedId, selectedConversation, isLoading, loadPeople,
     isLoadingMessages, messagesError, retryMessages: () => setMessageHistoryRetry((value) => value + 1),
-    refreshSidebar, setSelectedId, startConversation, requestFriendship, acceptFriendship, declineFriendship, cancelFriendship, unfriendConversation, blockConversation, pinConversation, submitMessage, editMessage, removeMessage, updateTyping,
+    refreshSidebar, setSelectedId, startConversation, requestFriendship, acceptFriendship, declineFriendship, cancelFriendship, unfriendConversation, blockConversation, pinConversation, submitMessage, retryMessage, discardFailedMessage, editMessage, removeMessage, updateTyping,
     hasMoreMessages, isLoadingOlder, loadOlder, connectionState,
     typingUsers: selectedId ? Object.values(typingByConversation[selectedId] || {}).filter((item) => item.expiresAt > Date.now()).map((item) => item.name) : [],
     isRecipientTyping: Boolean(selectedId && Object.keys(typingByConversation[selectedId] || {}).length),

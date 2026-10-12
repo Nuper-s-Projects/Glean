@@ -46,11 +46,13 @@ export default function SignUpScreen({ goTo, onAuthenticated }) {
   }
 
   return (
-    <AuthCard variant="signup-card">
+    <AuthCard
+      variant="signup-card"
+      brandContent={<div className="auth-brand-intro"><h2>Welcome to Glean!</h2><p>Let’s get started by creating your account. Already been here? Welcome back.</p></div>}
+    >
       <div className="auth-layout signup-layout">
         <section className="intro intro-signup">
           <h1>Create your<br />Glean account</h1>
-          <p>Choose a username<br />and create a password.</p>
         </section>
         <form className="auth-form" onSubmit={submit} noValidate>
           <TextField

@@ -62,7 +62,8 @@ export class ModerationService {
       }
     }
 
-    const result = await this.local.moderate(text, { simulate, conversation });
+    const localResult = await this.local.moderate(text, { simulate, conversation });
+    const result = this.#applyDeterministicPolicy(localResult, text, conversation);
     this.lastDecision = { provider: result.provider, fallbackUsed: true, at: new Date().toISOString() };
     safeLog('warn', 'local fail-safe activated', { requestId, failures: failures.map((f) => `${f.provider}:${f.code}`) });
     const response = { ...result, fallbackUsed: true, failures };

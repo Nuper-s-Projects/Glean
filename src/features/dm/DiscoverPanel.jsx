@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { getPublicServers } from '../../app/dmApi';
 import { Avatar } from './DmPrimitives';
 import { ChevronLeftIcon } from './icons';
@@ -14,41 +14,6 @@ export const DISCOVER_ATTRIBUTE_FILTERS = [
   { id: 'magnet', label: 'Magnet' },
   { id: 'laredo-college', label: 'Laredo College' },
 ];
-
-export function countDiscoverPeople(people) {
-  let add = 0;
-  let pending = 0;
-  let friends = 0;
-  for (const person of people) {
-    if (person.relation === 'friend') friends += 1;
-    else if (person.relation === 'incoming' || person.relation === 'outgoing') pending += 1;
-    else add += 1;
-  }
-  return { all: people.length, add, pending, friends };
-}
-
-function matchesAttributeFilter(person, filter) {
-  const programs = person.programs || [];
-  const hasProgramBadge = (id, label) => programs.some((program) => (
-    program.id === id || String(program.label || '').trim().toLowerCase() === label
-  ));
-  if (filter === 'magnet') return hasProgramBadge('magnet', 'magnet') || person.school === 'vmt-magnet';
-  if (filter === 'laredo-college') return hasProgramBadge('laredo-college', 'laredo college');
-  return true;
-}
-
-export function countDiscoverAttributes(people) {
-  return Object.fromEntries(DISCOVER_ATTRIBUTE_FILTERS.map((item) => [
-    item.id,
-    people.filter((person) => matchesAttributeFilter(person, item.id)).length,
-  ]));
-}
-
-function matchesQuery(person, query) {
-  if (!query) return true;
-  return String(person.username || '').toLowerCase().includes(query)
-    || String(person.bio || '').toLowerCase().includes(query);
-}
 
 function relationMeta(person) {
   if (person.relation === 'friend') return { chip: 'Friends', tone: 'friend' };
@@ -110,6 +75,14 @@ function PublicServerCard({ server, busy, onJoin }) {
 
 export default function DiscoverPanel({
   people,
+  total,
+  counts,
+  attributeCounts,
+  hasMorePeople,
+  isLoadingMorePeople,
+  peopleError,
+  onLoadMorePeople,
+  onRetryPeople,
   query,
   onQuery,
   filter,
@@ -126,7 +99,6 @@ export default function DiscoverPanel({
   onBack,
 }) {
   const [section, setSection] = useState('people');
-  const [visibleLimit, setVisibleLimit] = useState(50);
   const [publicServers, setPublicServers] = useState([]);
   const [publicCursor, setPublicCursor] = useState(null);
   const [publicLoading, setPublicLoading] = useState(false);
@@ -135,21 +107,17 @@ export default function DiscoverPanel({
   const [publicReload, setPublicReload] = useState(0);
   const [joiningId, setJoiningId] = useState(null);
   const publicRequestRef = useRef(0);
-  const counts = useMemo(() => countDiscoverPeople(people), [people]);
-  const attributeCounts = useMemo(() => countDiscoverAttributes(people), [people]);
-  const filtered = useMemo(() => {
-    const needle = query.trim().toLowerCase();
-    return people.filter((person) => {
-      if (!matchesQuery(person, needle)) return false;
-      if (attributeFilters.length && !attributeFilters.some((item) => matchesAttributeFilter(person, item))) return false;
-      if (filter === 'add') return person.relation === 'none';
-      if (filter === 'pending') return person.relation === 'incoming' || person.relation === 'outgoing';
-      if (filter === 'friends') return person.relation === 'friend';
-      return true;
-    });
-  }, [attributeFilters, people, query, filter]);
-  useEffect(() => setVisibleLimit(50), [query, filter, attributeFilters]);
-  const visiblePeople = useMemo(() => filtered.slice(0, visibleLimit), [filtered, visibleLimit]);
+  const bodyRef = useRef(null);
+  const peopleEndRef = useRef(null);
+  useEffect(() => { if (bodyRef.current) bodyRef.current.scrollTop = 0; }, [query, filter, attributeFilters, section]);
+  useEffect(() => {
+    if (section !== 'people' || !hasMorePeople || isLoading || isLoadingMorePeople || peopleError || !peopleEndRef.current) return undefined;
+    const observer = new IntersectionObserver(entries => {
+      if (entries.some(entry => entry.isIntersecting)) onLoadMorePeople();
+    }, { root: bodyRef.current, rootMargin: '300px' });
+    observer.observe(peopleEndRef.current);
+    return () => observer.disconnect();
+  }, [section, hasMorePeople, isLoading, isLoadingMorePeople, peopleError, onLoadMorePeople, people.length]);
   const cardProps = { onAdd, onAccept, onDecline, onCancel, onMessage };
   const resultTitle = filter === 'add' ? 'People you can add' : filter === 'pending' ? 'Requests' : filter === 'friends' ? 'Friends' : 'People';
 
@@ -268,7 +236,7 @@ export default function DiscoverPanel({
         </details>
         </> : null}
       </div>
-      <div className="dm-discover-body">
+      <div className="dm-discover-body" ref={bodyRef}>
         {section === 'servers' ? (
           publicLoading ? <p className="dm-empty-copy">Loading public servers…</p> : publicError && !publicServers.length ? (
             <div className="dm-discover-empty"><h2>Couldn’t load servers</h2><p>{publicError}</p><button className="dm-small-action" type="button" onClick={() => setPublicReload((value) => value + 1)}>Try again</button></div>
@@ -286,23 +254,27 @@ export default function DiscoverPanel({
           )
         ) : isLoading ? (
           <p className="dm-empty-copy">Loading people…</p>
-        ) : !filtered.length ? (
+        ) : peopleError && !people.length ? (
+          <div className="dm-discover-empty" role="alert"><h2>Couldn’t load people</h2><p>{peopleError}</p><button className="dm-small-action" type="button" onClick={onRetryPeople}>Try again</button></div>
+        ) : !people.length ? (
           <div className="dm-discover-empty">
-            <h2>{people.length ? 'No matches' : 'Nobody else yet'}</h2>
-            <p>{people.length ? 'Try another search or filter.' : 'When others join Glean, they’ll appear here.'}</p>
+            <h2>{query.trim() || filter !== 'all' || attributeFilters.length || counts.all ? 'No matches' : 'Nobody else yet'}</h2>
+            <p>{query.trim() || filter !== 'all' || attributeFilters.length || counts.all ? 'Try another search or filter.' : 'When others join Glean, they’ll appear here.'}</p>
           </div>
         ) : (
           <section className="dm-discover-section">
-            <h2>{resultTitle}<span>{filtered.length}</span></h2>
+            <h2>{resultTitle}<span>{total}</span></h2>
             <div className="dm-discover-grid">
-              {visiblePeople.map((person) => <PersonCard key={person.id} person={person} {...cardProps} />)}
+              {people.map((person) => <PersonCard key={person.id} person={person} {...cardProps} />)}
             </div>
           </section>
         )}
-        {section === 'people' && !isLoading && filtered.length > visibleLimit ? (
-          <button className="dm-small-action dm-discover-load-more" type="button" onClick={() => setVisibleLimit((limit) => limit + 50)}>
-            Show more people ({filtered.length - visibleLimit} remaining)
+        {section === 'people' && !isLoading && people.length > 0 && peopleError ? <p className="dm-empty-copy" role="alert">{peopleError}<button className="dm-small-action" type="button" onClick={onRetryPeople}>Try again</button></p> : null}
+        {section === 'people' && !isLoading && hasMorePeople ? (
+          <div ref={peopleEndRef} className="dm-discover-people-end"><button className="dm-small-action dm-discover-load-more" type="button" disabled={isLoadingMorePeople} onClick={onLoadMorePeople}>
+            {isLoadingMorePeople ? 'Loading…' : `Show more people (${Math.max(0, total - people.length)} remaining)`}
           </button>
+          </div>
         ) : null}
       </div>
     </section>

@@ -43,31 +43,46 @@ export function MessageAttachment({ attachment, message, accountId }) {
   const previewRef = useRef(null);
   const sourceRef = useRef(source);
   const loadLockRef = useRef(false);
+  const generationRef = useRef(0);
+  const attachmentRef = useRef(attachment);
+  const messageRef = useRef(message);
+  attachmentRef.current = attachment;
+  messageRef.current = message;
   sourceRef.current = source;
   const kind = classifyFileKind(attachment.type, attachment.name);
 
   const load = useCallback(async () => {
     if (!attachment.encrypted || sourceRef.current || loadLockRef.current) return;
     loadLockRef.current = true;
+    const generation = generationRef.current;
     setState('loading');
     try {
-      const blob = await decryptAttachment(accountId, attachment, message);
+      const blob = await decryptAttachment(accountId, attachmentRef.current, messageRef.current);
+      if (generation !== generationRef.current) return;
       const objectUrl = URL.createObjectURL(blob);
       objectUrlRef.current = objectUrl;
       sourceRef.current = objectUrl;
       setSource(objectUrl);
       setState('ready');
     } catch {
-      setState('error');
+      if (generation === generationRef.current) setState('error');
     } finally {
-      loadLockRef.current = false;
+      if (generation === generationRef.current) loadLockRef.current = false;
     }
-  }, [accountId, attachment, message]);
+  }, [accountId, attachment.id, attachment.encrypted]);
 
   useEffect(() => {
+    generationRef.current += 1;
+    const release = () => {
+      generationRef.current += 1;
+      if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
+      objectUrlRef.current = null;
+      sourceRef.current = null;
+      loadLockRef.current = false;
+    };
     if (!attachment.encrypted) {
       setSource(attachment.url);
-      return undefined;
+      return release;
     }
     setSource(null);
     sourceRef.current = null;
@@ -75,11 +90,11 @@ export function MessageAttachment({ attachment, message, accountId }) {
     loadLockRef.current = false;
     const shouldPreview = (kind === 'image' && Number(attachment.size || 0) <= 8 * 1024 * 1024)
       || (kind === 'audio' && Number(attachment.size || 0) <= 20 * 1024 * 1024);
-    if (!shouldPreview) return undefined;
+    if (!shouldPreview) return release;
     const target = previewRef.current;
     if (!target || typeof IntersectionObserver === 'undefined') {
       load();
-      return undefined;
+      return release;
     }
     const observer = new IntersectionObserver((entries) => {
       if (!entries.some((entry) => entry.isIntersecting)) return;
@@ -87,13 +102,8 @@ export function MessageAttachment({ attachment, message, accountId }) {
       load();
     }, { rootMargin: '320px 0px' });
     observer.observe(target);
-    return () => observer.disconnect();
-  }, [attachment.id, attachment.encrypted, attachment.size, load, kind]);
-
-  useEffect(() => () => {
-    if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
-    objectUrlRef.current = null;
-  }, [attachment.id]);
+    return () => { observer.disconnect(); release(); };
+  }, [attachment.id, attachment.encrypted, attachment.size, attachment.url, load, kind]);
 
   if (state === 'error') return <button type="button" className="dm-file-attachment dm-attachment-error" onClick={load}><AttachIcon /><span><strong>{attachment.name}</strong><small>Decryption failed · Retry</small></span></button>;
   if (!source && attachment.encrypted) return <button ref={previewRef} type="button" className="dm-file-attachment dm-attachment-loading" onClick={load} disabled={state === 'loading'}><AttachIcon /><span><strong>{attachment.name}</strong><small>{state === 'loading' ? 'Decrypting…' : `Encrypted · ${formatFileSize(attachment.size)}`}</small></span></button>;

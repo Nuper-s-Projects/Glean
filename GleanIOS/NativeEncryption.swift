@@ -1,4 +1,5 @@
 import CryptoKit
+import CommonCrypto
 import Foundation
 import Security
 import UniformTypeIdentifiers
@@ -16,31 +17,41 @@ struct NativeE2EEIdentity {
     private static var identities: [Int: NativeE2EEIdentity] = [:]
     private static var registered = Set<Int>()
     private static let service = "com.glean.ios.e2ee"
+    private static let profileBackupIterations: UInt32 = 600_000
     private static var archived: [String: [String: NativeE2EEIdentity]] = [:]
     private static var checkedAt: [Int: Date] = [:]
     private static var syncing: [Int: Task<NativeE2EEIdentity, Error>] = [:]
 
-    private static func localIdentity(auth: AuthStore) throws -> NativeE2EEIdentity {
+    private static func existingIdentity(auth: AuthStore) throws -> NativeE2EEIdentity? {
         let accountID = auth.account.number("id")
         guard accountID > 0 else { throw URLError(.userAuthenticationRequired) }
-        var identity: NativeE2EEIdentity
-        if let cached = identities[accountID] { identity = cached }
-        else {
-            let key: P256.KeyAgreement.PrivateKey
-            if let stored = readKey(accountID), let restored = try? P256.KeyAgreement.PrivateKey(rawRepresentation: stored) { key = restored }
-            else {
-                key = P256.KeyAgreement.PrivateKey()
-                saveKey(key.rawRepresentation, accountID: accountID)
-            }
-            let point = key.publicKey.x963Representation
-            let x = base64URL(Data(point[1..<33]))
-            let y = base64URL(Data(point[33..<65]))
-            let publicKey: Record = ["kty": "EC", "crv": "P-256", "x": x, "y": y]
-            let canonical = "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"\(x)\",\"y\":\"\(y)\"}"
-            let fingerprint = SHA256.hash(data: Data(canonical.utf8)).prefix(16).map { String(format: "%02x", $0) }.joined()
-            identity = NativeE2EEIdentity(privateKey: key, publicKey: publicKey, fingerprint: fingerprint)
-            identities[accountID] = identity
-        }
+        if let cached = identities[accountID] { return cached }
+        guard let stored = readKey(accountID), let key = try? P256.KeyAgreement.PrivateKey(rawRepresentation: stored) else { return nil }
+        let point = key.publicKey.x963Representation
+        let x = base64URL(Data(point[1..<33]))
+        let y = base64URL(Data(point[33..<65]))
+        let publicKey: Record = ["kty": "EC", "crv": "P-256", "x": x, "y": y]
+        let canonical = "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"\(x)\",\"y\":\"\(y)\"}"
+        let fingerprint = SHA256.hash(data: Data(canonical.utf8)).prefix(16).map { String(format: "%02x", $0) }.joined()
+        let identity = NativeE2EEIdentity(privateKey: key, publicKey: publicKey, fingerprint: fingerprint)
+        identities[accountID] = identity
+        return identity
+    }
+
+    private static func localIdentity(auth: AuthStore) throws -> NativeE2EEIdentity {
+        let accountID = auth.account.number("id")
+        if let existing = try existingIdentity(auth: auth) { return existing }
+        guard accountID > 0 else { throw URLError(.userAuthenticationRequired) }
+        let key = P256.KeyAgreement.PrivateKey()
+        saveKey(key.rawRepresentation, accountID: accountID)
+        let point = key.publicKey.x963Representation
+        let x = base64URL(Data(point[1..<33]))
+        let y = base64URL(Data(point[33..<65]))
+        let publicKey: Record = ["kty": "EC", "crv": "P-256", "x": x, "y": y]
+        let canonical = "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"\(x)\",\"y\":\"\(y)\"}"
+        let fingerprint = SHA256.hash(data: Data(canonical.utf8)).prefix(16).map { String(format: "%02x", $0) }.joined()
+        let identity = NativeE2EEIdentity(privateKey: key, publicKey: publicKey, fingerprint: fingerprint)
+        identities[accountID] = identity
         return identity
     }
 
@@ -52,7 +63,21 @@ struct NativeE2EEIdentity {
             identity = try localIdentity(auth: auth)
         } else {
             // A saved cross-device code must never silently replace the active key at startup.
-            let task = Task { try await sync(auth: auth, code: "") }
+            let task = Task { () throws -> NativeE2EEIdentity in
+                let accountKey = auth.username?.lowercased() == "nuper" ? try await auth.request("api/e2ee/profile-key") : [:]
+                let legacy = try await auth.request("api/e2ee/sync")
+                let activePublicKey = accountKey.object("publicKey").isEmpty ? legacy.object("publicKey") : accountKey.object("publicKey")
+                if !legacy.object("envelope").isEmpty, let code = savedSyncCode(accountID: accountID) {
+                    return try await sync(auth: auth, code: code)
+                }
+                if !activePublicKey.isEmpty {
+                    guard let local = try existingIdentity(auth: auth), samePublicKey(local.publicKey, activePublicKey) else {
+                        throw syncError("Sign in again with your Glean password to restore your account DM key on this device.")
+                    }
+                    return local
+                }
+                return try localIdentity(auth: auth)
+            }
             syncing[accountID] = task
             defer { syncing[accountID] = nil }
             identity = try await task.value
@@ -70,6 +95,147 @@ struct NativeE2EEIdentity {
     static func savedSyncCode(accountID: Int) -> String? {
         readSecret("code:\(accountID)").flatMap { String(data: $0, encoding: .utf8) }
     }
+
+    private static func profileBackupKey(password: String, salt: Data) async throws -> SymmetricKey {
+        let passwordData = Data(password.utf8)
+        let iterations = profileBackupIterations
+        let derived = try await Task.detached(priority: .userInitiated) { () throws -> Data in
+            let outputLength = 32
+            var output = Data(count: outputLength)
+            let status = passwordData.withUnsafeBytes { passwordBytes in
+                salt.withUnsafeBytes { saltBytes in
+                    output.withUnsafeMutableBytes { outputBytes in
+                        CCKeyDerivationPBKDF(
+                            CCPBKDFAlgorithm(kCCPBKDF2),
+                            passwordBytes.bindMemory(to: Int8.self).baseAddress,
+                            passwordData.count,
+                            saltBytes.bindMemory(to: UInt8.self).baseAddress,
+                            salt.count,
+                            CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA256),
+                            iterations,
+                            outputBytes.bindMemory(to: UInt8.self).baseAddress,
+                            outputLength
+                        )
+                    }
+                }
+            }
+            guard status == kCCSuccess else { throw URLError(.cannotDecodeContentData) }
+            return output
+        }.value
+        return SymmetricKey(data: derived)
+    }
+
+    private static func accountKeyRecords(accountID: Int, active: NativeE2EEIdentity) throws -> [Record] {
+        var records = readSecret("archive:\(accountID)").flatMap { try? JSONSerialization.jsonObject(with: $0) as? [Record] } ?? []
+        records += (archived[active.fingerprint] ?? [:]).values.map { item in
+            var privateJwk = item.publicKey
+            privateJwk["d"] = base64URL(item.privateKey.rawRepresentation)
+            return ["fingerprint": item.fingerprint, "publicKey": item.publicKey, "privateJwk": privateJwk]
+        }
+        var privateJwk = active.publicKey
+        privateJwk["d"] = base64URL(active.privateKey.rawRepresentation)
+        records.append(["fingerprint": active.fingerprint, "publicKey": active.publicKey, "privateJwk": privateJwk])
+        var unique: [String: Record] = [:]
+        for record in records {
+            let fingerprint = record.text("fingerprint")
+            if !fingerprint.isEmpty { unique[fingerprint] = record }
+        }
+        guard unique.count <= 64 else { throw NSError(domain: "Glean", code: 400, userInfo: [NSLocalizedDescriptionKey: "Your DM key archive has reached its limit."]) }
+        return Array(unique.values)
+    }
+
+    private static func encryptedProfileBackup(accountID: Int, password: String, active: NativeE2EEIdentity) async throws -> Record {
+        let identities = try accountKeyRecords(accountID: accountID, active: active)
+        let payload: Record = ["version": 1, "activeFingerprint": active.fingerprint, "identities": identities]
+        let clear = try JSONSerialization.data(withJSONObject: payload)
+        let salt = randomBytes(16)
+        let nonce = randomBytes(12)
+        let key = try await profileBackupKey(password: password, salt: salt)
+        let aad = Data("glean-account-key-backup-v1:\(accountID)".utf8)
+        let sealed = try AES.GCM.seal(clear, using: key, nonce: AES.GCM.Nonce(data: nonce), authenticating: aad)
+        return [
+            "version": 1,
+            "kdf": "PBKDF2-SHA256",
+            "iterations": Int(profileBackupIterations),
+            "salt": base64URL(salt),
+            "iv": base64URL(nonce),
+            "ciphertext": base64URL(sealed.ciphertext + sealed.tag),
+        ]
+    }
+
+    static func restoreProfileKeyBackup(auth: AuthStore, password: String) async throws {
+        guard auth.username?.lowercased() == "nuper" else { return }
+        let accountID = auth.account.number("id")
+        guard accountID > 0, !password.isEmpty else { throw syncError("Sign in with your Glean password to restore your DM key.") }
+        let remote = try await auth.request("api/e2ee/profile-key")
+        let remotePublic = remote.object("publicKey")
+        let local = try existingIdentity(auth: auth)
+        let backup = remote.object("backup")
+        var active: NativeE2EEIdentity?
+
+        if !backup.isEmpty {
+            do {
+                guard backup.number("version") == 1, backup.text("kdf") == "PBKDF2-SHA256", backup.number("iterations") == Int(profileBackupIterations) else { throw syncError("Unsupported Glean DM key backup.") }
+                let salt = try decode(backup.text("salt"))
+                let nonce = try decode(backup.text("iv"))
+                let combined = try decode(backup.text("ciphertext"))
+                guard combined.count > 16 else { throw URLError(.cannotDecodeContentData) }
+                let key = try await profileBackupKey(password: password, salt: salt)
+                let box = try AES.GCM.SealedBox(nonce: AES.GCM.Nonce(data: nonce), ciphertext: combined.dropLast(16), tag: combined.suffix(16))
+                let clear = try AES.GCM.open(box, using: key, authenticating: Data("glean-account-key-backup-v1:\(accountID)".utf8))
+                guard let payload = try JSONSerialization.jsonObject(with: clear) as? Record else { throw URLError(.cannotDecodeContentData) }
+                let records = payload.records("identities")
+                guard !records.isEmpty, records.count <= 64 else { throw URLError(.cannotDecodeContentData) }
+                let restored = restoreArchivedIdentities(records)
+                let selected = restored[payload.text("activeFingerprint")]
+                guard let selected, remotePublic.isEmpty || samePublicKey(selected.publicKey, remotePublic) else { throw syncError("The saved DM key does not match your account’s active key. Existing messages were not changed.") }
+                active = selected
+                archived[selected.fingerprint] = restored
+                saveKey(selected.privateKey.rawRepresentation, accountID: accountID)
+                try saveSecret(JSONSerialization.data(withJSONObject: records), name: "archive:\(accountID)")
+            } catch {
+                if let local, !remotePublic.isEmpty, samePublicKey(local.publicKey, remotePublic) {
+                    active = local
+                } else {
+                    throw syncError("This device could not unlock the account DM key. Check the Glean password or sign in on a device that can still read your DMs.")
+                }
+            }
+        } else if let local, remotePublic.isEmpty || samePublicKey(local.publicKey, remotePublic) {
+            active = local
+        } else if !remotePublic.isEmpty, let code = savedSyncCode(accountID: accountID) {
+            let restored = try await sync(auth: auth, code: code)
+            guard samePublicKey(restored.publicKey, remotePublic) else { throw syncError("This device is missing your active account DM key.") }
+            active = restored
+        } else if !remotePublic.isEmpty {
+            throw syncError("This account already has a DM key. Sign in on a device that can still read your DMs before linking a new device.")
+        } else {
+            active = try local ?? localIdentity(auth: auth)
+        }
+
+        guard let active, !active.serverKeyMismatch else { throw syncError("This device is missing your active account DM key.") }
+        let encrypted = try await encryptedProfileBackup(accountID: accountID, password: password, active: active)
+        let result: Record = [
+            "revision": remote.number("revision"),
+            "publicKey": active.publicKey,
+            "fingerprint": active.fingerprint,
+            "backup": encrypted,
+        ]
+        _ = try await auth.request("api/e2ee/profile-key", body: result, method: "PUT")
+        identities[accountID] = active
+        checkedAt[accountID] = Date()
+        registered.insert(accountID)
+    }
+
+    static func prepareProfileKeyBackupForPasswordChange(auth: AuthStore, currentPassword: String, newPassword: String) async throws -> Record? {
+        guard auth.username?.lowercased() == "nuper" else { return nil }
+        let remote = try await auth.request("api/e2ee/profile-key")
+        guard let local = try existingIdentity(auth: auth), remote.object("publicKey").isEmpty || samePublicKey(local.publicKey, remote.object("publicKey")) else {
+            throw syncError("This device does not have your active DM key. Restore it before changing your password.")
+        }
+        let encrypted = try await encryptedProfileBackup(accountID: auth.account.number("id"), password: newPassword, active: local)
+        return ["revision": remote.number("revision"), "publicKey": local.publicKey, "fingerprint": local.fingerprint, "backup": encrypted]
+    }
+
     static func deleteKeys(accountID: Int) {
         if let identity = identities.removeValue(forKey: accountID) { archived.removeValue(forKey: identity.fingerprint) }
         registered.remove(accountID)

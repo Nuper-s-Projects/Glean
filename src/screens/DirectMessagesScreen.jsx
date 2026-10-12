@@ -5,22 +5,21 @@ import { formatUnreadCount, setAppBadge } from '../app/pwa';
 import AddServerDialog from '../features/community/AddServerDialog';
 import AppRail from '../features/community/AppRail';
 import AccountChrome from '../features/dm/AccountChrome';
-import { Avatar, MessageAttachment, PresenceWrap } from '../features/dm/DmPrimitives';
-import { formatDateDivider, formatMessageTime, isGroupedMessage, shouldShowDivider } from '../features/dm/formatters';
-import { MessageBody } from '../features/dm/MessageBody';
-import { IsolatedMessageComposer } from '../features/dm/MessageComposer';
-import { messageMentionsUser } from '../features/dm/mentions';
-import { useChatAutoscroll } from '../features/dm/useChatAutoscroll';
+import { Avatar, PresenceWrap } from '../features/dm/DmPrimitives';
+import { IsolatedMessageComposer, typingStatusText } from '../features/dm/MessageComposer';
 import { useDmData } from '../features/dm/useDmData';
 import { useUserPopout } from '../features/dm/userPopout';
 import { setPushFocus } from '../app/desktopPush';
 import { USERNAME_INPUT_MAX_LENGTH } from '../app/username';
-import DiscoverPanel, { DISCOVER_FILTERS, countDiscoverPeople } from '../features/dm/DiscoverPanel';
+import DiscoverPanel, { DISCOVER_FILTERS } from '../features/dm/DiscoverPanel';
+import { useDiscoverPeople } from '../features/dm/useDiscoverPeople';
 import AnalyticsPanel from '../features/dm/AnalyticsPanel';
-import { CompassIcon, ChartIcon, ChevronLeftIcon, PhoneIcon, PhoneOffIcon } from '../features/dm/icons';
+import { CompassIcon, ChartIcon, ChevronLeftIcon, PhoneIcon, PhoneOffIcon, PlusIcon, MoreIcon, CloseIcon } from '../features/dm/icons';
 import DisplayName from '../features/dm/DisplayName';
-import CustomBadges from '../features/dm/CustomBadges';
-import { MessageHoverActions, ReplyQuote } from '../features/dm/MessageActions';
+import DmInbox from '../features/dm/DmInbox';
+import DmTranscript from '../features/dm/DmTranscript';
+import { presenceLabel, usePresence } from '../app/presence';
+import '../features/dm/DmWorkspace.css';
 import { DmCallSlot, useDmCall } from '../features/dm/DmCall';
 
 export default function DirectMessagesScreen({ account, goTo, onAccountUpdated, onSignedOut }) {
@@ -29,20 +28,21 @@ export default function DirectMessagesScreen({ account, goTo, onAccountUpdated, 
     try {
       const view = sessionStorage.getItem('glean.dmView');
       sessionStorage.removeItem('glean.dmView');
-      if (view === 'discover' || view === 'analytics' || view === 'requests' || view === 'friends') return view;
+      if (view === 'discover' || view === 'analytics' || view === 'requests') return view;
     } catch { /* ignore */ }
     return 'messages';
   });
   const [friendName, setFriendName] = useState('');
-  const [dmSearch, setDmSearch] = useState('');
-  const [friendsSearch, setFriendsSearch] = useState('');
+  const [showAddFriend, setShowAddFriend] = useState(false);
+  const friendInputRef = useRef(null);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [sendingIds, setSendingIds] = useState(() => new Set());
+  const draftStoreRef = useRef(new Map());
   const [discoverQuery, setDiscoverQuery] = useState('');
   const [discoverFilter, setDiscoverFilter] = useState('all');
   const [discoverAttributeFilters, setDiscoverAttributeFilters] = useState([]);
-  const [isFriendInputActive, setIsFriendInputActive] = useState(false);
   const [notice, setNotice] = useState('');
   const [dmContextMenu, setDmContextMenu] = useState(null);
-  const [isSending, setIsSending] = useState(false);
   const [replyTo, setReplyTo] = useState(null);
   const [editingMessageId, setEditingMessageId] = useState(null);
   const [editDraft, setEditDraft] = useState('');
@@ -65,57 +65,48 @@ export default function DirectMessagesScreen({ account, goTo, onAccountUpdated, 
     setServers((current) => patchServerUnreadSummary(current, payload));
   }, []);
   const {
-    friends, requests, sent, people, conversations, messages, selectedId, selectedConversation, isLoading, isLoadingPeople, loadPeople,
+    friends, requests, sent, peopleRevision, conversations, messages, selectedId, selectedConversation, isLoading, loadPeople,
     isLoadingMessages, messagesError, retryMessages,
     setSelectedId, startConversation, requestFriendship, acceptFriendship, declineFriendship, cancelFriendship, unfriendConversation, blockConversation, pinConversation, submitMessage: submitDmMessage, editMessage, removeMessage, updateTyping,
-    hasMoreMessages, isLoadingOlder, loadOlder, connectionState,
+    hasMoreMessages, isLoadingOlder, loadOlder, connectionState, typingUsers, retryMessage, discardFailedMessage,
   } = useDmData(account, reportError, applyRailUnread);
   const composerRef = useRef(null);
-  const messageScrollRef = useRef(null);
+  const isSending = sendingIds.has(Number(selectedId));
+  const peerPresence = usePresence(selectedConversation?.user?.id, selectedConversation?.user?.presence || 'offline');
+  const selectConversation = useCallback(id => { setSelectedId(id); setActiveView('messages'); setSearchOpen(false); }, [setSelectedId]);
+  const showChats = useCallback(() => { setSelectedId(null); setShowAddFriend(false); setActiveView('messages'); }, [setSelectedId]);
+  const showNewChat = useCallback(() => { setSelectedId(null); setActiveView('requests'); setShowAddFriend(true); }, [setSelectedId]);
+  useEffect(() => {
+    if (activeView === 'requests' && showAddFriend) friendInputRef.current?.focus();
+  }, [activeView, showAddFriend]);
+  useEffect(() => {
+    const openFriendRequest = (username) => {
+      setSelectedId(null);
+      setFriendName(String(username || '').trim());
+      setShowAddFriend(true);
+      setActiveView('requests');
+    };
+    const onOpenFriendRequest = (event) => openFriendRequest(event.detail?.username);
+    window.addEventListener('glean-open-friend-request', onOpenFriendRequest);
+    try {
+      const username = sessionStorage.getItem('glean.friendRequestUsername');
+      if (username) {
+        sessionStorage.removeItem('glean.friendRequestUsername');
+        openFriendRequest(username);
+      }
+    } catch { /* ignore */ }
+    return () => window.removeEventListener('glean-open-friend-request', onOpenFriendRequest);
+  }, [setSelectedId]);
   const mentionUsers = useMemo(
     () => [account, selectedConversation?.user, ...friends].filter(Boolean),
-    [account, selectedConversation, friends],
-  );
-  const conversationByUserId = useMemo(() => {
-    const next = new Map();
-    conversations.forEach((conversation) => {
-      const id = Number(conversation.user?.id);
-      if (!Number.isFinite(id) || next.has(id)) return;
-      next.set(id, { conversation });
-    });
-    return next;
-  }, [conversations]);
-  const friendsInView = useMemo(() => {
-    const needle = friendsSearch.trim().toLowerCase();
-    return [...friends]
-      .filter((friend) => !needle || String(friend.username || '').toLowerCase().includes(needle))
-      .sort((left, right) => {
-    const leftConversation = conversationByUserId.get(Number(left.id))?.conversation;
-    const rightConversation = conversationByUserId.get(Number(right.id))?.conversation;
-    const leftTime = leftConversation?.lastMessageAt ? Date.parse(leftConversation.lastMessageAt) : 0;
-    const rightTime = rightConversation?.lastMessageAt ? Date.parse(rightConversation.lastMessageAt) : 0;
-    if (leftTime !== rightTime) return rightTime - leftTime;
-    return String(left.username || '').localeCompare(String(right.username || ''), undefined, { sensitivity: 'base' });
-      });
-  }, [friends, friendsSearch, conversationByUserId]);
-  const visibleConversations = useMemo(() => {
-    const needle = dmSearch.trim().toLowerCase();
-    if (!needle) return conversations;
-    return conversations.filter((conversation) => (
-      String(conversation.user?.username || '').toLowerCase().includes(needle)
-      || String(conversation.lastMessage || '').toLowerCase().includes(needle)
-    ));
-  }, [conversations, dmSearch]);
-  const { atBottom, hasNewMessages, jumpToBottom } = useChatAutoscroll(
-    messageScrollRef,
-    isLoading ? null : selectedId,
-    messages.at(-1)?.id ?? messages.length,
+    [account, selectedConversation?.user, friends],
   );
   useEffect(() => {
     setDirectory(mentionUsers);
   }, [mentionUsers, setDirectory]);
   useEffect(() => () => setDirectory([]), [setDirectory]);
   useEffect(() => {
+    setSearchOpen(false);
     setReplyTo(null);
     setEditingMessageId(null);
     setEditDraft('');
@@ -128,7 +119,12 @@ export default function DirectMessagesScreen({ account, goTo, onAccountUpdated, 
     const closeOnEscape = (event) => {
       if (event.key === 'Escape') setDmContextMenu(null);
     };
-    const closeOnViewportChange = () => setDmContextMenu(null);
+    const closeOnViewportChange = event => {
+      if (event.type === 'scroll' && event.target instanceof Node && !event.target.contains(dmContextMenu.anchor)) return;
+      setDmContextMenu(null);
+    };
+    const firstItem = document.querySelector('.dm-context-menu button');
+    firstItem?.focus();
     window.addEventListener('pointerdown', closeOnOutsidePress);
     window.addEventListener('keydown', closeOnEscape);
     window.addEventListener('resize', closeOnViewportChange);
@@ -336,9 +332,13 @@ export default function DirectMessagesScreen({ account, goTo, onAccountUpdated, 
     if (!username) return;
     setNotice('');
     try {
-      await requestFriendship(username);
+      const result = await requestFriendship(username);
       setFriendName('');
-      setNotice(`Friend request sent to ${username}.`);
+      setShowAddFriend(false);
+      if (result?.isBot) {
+        setActiveView('messages');
+        setNotice('Nura accepted your request. You can start chatting now.');
+      } else setNotice(`Friend request sent to ${username}.`);
     } catch (error) { setNotice(error.message); }
   };
 
@@ -346,16 +346,16 @@ export default function DirectMessagesScreen({ account, goTo, onAccountUpdated, 
     setNotice('');
     try {
       await acceptFriendship(id);
-      setActiveView('friends');
+      setActiveView('messages');
     } catch (error) { setNotice(error.message); }
   };
 
   const addPerson = async (username) => {
     setNotice('');
-    try {
-      await requestFriendship(username);
-      setNotice(`Friend request sent to ${username}.`);
-    } catch (error) { setNotice(error.message); }
+    setSelectedId(null);
+    setFriendName(username);
+    setShowAddFriend(true);
+    setActiveView('requests');
   };
 
   const cancelRequest = async (id) => {
@@ -372,7 +372,8 @@ export default function DirectMessagesScreen({ account, goTo, onAccountUpdated, 
     } catch (error) { setNotice(error.message); }
   };
 
-  const discoverCounts = useMemo(() => countDiscoverPeople(people), [people]);
+  const discover = useDiscoverPeople({ enabled: activeView === 'discover', query: discoverQuery, filter: discoverFilter, attributeFilters: discoverAttributeFilters, revision: peopleRevision });
+  const discoverCounts = discover.counts;
   const openDiscover = () => setActiveView('discover');
   const openAnalytics = () => setActiveView('analytics');
   const toggleDiscoverAttributeFilter = useCallback((filterId) => {
@@ -398,14 +399,16 @@ export default function DirectMessagesScreen({ account, goTo, onAccountUpdated, 
     const files = extra?.attachments || [];
     const draft = extra?.draft || '';
     if (!selectedConversation || selectedConversation.blocked || (!draft.trim() && !files.length) || isSending) return;
-    setIsSending(true);
+    const conversationId = Number(selectedConversation.id);
+    setSendingIds(current => new Set(current).add(conversationId));
     setNotice('');
+    const pending = submitDmMessage(draft, files, replyTo?.id || null);
+    extra?.setDraft('');
+    extra?.setAttachments([]);
+    setReplyTo(null);
     try {
-      await submitDmMessage(draft, files, replyTo?.id || null);
-      extra?.setDraft('');
-      extra?.setAttachments([]);
-      setReplyTo(null);
-    } catch (error) { setNotice(error.message); } finally { setIsSending(false); }
+      await pending;
+    } catch (error) { setNotice(error.message); } finally { setSendingIds(current => { const next = new Set(current); next.delete(conversationId); return next; }); }
   };
 
   const beginReply = (message) => {
@@ -446,11 +449,12 @@ export default function DirectMessagesScreen({ account, goTo, onAccountUpdated, 
   const openDmContextMenu = (event, conversation) => {
     event.preventDefault();
     const menuWidth = 220;
-    const menuHeight = 158;
+    const menuHeight = 210;
     setDmContextMenu({
       conversation,
-      x: Math.min(event.clientX, Math.max(8, window.innerWidth - menuWidth - 8)),
-      y: Math.min(event.clientY, Math.max(8, window.innerHeight - menuHeight - 8)),
+      anchor: event.currentTarget,
+      x: Math.min(event.type === 'click' ? event.currentTarget.getBoundingClientRect().right : event.clientX, Math.max(8, window.innerWidth - menuWidth - 8)),
+      y: Math.min(event.type === 'click' ? event.currentTarget.getBoundingClientRect().bottom : event.clientY, Math.max(8, window.innerHeight - menuHeight - 8)),
     });
   };
 
@@ -459,6 +463,7 @@ export default function DirectMessagesScreen({ account, goTo, onAccountUpdated, 
     if (!conversation) return;
     setDmContextMenu(null);
     const target = conversation.user?.username || 'this user';
+    if (action === 'profile') { open(conversation.user, dmContextMenu.anchor); return; }
     if (action === 'unfriend' && !window.confirm(`Remove ${target} as a friend?`)) return;
     if (action === 'block' && !window.confirm(`Block ${target}?`)) return;
     try {
@@ -479,29 +484,6 @@ export default function DirectMessagesScreen({ account, goTo, onAccountUpdated, 
   };
 
   const renderSidebarContent = () => {
-    if (activeView === 'friends') return <div className="dm-list-content">
-      <div className="dm-section-title">Friends <span>{friends.length}</span></div>
-      <input
-        className="dm-list-search"
-        type="search"
-        value={friendsSearch}
-        onChange={(event) => setFriendsSearch(event.target.value)}
-        placeholder="Search friends"
-        aria-label="Search friends"
-        autoComplete="off"
-      />
-      {friendsInView.length ? friendsInView.map((friend) => {
-        const thread = conversationByUserId.get(Number(friend.id))?.conversation;
-        return (
-        <PresenceWrap className="dm-person-row" user={friend} key={friend.id}>
-          <Avatar user={friend} presence />
-          <button className="dm-person-row-open" type="button" onClick={() => beginConversation(friend.username)}>
-            <span><strong><DisplayName user={friend} /></strong><small>{thread?.lastMessage || 'No messages yet'}</small></span>
-          </button>
-        </PresenceWrap>
-        );
-      }) : <p className="dm-empty-copy">Accepted friends appear here.</p>}
-    </div>;
     if (activeView === 'requests') return <div className="dm-list-content">
       <div className="dm-section-title">Incoming <span>{requests.length}</span></div>
       {requests.length ? requests.map((request) => (
@@ -538,31 +520,10 @@ export default function DirectMessagesScreen({ account, goTo, onAccountUpdated, 
     if (activeView === 'analytics') return <div className="dm-list-content">
       <p className="dm-empty-copy">Community trends and member profile details.</p>
     </div>;
-    return <div className="dm-list-content">
-      <div className="dm-section-title">Messages <span>{dmSearch.trim() ? `${visibleConversations.length}/${conversations.length}` : conversations.length}</span></div>
-      <input
-        className="dm-list-search"
-        type="search"
-        value={dmSearch}
-        onChange={(event) => setDmSearch(event.target.value)}
-        placeholder="Search DMs"
-        aria-label="Search direct messages"
-        autoComplete="off"
-      />
-      {conversations.length ? visibleConversations.length ? visibleConversations.map((conversation) => (
-        <PresenceWrap className={`dm-person-row${conversation.id === selectedId ? ' is-selected' : ''}${conversation.unreadCount ? ' is-unread' : ''}`} user={conversation.user} key={conversation.id} onContextMenu={(event) => openDmContextMenu(event, conversation)}>
-          <Avatar user={conversation.user} presence />
-          <button className="dm-person-row-open" type="button" onClick={() => { setSelectedId(conversation.id); setActiveView('messages'); }}>
-            <span><strong><DisplayName user={conversation.user} /></strong><small>{conversation.lastMessage || 'No messages yet'}</small></span>
-          </button>
-          {conversation.pinned ? <span className="dm-pinned-mark" title="Pinned DM" aria-label="Pinned DM">📌</span> : null}
-          {conversation.unreadCount ? <b className="dm-unread-count">{formatUnreadCount(conversation.unreadCount)}</b> : null}
-        </PresenceWrap>
-      )) : <p className="dm-empty-copy">No DMs match that search.</p> : <p className="dm-empty-copy">Start a conversation with an accepted friend.</p>}
-    </div>;
+    return <DmInbox conversations={conversations} friends={friends} selectedId={selectedId} onSelect={selectConversation} onMenu={openDmContextMenu} onStart={beginConversation} isLoading={isLoading} onNewConversation={showNewChat} />;
   };
 
-  return <main className="dm-app" aria-label="Glean direct messages">
+  return <main className="dm-app dm-workspace" aria-label="Glean direct messages">
     <AppRail
         account={account}
         homeActive
@@ -588,14 +549,30 @@ export default function DirectMessagesScreen({ account, goTo, onAccountUpdated, 
         role="menu"
         style={{ left: dmContextMenu.x, top: dmContextMenu.y }}
         onContextMenu={(event) => event.preventDefault()}
+        onKeyDown={event => {
+          if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+          event.preventDefault();
+          const items = [...event.currentTarget.querySelectorAll('[role="menuitem"]')];
+          const index = items.indexOf(document.activeElement);
+          const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1 : (index + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+          items[next]?.focus();
+        }}
       >
+        <button type="button" role="menuitem" onClick={() => runDmContextAction('profile')}>View profile</button>
         <button type="button" role="menuitem" onClick={() => runDmContextAction('pin')}>{dmContextMenu.conversation.pinned ? 'Unpin DM' : 'Pin DM'}</button>
         <button type="button" role="menuitem" onClick={() => runDmContextAction('unfriend')}>Unfriend</button>
         <button type="button" role="menuitem" className="is-danger" onClick={() => runDmContextAction('block')}>Block</button>
       </div>
     ) : null}
 
-    <aside className="dm-sidebar">
+    <aside className="dm-sidebar" aria-label="Direct message navigation">
+      <div className="dm-sidebar-heading"><div><h1>Messages</h1></div><button type="button" onClick={showNewChat} aria-label="Add a friend" title="Add a friend" aria-controls="dm-add-friend" aria-expanded={activeView === 'requests' && showAddFriend}><PlusIcon /></button></div>
+      <nav className="dm-tabs" aria-label="Messages views">
+        <button type="button" aria-pressed={activeView === 'messages'} className={activeView === 'messages' ? 'is-active' : ''} onClick={showChats}>Chats</button>
+        <button type="button" aria-pressed={activeView === 'requests'} aria-label={`Requests${requests.length ? ` (${requests.length} pending)` : ''}`} className={activeView === 'requests' ? 'is-active' : ''} onClick={() => { setSelectedId(null); setShowAddFriend(true); setActiveView('requests'); }}>Requests{requests.length ? <b aria-hidden="true">{requests.length > 99 ? '99+' : requests.length}</b> : null}</button>
+        <button type="button" aria-pressed={activeView === 'discover'} className={`dm-discover-tab${activeView === 'discover' ? ' is-active' : ''}`} onClick={openDiscover} aria-label="Discover people" title="Discover people"><CompassIcon /></button>
+        <button type="button" aria-pressed={activeView === 'analytics'} className={`dm-discover-tab${activeView === 'analytics' ? ' is-active' : ''}`} onClick={openAnalytics} aria-label="Community analytics" title="Community analytics"><ChartIcon /></button>
+      </nav>
       {activeView === 'discover' ? (
         <div className="dm-search is-discover-head">
           <CompassIcon />
@@ -607,34 +584,37 @@ export default function DirectMessagesScreen({ account, goTo, onAccountUpdated, 
           <strong>Analytics</strong>
         </div>
       ) : (
-        <form className={`dm-search${isFriendInputActive ? ' is-focused' : ''}`} onSubmit={submitFriendRequest} onFocus={() => setIsFriendInputActive(true)} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setIsFriendInputActive(false); }}>
-          <input value={friendName} onChange={(event) => setFriendName(event.target.value)} placeholder="Friend username" aria-label="Friend username" maxLength={USERNAME_INPUT_MAX_LENGTH} />
-          {isFriendInputActive ? <button type="submit">Add</button> : null}
-        </form>
+        activeView === 'requests' ? <form className="dm-search dm-add-friend" id="dm-add-friend" onSubmit={submitFriendRequest}>
+          <input ref={friendInputRef} value={friendName} onChange={event => setFriendName(event.target.value)} placeholder="Add a friend by username" aria-label="Friend username" maxLength={USERNAME_INPUT_MAX_LENGTH} required />
+          <button type="submit" disabled={!friendName.trim()}>Add</button>
+        </form> : null
       )}
-      <div className="dm-tabs">
-        <button type="button" className={activeView === 'friends' ? 'is-active' : ''} onClick={() => setActiveView('friends')}>Friends</button>
-        <button type="button" className={activeView === 'requests' ? 'is-active' : ''} onClick={() => setActiveView('requests')}>Requests{requests.length ? <b>{requests.length}</b> : null}</button>
-        <button type="button" className={`dm-discover-tab${activeView === 'discover' ? ' is-active' : ''}`} onClick={openDiscover} aria-label="Discover people" title="Discover people"><CompassIcon /></button>
-        <button type="button" className={`dm-discover-tab${activeView === 'analytics' ? ' is-active' : ''}`} onClick={openAnalytics} aria-label="Community analytics" title="Community analytics"><ChartIcon /></button>
-      </div>
-      {isLoading && activeView !== 'discover' && activeView !== 'analytics' ? <p className="dm-empty-copy">Loading your messages…</p> : renderSidebarContent()}
+      {renderSidebarContent()}
+      {connectionState !== 'connected' ? <div className={`dm-connection-state is-${connectionState}`} role="status"><i />{connectionState === 'reconnecting' ? 'Reconnecting…' : 'Connecting…'}</div> : null}
       <div data-voice-dock-host />
       <AccountChrome account={account} onAccountUpdated={onAccountUpdated} onSignedOut={onSignedOut} />
     </aside>
 
     <section className={`dm-main-panel${selectedConversation && (call.status === 'outgoing' || call.status === 'active') && Number(call.conversationId) === Number(selectedConversation.id) ? ' is-voice-chat' : ''}`}>
-      {notice ? <div className="dm-notice" role="status">{notice}</div> : null}
+      {notice ? <div className="dm-notice" role="status"><span>{notice}</span><button type="button" onClick={() => setNotice('')} aria-label="Dismiss notice"><CloseIcon /></button></div> : null}
       {activeView === 'discover' ? (
         <DiscoverPanel
-          people={people}
+          people={discover.people}
+          total={discover.total}
+          counts={discover.counts}
+          attributeCounts={discover.attributeCounts}
+          hasMorePeople={discover.hasMore}
+          isLoadingMorePeople={discover.isLoadingMore}
+          peopleError={discover.error}
+          onLoadMorePeople={discover.loadMore}
+          onRetryPeople={discover.retry}
           query={discoverQuery}
           onQuery={setDiscoverQuery}
           filter={discoverFilter}
           onFilter={setDiscoverFilter}
           attributeFilters={discoverAttributeFilters}
           onAttributeFilterToggle={toggleDiscoverAttributeFilter}
-          isLoading={isLoadingPeople}
+          isLoading={discover.isLoading}
           onAdd={addPerson}
           onAccept={acceptRequest}
           onDecline={declineRequest}
@@ -654,7 +634,7 @@ export default function DirectMessagesScreen({ account, goTo, onAccountUpdated, 
             <Avatar user={selectedConversation.user} interactive={false} presence/>
             <span className="dm-chat-header-copy">
               <strong><DisplayName user={selectedConversation.user} /></strong>
-              <small className="dm-secure-label">Messages are readable across devices</small>
+              <small className="dm-secure-label">{selectedConversation.blocked ? 'Blocked' : selectedConversation.user.isBot ? 'AI chat · Groq · Not end-to-end encrypted' : typingUsers.length ? typingStatusText(typingUsers) : presenceLabel(peerPresence)}</small>
             </span>
           </PresenceWrap>
           {selectedConversation.blocked ? null : (
@@ -672,81 +652,27 @@ export default function DirectMessagesScreen({ account, goTo, onAccountUpdated, 
               {call.status !== 'idle' && Number(call.conversationId) === Number(selectedConversation.id) ? <PhoneOffIcon /> : <PhoneIcon />}
             </button>
           )}
+          <button className="dm-header-action" type="button" onClick={() => setSearchOpen(value => !value)} aria-label="Search conversation" aria-pressed={searchOpen} title="Search conversation"><svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5" /><path d="m16 16 4 4" /></svg></button>
+          <button className="dm-header-action" type="button" onClick={event => openDmContextMenu(event, selectedConversation)} aria-label="Conversation options" aria-haspopup="menu"><MoreIcon /></button>
         </header>
-        {hasNewMessages ? (
-          <button className="dm-new-messages-banner" type="button" onClick={jumpToBottom}>
-            <span aria-hidden="true">—</span> New messages
-          </button>
-        ) : null}
-        <div className="dm-message-scroll" ref={messageScrollRef}>
-          {isLoadingMessages ? <div className="community-chat-loading"><span className="community-spinner" />Loading messages…</div> : null}
-          {!isLoadingMessages && messagesError ? <div className="dm-history-error" role="alert"><p>{messagesError}</p><button type="button" onClick={retryMessages}>Try again</button></div> : null}
-          {!isLoadingMessages && !messagesError ? <>
-          {hasMoreMessages ? <button className="dm-load-older" type="button" onClick={loadOlder} disabled={isLoadingOlder}>{isLoadingOlder ? 'Loading…' : 'Load older messages'}</button> : <div className="dm-history-start"><Avatar user={selectedConversation.user} large/><h1><DisplayName user={selectedConversation.user} /></h1><p>This is the beginning of your message history with <strong><DisplayName user={selectedConversation.user} /></strong>.</p></div>}
-          {messages.map((message, index) => {
-            const grouped = isGroupedMessage(messages[index - 1], message);
-            const sender = Number(message.sender.id) === Number(account.id)
-              ? { ...message.sender, ...account }
-              : Number(message.sender.id) === Number(selectedConversation.user.id)
-                ? { ...message.sender, ...selectedConversation.user }
-                : message.sender;
-            const isAuthor = Number(message.sender.id) === Number(account.id);
-            const persisted = Number.isFinite(Number(message.id));
-            const isEditing = persisted && Number(editingMessageId) === Number(message.id);
-            return (
-          <div key={message.id}>
-            {shouldShowDivider(messages[index - 1], message) ? <div className="dm-date-divider"><span>{formatDateDivider(message.createdAt)}</span></div> : null}
-            <article className={`dm-message${message.status === 'failed' ? ' is-failed' : ''}${grouped ? ' is-grouped' : ''}${messageMentionsUser(message.body, account.username) ? ' is-mentioned' : ''}`} id={persisted ? `m-${message.id}` : undefined}>
-              {grouped ? <span className="dm-avatar-spacer" /> : <Avatar user={sender} />}
-              <div className="dm-message-body">
-                {grouped ? null : (
-                  <div className="dm-message-meta">
-                    <div className="dm-message-author-line">
-                      <button type="button" className="dm-message-author" onClick={(event) => open(sender, event.currentTarget)}><DisplayName user={sender} /></button>
-                      <CustomBadges badges={sender.customBadges} inline />
-                    </div>
-                    <time>{formatMessageTime(message.createdAt)}</time>
-                    {message.editedAt ? <small className="community-edited-label">edited</small> : null}
-                  </div>
-                )}
-                <MessageHoverActions
-                  canReply={persisted && !selectedConversation.blocked}
-                  canEdit={persisted && isAuthor && !message.encrypted}
-                  canDelete={persisted && isAuthor}
-                  onReply={() => beginReply(message)}
-                  onEdit={() => beginEdit(message)}
-                  onDelete={() => deleteOwnMessage(message)}
-                />
-                {isEditing ? (
-                  <form className="community-edit-form" onSubmit={(event) => submitEdit(event, message)}>
-                    <textarea value={editDraft} onChange={(event) => setEditDraft(event.target.value)} maxLength="4000" autoFocus aria-label="Edit message" />
-                    <div><button type="submit" disabled={!editDraft.trim() && !message.attachments?.length}>Save</button><button type="button" onClick={cancelEdit}>Cancel</button></div>
-                  </form>
-                ) : (
-                  <>
-                    <ReplyQuote reply={message.replyTo} />
-                    {message.body ? <MessageBody className="dm-message-text" body={message.body} users={mentionUsers} currentUsername={account.username} /> : null}
-                    {grouped && message.editedAt ? <small className="community-edited-label">edited</small> : null}
-                    {message.attachments?.length ? <div className="dm-message-attachments">{message.attachments.map((attachment) => <MessageAttachment key={attachment.id} attachment={attachment} message={message} accountId={account.id} />)}</div> : null}
-                    {message.status ? <small className="dm-message-status">{message.status === 'sending' ? 'Encrypting & sending…' : message.status === 'failed' ? 'Failed to send' : ''}</small> : null}
-                  </>
-                )}
-              </div>
-            </article>
-          </div>
-            );
-          })}
-          <div data-chat-end aria-hidden="true" />
-          </> : null}
-        </div>
-        {!atBottom ? (
-          <button className="dm-jump-latest" type="button" onClick={jumpToBottom} aria-label="Jump to latest messages" title="Jump to latest messages">
-            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" /></svg>
-          </button>
-        ) : null}
+        <DmTranscript
+          key={selectedConversation.id}
+          conversation={selectedConversation} account={account} messages={messages}
+          isLoading={isLoadingMessages} error={messagesError} onRetryHistory={retryMessages}
+          hasMore={hasMoreMessages} isLoadingOlder={isLoadingOlder} onLoadOlder={loadOlder}
+          searchOpen={searchOpen} onCloseSearch={() => setSearchOpen(false)} mentionUsers={mentionUsers}
+          openProfile={open} onReply={beginReply} onEdit={beginEdit} onDelete={deleteOwnMessage}
+          editingMessageId={editingMessageId} editDraft={editDraft} onEditDraft={setEditDraft} onSubmitEdit={submitEdit} onCancelEdit={cancelEdit}
+          onRetry={id => retryMessage(id).catch(reportError)} onDiscard={discardFailedMessage}
+        />
+        <div className="dm-compose-dock">
+          {selectedConversation.blocked ? <p className="dm-blocked-notice">You cannot send messages to this person.</p> : null}
         <IsolatedMessageComposer
           key={selectedConversation.id}
           resetKey={selectedConversation.id}
+          draftStore={draftStoreRef.current}
+          draftKey={`${account.id}:${selectedConversation.id}`}
+          typingText={typingStatusText(typingUsers)}
           onSend={submitMessage}
           onTyping={updateTyping}
           placeholder={selectedConversation.blocked ? "You can't message this person." : `Message ${selectedConversation.user.username}`}
@@ -759,7 +685,8 @@ export default function DirectMessagesScreen({ account, goTo, onAccountUpdated, 
           replyTo={replyTo}
           onClearReply={() => setReplyTo(null)}
         />
-      </> : <div className="dm-welcome"><Avatar user={account} username={username} avatarUrl={account?.avatarUrl} large/><h1>Your messages</h1><p>Select a conversation or open Friends to start a private direct message.</p></div>}
+        </div>
+      </> : <div className="dm-welcome"><Avatar user={account} username={username} avatarUrl={account?.avatarUrl} large/><h1>Your messages</h1><p>Your conversations and friends, together in Chats.</p><div className="dm-welcome-stats"><span><strong>{conversations.length}</strong> conversations</span><span><strong>{friends.length}</strong> friends</span></div><button className="glean-btn" type="button" onClick={showNewChat}><PlusIcon /> Add a friend</button></div>}
     </section>
     {showAddServer ? (
       <AddServerDialog

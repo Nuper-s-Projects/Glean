@@ -24,6 +24,8 @@ for (const path of files) {
   if (url !== '/index.html') assets.push(url);
 }
 
+// Worker-only changes must also advance the cache version and activate the update.
+hash.update(await readFile(join(dist, 'sw.js'), 'utf8'));
 const version = hash.digest('hex').slice(0, 16);
 await writeFile(join(dist, 'pwa-assets.json'), JSON.stringify({ version, assets }));
 const workerPath = join(dist, 'sw.js');

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, memo } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useId, memo } from 'react';
 import { Liquid } from 'liquid-gooey';
 import { Glass } from '@samasante/liquid-glass';
 import { AttachIcon, CloseIcon, MegaphoneIcon, MicIcon, PlusIcon, PollIcon, SendIcon } from './icons';
@@ -10,6 +10,7 @@ import { useImagePreview } from './ImagePreview';
 import { canRecordVoice, pickRecorderType, voiceFileFromBlob, VOICE_MAX_MS } from './voiceNote';
 import { apiRequest } from '../../app/apiClient';
 import { normalizeAccessibility } from '../../app/accessibility';
+import { matchingBotCommands } from './botCommands';
 
 const MAX_ATTACHMENTS = 10;
 const MAX_ATTACHMENT_BYTES = 2 * 1024 * 1024 * 1024;
@@ -347,6 +348,7 @@ export default function MessageComposer({
   maxLength = 2000,
   composerRef,
   mentionUsers = [],
+  commandBots = [],
   replyTo = null,
   onClearReply,
   typingText = '',
@@ -366,6 +368,16 @@ export default function MessageComposer({
   attachmentsRef.current = attachments;
   const [mention, setMention] = useState(null);
   const [mentionIndex, setMentionIndex] = useState(0);
+  const commandListId = useId();
+  const [commandIndex, setCommandIndex] = useState(0);
+  const [commandDismissed, setCommandDismissed] = useState(null);
+  const [commandCaret, setCommandCaret] = useState(draft.length);
+  const commandOptions = !disabled && !poll && commandDismissed !== draft
+    ? matchingBotCommands(commandBots, draft, commandCaret) : [];
+  const activeCommandIndex = Math.min(commandIndex, Math.max(0, commandOptions.length - 1));
+  useEffect(() => {
+    document.getElementById(`${commandListId}-${activeCommandIndex}`)?.scrollIntoView({ block: 'nearest' });
+  }, [commandListId, activeCommandIndex, draft]);
   const [recording, setRecording] = useState(false);
   const [recordError, setRecordError] = useState('');
   const [attachmentError, setAttachmentError] = useState('');
@@ -599,7 +611,37 @@ export default function MessageComposer({
     });
   };
 
+  const applyCommand = (command) => {
+    const text = `/${command.name} `;
+    onDraftChange(text);
+    setCommandIndex(0);
+    requestAnimationFrame(() => {
+      const node = textareaRef.current;
+      node?.focus();
+      node?.setSelectionRange(text.length, text.length);
+      fitTextarea(node);
+    });
+  };
+
   const onKeyDown = (event) => {
+    if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+    if (commandOptions.length) {
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        setCommandIndex((index) => (index + (event.key === 'ArrowDown' ? 1 : -1) + commandOptions.length) % commandOptions.length);
+        return;
+      }
+      if ((event.key === 'Enter' && !event.shiftKey) || event.key === 'Tab') {
+        event.preventDefault();
+        applyCommand(commandOptions[activeCommandIndex]);
+        return;
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setCommandDismissed(draft);
+        return;
+      }
+    }
     if (mentionMatches.length) {
       if (event.key === 'ArrowDown') {
         event.preventDefault();
@@ -804,12 +846,20 @@ export default function MessageComposer({
             ref={textareaRef}
             value={draft}
             onChange={(event) => {
+              setCommandDismissed(null);
+              setCommandIndex(0);
+              setCommandCaret(event.target.selectionStart);
               skipMentionAt.current = -1;
               syncMention(event.target.value, event.target.selectionStart);
               onDraftChange(event.target.value);
               fitTextarea(event.target);
             }}
             onKeyDown={onKeyDown}
+            onSelect={(event) => setCommandCaret(event.target.selectionStart)}
+            aria-controls={commandOptions.length ? commandListId : undefined}
+            aria-expanded={commandBots.length ? Boolean(commandOptions.length) : undefined}
+            aria-autocomplete={commandBots.length ? 'list' : undefined}
+            aria-activedescendant={commandOptions.length ? `${commandListId}-${activeCommandIndex}` : undefined}
             placeholder={poll ? 'Add a comment (optional)' : placeholder}
             maxLength={maxLength}
             rows="1"
@@ -831,7 +881,23 @@ export default function MessageComposer({
         ) : null}
         <SendButton disabled={!canSend} isSending={isSending} />
       </div>
-      {mentionMatches.length ? (
+      {commandOptions.length ? (
+        <div className="dm-command-picker" id={commandListId} role="listbox" aria-label="Bot commands">
+          {commandOptions.map((command, index) => (
+            <div key={command.key}>
+              {index === 0 || commandOptions[index - 1].bot.id !== command.bot.id ? (
+                <div className="dm-command-bot"><Avatar user={{ ...command.bot, username: command.bot.name }} interactive={false} /><strong>{command.bot.name}</strong><small>BOT</small></div>
+              ) : null}
+              <button type="button" role="option" id={`${commandListId}-${index}`} aria-selected={index === activeCommandIndex}
+                className={`dm-command-option${index === activeCommandIndex ? ' is-active' : ''}`}
+                onMouseDown={(event) => event.preventDefault()} onClick={() => applyCommand(command)}>
+                <span className="dm-command-mark" aria-hidden="true">/</span>
+                <span><strong>/{command.name} {command.usage ? <em>{command.usage}</em> : null}</strong><small>{command.description}</small></span>
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : mentionMatches.length ? (
         <div className="dm-mention-picker" role="listbox" aria-label="Mention someone">
           {mentionMatches.map((user) => (
             <button
@@ -855,15 +921,36 @@ export default function MessageComposer({
   );
 }
 
-export const IsolatedMessageComposer = memo(function IsolatedMessageComposer({ resetKey, onSend, onTyping, allowPolls = false, ...props }) {
-  const [draft, setDraft] = useState('');
-  const [attachments, setAttachments] = useState([]);
+export const IsolatedMessageComposer = memo(function IsolatedMessageComposer({ resetKey, onSend, onTyping, allowPolls = false, draftStore, draftKey, ...props }) {
+  const [draft, setDraftState] = useState(() => draftStore?.get(draftKey)?.draft || '');
+  const [attachments, setAttachmentsState] = useState(() => draftStore?.get(draftKey)?.attachments || []);
   const [poll, setPoll] = useState(null);
+  const draftRef = useRef(draft);
+  const attachmentsRef = useRef(attachments);
+  const rememberDraft = useCallback(() => {
+    if (!draftStore || !draftKey) return;
+    draftStore.delete(draftKey);
+    if (draftRef.current || attachmentsRef.current.length) draftStore.set(draftKey, { draft: draftRef.current, attachments: attachmentsRef.current });
+    while (draftStore.size > 10) draftStore.delete(draftStore.keys().next().value);
+  }, [draftStore, draftKey]);
+  const setDraft = useCallback(value => {
+    const next = typeof value === 'function' ? value(draftRef.current) : value;
+    draftRef.current = next;
+    setDraftState(next);
+    rememberDraft();
+  }, [rememberDraft]);
+  const setAttachments = useCallback(value => {
+    const next = typeof value === 'function' ? value(attachmentsRef.current) : value;
+    attachmentsRef.current = next;
+    setAttachmentsState(next);
+    rememberDraft();
+  }, [rememberDraft]);
   useEffect(() => {
+    if (draftStore) return;
     setDraft('');
     setAttachments([]);
     setPoll(null);
-  }, [resetKey]);
+  }, [resetKey, draftStore, setDraft, setAttachments]);
   useEffect(() => {
     onTyping?.(Boolean(draft.trim()));
     if (!draft.trim()) return undefined;

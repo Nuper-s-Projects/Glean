@@ -531,7 +531,11 @@ struct PrivacySettingsView: View {
                 SecureField("Current password", text: $oldPassword).textContentType(.password)
                 SecureField("New password", text: $password).textContentType(.newPassword)
                 Button("Change password") { Task { await action.run {
-                    _ = try await auth.request("api/account/password", body: ["currentPassword": oldPassword, "newPassword": password]); oldPassword = ""; password = ""
+                    var body: [String: Any] = ["currentPassword": oldPassword, "newPassword": password]
+                    if auth.username?.lowercased() == "nuper", let backup = try await NativeE2EE.prepareProfileKeyBackupForPasswordChange(auth: auth, currentPassword: oldPassword, newPassword: password) {
+                        body["profileKeyBackup"] = backup
+                    }
+                    _ = try await auth.request("api/account/password", body: body); oldPassword = ""; password = ""
                 } } }.disabled(password.count < 10 || oldPassword.isEmpty)
             }
             Section { ActionFeedback(action: action) }

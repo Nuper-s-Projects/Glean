@@ -23,6 +23,7 @@ import { isDeveloperModeEnabled, subscribeDeveloperMode } from './developerMode'
 import DeveloperModeWindow from '../features/dm/DeveloperModeWindow';
 import BackupLinksModal from '../components/BackupLinksModal';
 import { loopReturnPath, loopSignInPath } from './loopEntry';
+import MainThemeBackdrop from './MainThemeBackdrop';
 
 const BACKUP_LINKS_DISMISSED_KEY = 'glean-backup-links-dismissed-v1';
 
@@ -110,7 +111,7 @@ export default function App() {
     const motionPreference = window.matchMedia('(prefers-reduced-motion: reduce)');
     motionPreference.addEventListener('change', apply);
     return () => motionPreference.removeEventListener('change', apply);
-  }, [account?.id, account?.accessibility?.contrast, account?.accessibility?.saturation, account?.accessibility?.glassFrost, account?.accessibility?.glassDepth, account?.accessibility?.glassRefraction, displayedRoute]);
+  }, [account?.id, account?.accessibility?.theme, account?.accessibility?.contrast, account?.accessibility?.saturation, account?.accessibility?.glassFrost, account?.accessibility?.glassDepth, account?.accessibility?.glassRefraction, displayedRoute]);
 
   const transitionTo = useCallback((nextRoute) => {
     if (nextRoute === targetRoute.current && !transitionTimeout.current) return;
@@ -237,6 +238,19 @@ export default function App() {
   }, [navigate]);
 
   useEffect(() => {
+    const onOpenFriendRequest = (event) => {
+      const username = String(event.detail?.username || '').trim();
+      if (!username) return;
+      if (targetRoute.current !== ROUTES.APP) {
+        try { sessionStorage.setItem('glean.friendRequestUsername', username); } catch { /* ignore */ }
+        navigate(ROUTES.APP);
+      }
+    };
+    window.addEventListener('glean-open-friend-request', onOpenFriendRequest);
+    return () => window.removeEventListener('glean-open-friend-request', onOpenFriendRequest);
+  }, [navigate]);
+
+  useEffect(() => {
     const onOpenServer = (event) => {
       const serverId = Number(event.detail?.serverId || event.detail?.server?.id);
       if (!(Number.isInteger(serverId) && serverId > 0)) return;
@@ -269,6 +283,7 @@ export default function App() {
 
   return (
     <UserPopoutProvider account={hasAcceptedCurrentAgreements(account) ? account : null} onAccountUpdated={updateAccount}>
+      <MainThemeBackdrop preferences={account?.mainThemes} enabled={Boolean(account) && displayedRoute !== ROUTES.LOOP} />
       <ImagePreviewProvider>
       <DmCallProvider account={hasAcceptedCurrentAgreements(account) ? account : null}>
       {hasAcceptedCurrentAgreements(account) ? <PlatformAnnouncement account={account} /> : null}

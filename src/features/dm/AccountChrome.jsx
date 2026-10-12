@@ -5,14 +5,11 @@ import { signOut } from '../../app/storage';
 import { changePassword, deleteAccount, getAccountSessions, getBlockedUsers, resetUserPassword, revokeAccountSession, revokeOtherSessions, sendPushAnnouncement, sendTestPush, setKeepInformationSecret, setPresenceHidden, setPresenceStatus, setPrivateNotesEnabled, setShowInspectServers, subscribeToDmEvents, unblockUser, updateAccountAccessibility, updateAccountAvatar, updateAccountBio, updateAccountCustomBadges, updateAccountDiscord, updateAccountGrade, updateAccountProgram, updateAccountProfileBackground, updateAccountSchool, updateAccountSocialLinks, updateAccountUsername } from '../../app/dmApi';
 import { applyAccessibilitySettings, DEFAULT_ACCESSIBILITY, normalizeAccessibility } from '../../app/accessibility';
 import GleanButton from './GleanButton';
-import GradeQuestion from '../../components/GradeQuestion';
-import SchoolQuestion from '../../components/SchoolQuestion';
-import ProgramQuestion from '../../components/ProgramQuestion';
 import { schoolFitsGrade } from '../../app/laredoSchools';
 import { programDraftFromAccount } from '../../app/programs';
 import { normalizeDiscordUsername } from '../../app/discordUsername';
 import { normalizeSocialUrl, normalizeSocialUsername } from '../../app/socialLinks';
-import { normalizeUsername, USERNAME_INPUT_MAX_LENGTH, USERNAME_RULES_MESSAGE } from '../../app/username';
+import { normalizeUsername, USERNAME_RULES_MESSAGE } from '../../app/username';
 import { presenceLabel, usePresence, usePresenceHidden } from '../../app/presence';
 import AvatarCropEditor from './AvatarCropEditor';
 import BannerEditor from './BannerEditor';
@@ -20,14 +17,16 @@ import NameStyleEditor from './NameStyleEditor';
 import DisplayName from './DisplayName';
 import { profileThemeStyle, useContactBannerStyle } from './banner';
 import { Avatar } from './DmPrimitives';
-import { AccountIcon, SettingsIcon } from './icons';
+import { SettingsIcon } from './icons';
 import { useUserPopout } from './userPopout';
 import { CURRENT_RELEASE } from '../../app/releaseNotes';
-import { customBadgeTextColor, MAX_CUSTOM_BADGES, MAX_CUSTOM_BADGE_LABEL, normalizeCustomBadges } from '../../app/customBadges';
+import { formatJoinedDate, formatReleaseDate } from './formatters';
+import { MAX_CUSTOM_BADGES, MAX_CUSTOM_BADGE_LABEL, normalizeCustomBadges } from '../../app/customBadges';
 import { isDeveloperModeEnabled, setDeveloperModeEnabled, subscribeDeveloperMode } from '../../app/developerMode';
-import { Glass } from '@samasante/liquid-glass';
-import { glassOptics } from './MessageComposer';
-import { deleteE2EEIdentity, ensureE2EEIdentity, resetE2EEIdentity } from '../../app/e2ee';
+import { ProfileSettings, PrivacySettings, SecuritySettings, NotificationSettings, AccessibilitySettings } from './AccountSettingsPanels';
+import { SettingIcon, SettingsNotice } from './AccountSettingsPrimitives';
+import './AccountSettings.css';
+import { deleteE2EEIdentity, ensureE2EEIdentity, prepareProfileKeyBackupForPasswordChange, resetE2EEIdentity } from '../../app/e2ee';
 
 const AVATAR_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
 const AVATAR_MAX_BYTES = 200 * 1024 * 1024;
@@ -119,6 +118,7 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
   const [resetNote, setResetNote] = useState('');
   const [isResettingPassword, setIsResettingPassword] = useState(false);
   const [sessions, setSessions] = useState([]);
+  const [sessionsLoading, setSessionsLoading] = useState(false);
   const [sessionsBusy, setSessionsBusy] = useState('');
   const [deleteStage, setDeleteStage] = useState(0);
   const [deletePassword, setDeletePassword] = useState('');
@@ -130,6 +130,7 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
   const [privateNotesBusy, setPrivateNotesBusy] = useState(false);
   const [presenceStatusBusy, setPresenceStatusBusy] = useState(false);
   const [blockedUsers, setBlockedUsers] = useState([]);
+  const [blockedLoading, setBlockedLoading] = useState(false);
   const [blockedBusy, setBlockedBusy] = useState('');
   const cropSourceRef = useRef(null);
   cropSourceRef.current = cropSource;
@@ -256,6 +257,7 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
     applyAccessibilitySettings(account?.accessibility);
     setSettingsError('');
     setPasswordNote('');
+    setNotifyState(notificationPermission());
     setCurrentPassword('');
     setNewPassword('');
     setConfirmPassword('');
@@ -277,7 +279,8 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
   useEffect(() => {
     if (!isSettingsOpen || settingsTab !== 'security') return undefined;
     let cancelled = false;
-    loadSessions().catch((error) => { if (!cancelled) setSettingsError(error.message); });
+    setSessionsLoading(true);
+    loadSessions().catch((error) => { if (!cancelled) setSettingsError(error.message); }).finally(() => { if (!cancelled) setSessionsLoading(false); });
     if (account?.id) {
       ensureE2EEIdentity(account.id, account.username)
         .then((identity) => { if (!cancelled) setDmKeyStatus(identity.serverKeyMismatch ? 'mismatch' : 'ready'); })
@@ -289,7 +292,8 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
   useEffect(() => {
     if (!isSettingsOpen || settingsTab !== 'privacy') return undefined;
     let cancelled = false;
-    loadBlocked().catch((error) => { if (!cancelled) setSettingsError(error.message); });
+    setBlockedLoading(true);
+    loadBlocked().catch((error) => { if (!cancelled) setSettingsError(error.message); }).finally(() => { if (!cancelled) setBlockedLoading(false); });
     return () => { cancelled = true; };
   }, [isSettingsOpen, settingsTab, loadBlocked]);
 
@@ -313,7 +317,7 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
       setSettingsError('');
       updateAccountAccessibility(next.contrast, next.saturation, next.reduceMotion, next.glassFrost, next.glassDepth, next.glassRefraction, next.theme)
         .then((nextAccount) => {
-          onAccountUpdated(nextAccount);
+          onAccountUpdated({ ...accountRef.current, accessibility: nextAccount.accessibility });
           setAccessibilitySaved(true);
         })
         .catch((error) => setSettingsError(error.message || 'Could not save accessibility settings.'))
@@ -344,7 +348,10 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
     setSettingsError('');
     setPasswordNote('');
     try {
-      const result = await changePassword(currentPassword, newPassword);
+      const keyBackup = String(account.username || '').toLowerCase() === 'nuper'
+        ? await prepareProfileKeyBackupForPasswordChange(account.id, account.username, currentPassword, newPassword)
+        : null;
+      const result = await changePassword(currentPassword, newPassword, keyBackup);
       setCurrentPassword('');
       setNewPassword('');
       setConfirmPassword('');
@@ -552,6 +559,14 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
   };
 
   const editCustomBadge = (index, patch) => setCustomBadgeDraft((current) => current.map((badge, badgeIndex) => badgeIndex === index ? { ...badge, ...patch } : badge));
+  const changeProfileDraft = (field, value) => {
+    const setters = { username: setUsernameDraft, bio: setBioDraft, school: setSchoolDraft, programs: setProgramDraft, discord: setDiscordDraft, instagram: setInstagramDraft, instagramUsername: setInstagramUsernameDraft, tiktok: setTiktokDraft, tiktokUsername: setTiktokUsernameDraft };
+    if (field === 'grade') {
+      setGradeDraft(value);
+      setSchoolDraft(current => schoolFitsGrade(current, value) ? current : '');
+    } else setters[field]?.(value);
+    setSettingsError('');
+  };
   const addCustomBadge = () => {
     if (customBadgeDraft.length >= MAX_CUSTOM_BADGES) return;
     setCustomBadgeDraft((current) => [...current, { label: '', color: '#5865F2' }]);
@@ -715,18 +730,22 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
             <p className="dm-release-kicker">GLEAN UPDATE</p>
             <div className="dm-release-heading">
               <div>
-                <h2 id="release-title">{CURRENT_RELEASE.title}</h2>
+                <h2 id="release-title"><strong>{CURRENT_RELEASE.title}</strong></h2>
                 <p>Version {CURRENT_RELEASE.version}</p>
               </div>
               <img src="/glean-mark.svg" alt="Glean logo" />
             </div>
             <p className="dm-release-summary">{CURRENT_RELEASE.summary}</p>
-            <div className="dm-release-changes">
-              {CURRENT_RELEASE.changes.map((change) => (
-                <div className="dm-release-change" key={`${change.label}-${change.text}`}>
-                  <strong>{change.label}</strong>
-                  <span>{change.text}</span>
-                </div>
+            <div className="dm-release-changes" aria-label="Release updates">
+              {CURRENT_RELEASE.sections.map((section) => (
+                <section className="dm-release-section" key={section.title}>
+                  <h3>{section.title}</h3>
+                  <div className="dm-release-change-grid">
+                    {section.changes.map((change) => (
+                      <article className="dm-release-change" key={change}><span>{change}</span></article>
+                    ))}
+                  </div>
+                </section>
               ))}
             </div>
             <GleanButton type="button" onClick={() => { dismissRelease(); setShowReleaseNotes(false); }}>Got it</GleanButton>
@@ -742,373 +761,64 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
       </div>
       {isSettingsOpen ? (
         <div className="dm-settings-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !cropSource && !bannerOpen && !profileBackgroundOpen && !nameStyleOpen && !deleteStage) closeSettings(); }}>
-          <section className="dm-settings-modal dm-settings-organized" ref={settingsDialogRef} role="dialog" aria-modal="true" aria-labelledby="settings-title" aria-describedby="settings-description">
+          <section className="dm-settings-modal dm-settings-organized dm-settings-redesigned" ref={settingsDialogRef} role="dialog" aria-modal="true" aria-labelledby="settings-title" aria-describedby="settings-description">
             <aside className="dm-settings-sidebar">
-              <div className="dm-settings-category"><AccountIcon /><span>Settings</span></div>
+              <div className="dm-settings-category"><img src="/glean-mark.svg" alt="" /><span>Glean<small>Settings</small></span></div>
               <div className="dm-settings-subnav" role="navigation" aria-label="Settings sections">
-                <small className="dm-settings-nav-label">YOUR ACCOUNT</small>
-                {SETTINGS_SECTIONS.filter((section) => section.id !== 'info').map((section) => <button key={section.id} type="button" aria-current={settingsTab === section.id ? 'page' : undefined} className={settingsTab === section.id ? 'is-active' : ''} onClick={() => selectSettings(section.id)}><span>{section.title}</span><small>{section.description}</small></button>)}
+                {SETTINGS_SECTIONS.filter((section) => section.id !== 'info').map((section) => <button key={section.id} type="button" aria-current={settingsTab === section.id ? 'page' : undefined} className={settingsTab === section.id ? 'is-active' : ''} onClick={() => selectSettings(section.id)}><SettingIcon name={section.id} /><span>{section.title}</span></button>)}
               </div>
               <button type="button" aria-current={settingsTab === 'info' ? 'page' : undefined} className={`dm-settings-info${settingsTab === 'info' ? ' is-active' : ''}`} onClick={() => selectSettings('info')}>Info <small>Glean {CURRENT_RELEASE.version}</small></button>
               <button className="dm-settings-signout" type="button" onClick={handleSignOut} disabled={isSigningOut}>{isSigningOut ? 'Signing out…' : 'Sign out'}</button>
             </aside>
             <div className="dm-settings-content">
               <header className="dm-settings-header">
-                <div><span className="dm-settings-eyebrow">ACCOUNT SETTINGS</span><h1 id="settings-title">{activeSettings.title}</h1><p id="settings-description" className="dm-settings-lead">{activeSettings.description}</p></div>
-                <button type="button" className="dm-settings-close" onClick={closeSettings} aria-label="Close settings">×</button>
+                <div><h1 id="settings-title">{activeSettings.title}</h1><p id="settings-description" className="dm-settings-lead">{activeSettings.description}</p></div>
+                {settingsTab === 'profile' ? <GleanButton className="settings-profile-save" form="account-profile-form" type="submit" disabled={isSavingBio}>{isSavingBio ? 'Saving…' : 'Save profile'}</GleanButton> : null}
+                {settingsTab === 'accessibility' ? <p className="settings-autosave" role="status">{isSavingAccessibility ? 'Saving…' : accessibilitySaved ? 'Saved to your profile' : 'Changes save automatically'}</p> : null}
+                <button type="button" className="dm-settings-close" onClick={closeSettings} aria-label="Close settings"><SettingIcon name="close" /></button>
                 <label className="dm-settings-mobile-picker"><span>Section</span><select value={settingsTab} onChange={(event) => selectSettings(event.target.value)}>{SETTINGS_SECTIONS.map((section) => <option key={section.id} value={section.id}>{section.title}</option>)}</select></label>
               </header>
               <div className="dm-settings-scroll" ref={settingsScrollRef}>
-              {settingsTab === 'profile' ? (
-                <>
-              <form className="dm-profile-settings-form" onSubmit={saveAccountInfo}>
-                <section className="dm-settings-card" aria-labelledby="settings-appearance-title">
-                <h2 id="settings-appearance-title">Appearance</h2><p className="dm-settings-card-description">Personalize how your profile looks.</p>
-                <div className="dm-avatar-upload">
-                  <span>Profile picture</span>
-                  <div className="dm-avatar-picker">
-                    <Avatar username={username} avatarUrl={account?.avatarUrl} interactive={false} />
-                    <div>
-                      <label className="glean-btn is-quiet">
-                        <span className="glean-btn-glare" aria-hidden="true" />
-                        <span className="glean-btn-label">Choose photo</span>
-                        <input type="file" accept="image/jpeg,image/png,image/webp,image/gif" onChange={pickAvatar} disabled={isUploadingAvatar || Boolean(cropSource)} />
-                      </label>
-                      <small>{isUploadingAvatar ? 'Uploading…' : 'Choose an image or animated GIF up to 200 MB. GIFs open in the preview modal and stay animated.'}</small>
-                    </div>
-                  </div>
-                </div>
-                <div className="dm-account-banner-row">
-                  <span>Profile banner</span>
-                  <div className="dm-account-banner-preview" style={bannerPreview} />
-                  <GleanButton variant="quiet" type="button" onClick={() => setBannerOpen(true)}>Customize</GleanButton>
-                </div>
-                <div className="dm-account-banner-row">
-                  <span>Profile background</span>
-                  <div className="dm-account-banner-preview" style={profileBackgroundPreview} />
-                  <GleanButton variant="quiet" type="button" onClick={() => setProfileBackgroundOpen(true)}>Customize</GleanButton>
-                  <small>Solid color or two-color gradient behind the full profile card.</small>
-                </div>
-                </section>
-                <section className="dm-settings-card" aria-labelledby="settings-identity-title"><h2 id="settings-identity-title">Username</h2><p className="dm-settings-card-description">How people find and recognize you.</p>
-                <div className="dm-username-field">
-                  <label className="dm-bio-label" htmlFor="account-username">Username</label>
-                  <input id="account-username" className="dm-username-input" value={usernameDraft} onChange={(event) => { setUsernameDraft(event.target.value); setSettingsError(''); }} maxLength={USERNAME_INPUT_MAX_LENGTH} autoComplete="username" spellCheck="false" />
-                  <small>{USERNAME_RULES_MESSAGE} Can’t use a name that’s already taken.</small>
-                </div>
-                </section>
-                <section className="dm-settings-card" aria-labelledby="settings-socials-title"><h2 id="settings-socials-title">Social accounts</h2><p className="dm-settings-card-description">Optional links to help friends find you elsewhere.</p>
-                <div className="dm-username-field">
-                  <label className="dm-bio-label" htmlFor="account-discord">Discord</label>
-                  <input id="account-discord" className="dm-username-input" value={discordDraft} onChange={(event) => { setDiscordDraft(event.target.value); setSettingsError(''); }} maxLength="37" autoComplete="off" spellCheck="false" placeholder="username" />
-                  <small>Optional. New Discord usernames or name#0000. Leave blank to hide it.</small>
-                </div>
-                <div className="dm-username-field">
-                  <label className="dm-bio-label" htmlFor="account-instagram">Instagram</label>
-                  <input id="account-instagram-username" aria-label="Instagram username" className="dm-username-input" value={instagramUsernameDraft} onChange={(event) => { setInstagramUsernameDraft(event.target.value); setSettingsError(''); }} placeholder="Username (optional)" autoComplete="username" />
-                  <input id="account-instagram" className="dm-username-input" value={instagramDraft} onChange={(event) => { setInstagramDraft(event.target.value); setSettingsError(''); }} placeholder="Instagram link (optional)" autoComplete="url" />
-                </div>
-                <div className="dm-username-field">
-                  <label className="dm-bio-label" htmlFor="account-tiktok">TikTok</label>
-                  <input id="account-tiktok-username" aria-label="TikTok username" className="dm-username-input" value={tiktokUsernameDraft} onChange={(event) => { setTiktokUsernameDraft(event.target.value); setSettingsError(''); }} placeholder="Username (optional)" autoComplete="username" />
-                  <input id="account-tiktok" className="dm-username-input" value={tiktokDraft} onChange={(event) => { setTiktokDraft(event.target.value); setSettingsError(''); }} placeholder="https://tiktok.com/@username" autoComplete="url" />
-                </div>
-                </section>
-                <section className="dm-settings-card" aria-labelledby="settings-about-title"><h2 id="settings-about-title">About you</h2><p className="dm-settings-card-description">Your bio and how your name appears.</p>
-                <div className="dm-account-name-row">
-                  <span>Name style</span>
-                  <div className="dm-account-name-preview"><DisplayName user={{ username: usernameDraft || username, nameStyle: account?.nameStyle }} /></div>
-                  <GleanButton variant="quiet" type="button" onClick={() => setNameStyleOpen(true)}>Customize</GleanButton>
-                </div>
-                <label className="dm-bio-label" htmlFor="account-bio">Bio</label>
-                <textarea id="account-bio" value={bioDraft} onChange={(event) => setBioDraft(event.target.value)} maxLength="500" placeholder="Tell people a little about yourself." rows="5" />
-                </section>
-                <section className="dm-settings-card" aria-labelledby="settings-school-title"><h2 id="settings-school-title">School & programs</h2><p className="dm-settings-card-description">Choose the badges shown on your profile.</p>
-                <GradeQuestion
-                  value={gradeDraft}
-                  onChange={(next) => {
-                    setGradeDraft(next);
-                    setSchoolDraft((current) => (schoolFitsGrade(current, next) ? current : ''));
-                    setSettingsError('');
-                  }}
-                  name="settings-grade"
-                />
-                <SchoolQuestion
-                  value={schoolDraft}
-                  grade={gradeDraft}
-                  onChange={(next) => { setSchoolDraft(next); setSettingsError(''); }}
-                  name="settings-school"
-                />
-                <ProgramQuestion
-                  value={programDraft}
-                  onChange={(next) => { setProgramDraft(next); setSettingsError(''); }}
-                  name="settings-program"
-                />
-                </section>
-                <section className="dm-custom-badge-settings dm-settings-card" aria-labelledby="custom-badges-title">
-                  <div className="dm-custom-badge-heading">
-                    <div><h2 id="custom-badges-title">Custom badges</h2><p>Add short text badges to your profile and beside your name. Choose a color. Icons aren’t used.</p></div>
-                    <GleanButton variant="quiet" type="button" onClick={addCustomBadge} disabled={customBadgeDraft.length >= MAX_CUSTOM_BADGES}>Add badge</GleanButton>
-                  </div>
-                  {customBadgeDraft.length ? <div className="dm-custom-badge-list">
-                    {customBadgeDraft.map((badge, index) => (
-                      <div className="dm-custom-badge-row" key={`custom-badge-${index}`}>
-                        <label><span>Badge text</span><input className="dm-username-input" value={badge.label} maxLength={MAX_CUSTOM_BADGE_LABEL} onChange={(event) => { editCustomBadge(index, { label: event.target.value }); setCustomBadgeNote(''); }} placeholder="e.g. OM" /></label>
-                        <label><span>Color</span><input className="dm-custom-badge-color" type="color" value={badge.color} onChange={(event) => { editCustomBadge(index, { color: event.target.value.toUpperCase() }); setCustomBadgeNote(''); }} aria-label={`Badge ${index + 1} color`} /></label>
-                        <span className="dm-profile-badge is-custom" style={{ '--custom-badge-background': badge.color, '--custom-badge-foreground': customBadgeTextColor(badge.color) }}>{badge.label.trim() || 'Preview'}</span>
-                        <GleanButton variant="quiet" type="button" onClick={() => removeCustomBadge(index)} aria-label={`Remove badge ${index + 1}`}>Remove</GleanButton>
-                      </div>
-                    ))}
-                  </div> : <p className="dm-custom-badge-empty">No custom badges yet.</p>}
-                  <div className="dm-settings-actions">
-                    <GleanButton type="button" onClick={saveCustomBadges} disabled={isSavingCustomBadges}>{isSavingCustomBadges ? 'Saving…' : 'Save badges'}</GleanButton>
-                    <small>{customBadgeDraft.length}/{MAX_CUSTOM_BADGES}</small>
-                  </div>
-                  {customBadgeNote ? <p className="dm-settings-note" role="status">{customBadgeNote}</p> : null}
-                </section>
-                {settingsError ? <p className="dm-settings-error" role="alert">{settingsError}</p> : null}
-                <div className="dm-bio-actions">
-                  <GleanButton type="submit" disabled={isSavingBio}>{isSavingBio ? 'Saving…' : 'Save profile'}</GleanButton>
-                </div>
-              </form>
-                </>
-              ) : settingsTab === 'privacy' ? (
-                <>
-                  <section className="dm-notify-settings dm-privacy-secret">
-                    <h2>Keep My Information Secret</h2>
-                    <p>Reduces the activity Glean shares about you. It hides your online presence, stops typing indicators, and makes push alerts generic.</p>
-                    <label className="dm-privacy-toggle">
-                      <span><strong>Keep my information secret</strong><small>Applies to your account on all signed-in devices.</small></span>
-                      <input type="checkbox" role="switch" checked={Boolean(account?.keepInformationSecret)} onChange={(event) => toggleSecretMode(event.target.checked)} disabled={secretModeBusy} aria-label="Keep My Information Secret" />
-                    </label>
-                    <small className="dm-privacy-limits">DMs are end-to-end encrypted. Calls use encrypted WebRTC media. Server messages and call signaling still pass through Glean, and people in a server can see what you post and when you join a call. This setting does not make you anonymous.</small>
+              <div className="settings-page-body">
+                <SettingsNotice error>{settingsError}</SettingsNotice>
+                {settingsTab === 'profile' ? <ProfileSettings
+                  account={account}
+                  draft={{ username: usernameDraft, bio: bioDraft, grade: gradeDraft, school: schoolDraft, programs: programDraft, discord: discordDraft, instagram: instagramDraft, instagramUsername: instagramUsernameDraft, tiktok: tiktokDraft, tiktokUsername: tiktokUsernameDraft, badges: customBadgeDraft }}
+                  onChange={changeProfileDraft} banner={bannerPreview} background={profileBackgroundPreview}
+                  onSubmit={saveAccountInfo} onChooseAvatar={pickAvatar} avatarBusy={isUploadingAvatar} avatarDisabled={isUploadingAvatar || Boolean(cropSource)}
+                  onBanner={() => setBannerOpen(true)} onBackground={() => setProfileBackgroundOpen(true)} onNameStyle={() => setNameStyleOpen(true)}
+                  badges={{ add: addCustomBadge, edit: (index, patch) => { editCustomBadge(index, patch); setCustomBadgeNote(''); }, remove: removeCustomBadge, save: saveCustomBadges, busy: isSavingCustomBadges, note: customBadgeNote }}
+                /> : settingsTab === 'privacy' ? <PrivacySettings
+                  account={account} hidden={selfHidden} presence={selfLabel} blockedUsers={blockedUsers} loading={blockedLoading}
+                  busy={{ secret: secretModeBusy, presence: presenceStatusBusy, hidden: hidingPresence, notes: privateNotesBusy, blocked: blockedBusy, inspect: inspectBusy }}
+                  actions={{ secret: toggleSecretMode, presence: changePresenceStatus, hidden: toggleHidden, notes: togglePrivateNotes, unblock: unblockPerson, inspect: toggleInspectServers }}
+                /> : settingsTab === 'security' ? <SecuritySettings
+                  account={account} passwords={{ current: currentPassword, next: newPassword, confirm: confirmPassword }}
+                  onPasswordChange={(field, value) => ({ current: setCurrentPassword, next: setNewPassword, confirm: setConfirmPassword })[field](value)}
+                  passwordBusy={isSavingPassword} passwordNote={passwordNote} onSavePassword={savePassword}
+                  sessions={sessions} sessionsLoading={sessionsLoading} sessionsBusy={sessionsBusy} onRevoke={revokeSession} onRevokeOthers={revokeOthers}
+                  encryption={{ status: dmKeyStatus, password: dmKeyPassword, setPassword: setDmKeyPassword, acknowledged: dmKeyAcknowledged, setAcknowledged: setDmKeyAcknowledged, busy: dmKeyBusy, reset: resetDmEncryption, note: dmKeyNote, error: dmKeyError }}
+                  admin={{ username: resetUsername, setUsername: setResetUsername, password: resetPassword, setPassword: setResetPassword, busy: isResettingPassword, submit: resetUserPasswordForAdmin, note: resetNote }}
+                  onDelete={openDeleteWarning}
+                /> : settingsTab === 'notifications' ? <NotificationSettings
+                  account={account} permission={notifyState} busy={notifyBusy} onEnable={toggleNotifications}
+                  test={{ send: sendTestNotification, busy: testPushBusy, note: testPushNote }}
+                  announcement={{ draft: announcementDraft, setDraft: setAnnouncementDraft, send: sendAnnouncement, busy: announcementBusy, note: announcementNote }}
+                  pwa={pwa} onInstall={() => promptInstall().catch(error => setSettingsError(error.message || 'Could not install Glean.'))}
+                /> : settingsTab === 'accessibility' ? <AccessibilitySettings value={accessibility} onChange={changeAccessibility} onReset={resetGlassOptics} mainThemes={account.mainThemes} onThemeSaved={mainThemes => onAccountUpdated({ ...accountRef.current, mainThemes })} /> : (
+                  <section className="dm-info-screen" aria-labelledby="glean-info-name">
+                    <img src="/glean-mark.svg" alt="Glean logo" />
+                    <div className="dm-info-brandline"><h2 id="glean-info-name">Glean</h2><span>Beta</span></div>
+                    <p>Version <strong>{CURRENT_RELEASE.version}</strong></p>
+                    <dl className="dm-info-details">
+                      <div><dt>Release date</dt><dd><time dateTime={CURRENT_RELEASE.releasedAt}>{formatReleaseDate(CURRENT_RELEASE.releasedAt)}</time></dd></div>
+                      <div><dt>You joined</dt><dd>{formatJoinedDate(account?.createdAt) || 'Date unavailable'}</dd></div>
+                    </dl>
+                    <GleanButton type="button" onClick={() => setShowReleaseNotes(true)}>View update log</GleanButton>
+                    <div className="dm-developer-mode-setting"><span><strong>Developer Mode</strong><small>Show local performance and network diagnostics.</small></span><button className="dm-accessibility-switch" type="button" role="switch" aria-checked={developerMode} onClick={() => setDeveloperModeEnabled(!developerMode)}>{developerMode ? 'On' : 'Off'}</button></div>
                   </section>
-                  <section className="dm-notify-settings">
-                    <h2>Blocked users</h2>
-                    <p>People you block can’t contact you through Glean.</p>
-                    {settingsError ? <p className="dm-settings-error" role="alert">{settingsError}</p> : null}
-                    {blockedUsers.length ? <div className="dm-blocked-list">{blockedUsers.map((person) => (
-                      <div className="dm-session-row" key={person.id}><span><strong>{person.username}</strong></span>
-                        <GleanButton className="is-compact" variant="quiet" type="button" onClick={() => unblockPerson(person.username)} disabled={Boolean(blockedBusy)}>{blockedBusy === person.username ? 'Unblocking…' : 'Unblock'}</GleanButton>
-                      </div>
-                    ))}</div> : !settingsError ? <p>Nobody is blocked.</p> : null}
-                  </section>
-                  <section className="dm-notify-settings">
-                    <h2>Presence</h2>
-                    <p>Choose whether other people can see when you’re online.</p>
-                    <label className="dm-settings-field"><span>Status</span><select value={account?.presenceStatus || 'auto'} onChange={(event) => changePresenceStatus(event.target.value)} disabled={presenceStatusBusy} aria-label="Online status">
-                      <option value="auto">Automatic</option>
-                      <option value="online">Online</option>
-                      <option value="idle">Idle</option>
-                      <option value="dnd">Do Not Disturb</option>
-                      <option value="offline">Offline</option>
-                    </select></label>
-                    {account?.keepInformationSecret ? <small>Keep My Information Secret is keeping your presence hidden.</small> : <GleanButton type="button" onClick={toggleHidden} disabled={hidingPresence}>{hidingPresence ? 'Saving…' : selfHidden ? 'Stop appearing offline' : 'Appear offline'}</GleanButton>}
-                    <small> Right now: {selfLabel}</small>
-                  </section>
-                  <section className="dm-notify-settings">
-                    <h2>Private notes</h2>
-                    <p>Show or hide the private note area in user profiles. Existing notes are kept.</p>
-                    <div className="dm-settings-actions" role="group" aria-label="Private notes">
-                      <GleanButton type="button" pressed={account?.privateNotesEnabled !== false} onClick={() => togglePrivateNotes(true)} disabled={privateNotesBusy}>On</GleanButton>
-                      <GleanButton variant="quiet" type="button" pressed={account?.privateNotesEnabled === false} onClick={() => togglePrivateNotes(false)} disabled={privateNotesBusy}>Off</GleanButton>
-                    </div>
-                  </section>
-                  {account?.platformAdmin ? <section className="dm-notify-settings">
-                    <h2>Hidden servers</h2><p>Servers you can inspect but not join. Turn this off to hide them from your rail.</p>
-                    <div className="dm-settings-actions" role="group" aria-label="Hidden servers">
-                      <GleanButton type="button" pressed={account?.showInspectServers !== false} onClick={() => toggleInspectServers(true)} disabled={inspectBusy}>On</GleanButton>
-                      <GleanButton variant="quiet" type="button" pressed={account?.showInspectServers === false} onClick={() => toggleInspectServers(false)} disabled={inspectBusy}>Off</GleanButton>
-                    </div>
-                  </section> : null}
-                </>
-              ) : settingsTab === 'notifications' ? (
-                <>
-                  <section className="dm-notify-settings">
-                    <h2>Desktop notifications</h2>
-                    <p>Alerts for DMs, servers, and friend requests, even when Glean is in the background.</p>
-                    <div className="dm-settings-actions">
-                      <GleanButton type="button" pressed={notifyState === 'granted'} onClick={toggleNotifications} disabled={notifyBusy || notifyState === 'unsupported'}>{notifyBusy ? 'Enabling…' : notifyState === 'granted' ? 'Notifications on' : notifyState === 'denied' ? 'Blocked in browser' : 'Enable notifications'}</GleanButton>
-                      {account?.platformAdmin ? <GleanButton variant="quiet" type="button" onClick={sendTestNotification} disabled={testPushBusy}>{testPushBusy ? 'Sending…' : 'Send test'}</GleanButton> : null}
-                    </div>
-                    {testPushNote ? <small>{testPushNote}</small> : null}
-                  </section>
-                  {account?.platformAdmin && String(account?.username || '').trim().toLowerCase() === 'nuper' ? <section className="dm-notify-settings">
-                    <h2>Send an announcement</h2>
-                    <p>Send a custom notification to users who have enabled desktop notifications.</p>
-                    <label className="dm-announcement-label" htmlFor="dm-announcement-message">Message</label>
-                    <textarea id="dm-announcement-message" className="dm-announcement-message" value={announcementDraft} maxLength={240} rows={3} placeholder="Write a notification…" onChange={(event) => setAnnouncementDraft(event.target.value)} />
-                    <div className="dm-settings-actions"><GleanButton type="button" onClick={sendAnnouncement} disabled={announcementBusy || !announcementDraft.trim()}>{announcementBusy ? 'Sending…' : 'Send to everyone'}</GleanButton><small>{announcementDraft.length}/240</small></div>
-                    {announcementNote ? <small role="status">{announcementNote}</small> : null}
-                    {settingsError ? <p className="dm-settings-error" role="alert">{settingsError}</p> : null}
-                  </section> : null}
-                  <section className="dm-notify-settings">
-                    <h2>Daily greetings</h2>
-                    <p>Weekdays at 8:15 AM and 4:00 PM Central time. Friday afternoon has a weekend message. No scheduled greetings on Saturday or Sunday. Users need desktop notifications enabled.</p>
-                  </section>
-                  <section className="dm-notify-settings">
-                    <h2>Install Glean</h2>
-                    {pwa.standalone ? <p>Glean is installed on this device.</p> : pwa.canInstall ? <><p>Install Glean for a dedicated app window and easier access.</p><GleanButton type="button" onClick={() => promptInstall().catch(() => {})}>Install Glean</GleanButton></> : <p>Use your browser’s install or Add to Home Screen option to pin Glean as an app.</p>}
-                  </section>
-                </>
-              ) : settingsTab === 'accessibility' ? (
-                <section className="dm-accessibility-settings" aria-labelledby="accessibility-heading">
-                  <h2 id="accessibility-heading">Display adjustments</h2>
-                  <p className="dm-accessibility-description">Fine-tune Glean’s colors for your comfort. These preferences are saved to your profile and follow you to other devices.</p>
-                  <div className="dm-accessibility-control">
-                    <div className="dm-accessibility-label"><span>Theme</span><output>{accessibility.theme === 'system' ? 'System' : accessibility.theme === 'light' ? 'Light' : 'Dark'}</output></div>
-                    <div className="dm-glass-presets" role="radiogroup" aria-label="Color theme">
-                      {[{ value: 'system', label: 'System' }, { value: 'light', label: 'Light' }, { value: 'dark', label: 'Dark' }].map((option) => (
-                        <button key={option.value} type="button" role="radio" aria-checked={accessibility.theme === option.value} onClick={() => changeAccessibility('theme', option.value)}>{option.label}</button>
-                      ))}
-                    </div>
-                    <p className="dm-accessibility-description">System follows your device appearance. Light and Dark set Glean’s appearance directly.</p>
-                  </div>
-                  <div className="dm-accessibility-control dm-accessibility-control-glass">
-                    <>
-                        <div className="dm-accessibility-label"><label htmlFor="accessibility-glass">Liquid Glass</label><output htmlFor="accessibility-glass">{accessibility.glassFrost < 20 ? 'Clear' : accessibility.glassFrost > 80 ? 'Frosted' : `${accessibility.glassFrost}% frosted`}</output></div>
-                        <p className="dm-accessibility-description">Tune the glass finish, lens depth, and refraction. These controls update the live preview and the message composer.</p>
-                        <div className="dm-glass-presets" role="group" aria-label="Liquid Glass presets">
-                          {[{ value: 0, label: 'Clear' }, { value: 50, label: 'Balanced' }, { value: 100, label: 'Frosted' }].map((preset) => (
-                            <button key={preset.value} type="button" aria-pressed={accessibility.glassFrost === preset.value} onClick={() => changeAccessibility('glassFrost', preset.value)}>{preset.label}</button>
-                          ))}
-                        </div>
-                        <input id="accessibility-glass" type="range" min="0" max="100" step="1" value={accessibility.glassFrost} aria-valuetext={`${accessibility.glassFrost} percent frosted`} style={{ '--glass-frost-position': `${accessibility.glassFrost}%` }} onChange={(event) => changeAccessibility('glassFrost', event.target.value)} />
-                        <div className="dm-accessibility-scale"><span>Clear, strong refraction</span><span>Soft, frosted blur</span></div>
-                        <div className="dm-glass-optics-grid">
-                          <div className="dm-glass-optics-control">
-                            <div className="dm-accessibility-label"><label htmlFor="accessibility-glass-depth">Depth</label><output htmlFor="accessibility-glass-depth">{accessibility.glassDepth}%</output></div>
-                            <p>Adjusts the lens bulge, from flat to more dimensional.</p>
-                            <input id="accessibility-glass-depth" type="range" min="0" max="100" step="1" value={accessibility.glassDepth} aria-valuetext={`${accessibility.glassDepth} percent depth`} style={{ '--glass-frost-position': `${accessibility.glassDepth}%` }} onChange={(event) => changeAccessibility('glassDepth', event.target.value)} />
-                          </div>
-                          <div className="dm-glass-optics-control">
-                            <div className="dm-accessibility-label"><label htmlFor="accessibility-glass-refraction">Refraction</label><output htmlFor="accessibility-glass-refraction">{accessibility.glassRefraction}%</output></div>
-                            <p>Sets how strongly the background bends through the glass.</p>
-                            <input id="accessibility-glass-refraction" type="range" min="0" max="100" step="1" value={accessibility.glassRefraction} aria-valuetext={`${accessibility.glassRefraction} percent refraction`} style={{ '--glass-frost-position': `${accessibility.glassRefraction}%` }} onChange={(event) => changeAccessibility('glassRefraction', event.target.value)} />
-                          </div>
-                        </div>
-                        <button className="dm-glass-reset" type="button" onClick={resetGlassOptics}>Reset depth and refraction</button>
-                        <div className="dm-glass-preview-wrap" role="group" aria-label="Live Liquid Glass preview">
-                          <img className="dm-glass-preview-image" src="/liquid-glass-preview.jpg" alt="" />
-                          <Glass className="dm-glass-live-preview" radius={18} optics={glassOptics(accessibility.glassFrost, accessibility.glassDepth, accessibility.glassRefraction)}>
-                            <span className="dm-glass-preview-mark" aria-hidden="true">G</span>
-                            <span>Live preview <small>{accessibility.glassFrost}% frost · {accessibility.glassDepth}% depth · {accessibility.glassRefraction}% refraction</small></span>
-                          </Glass>
-                        </div>
-                        <p className="dm-glass-preview-hint">Preview updates as you move the slider. Your choice saves automatically.</p>
-                    </>
-                  </div>
-                  <div className="dm-accessibility-control">
-                    <div className="dm-accessibility-label"><label htmlFor="accessibility-contrast">Contrast</label><output htmlFor="accessibility-contrast">{accessibility.contrast}%</output></div>
-                    <input id="accessibility-contrast" type="range" min="50" max="150" step="1" value={accessibility.contrast} aria-valuetext={`${accessibility.contrast} percent contrast`} onChange={(event) => changeAccessibility('contrast', event.target.value)} />
-                    <div className="dm-accessibility-scale"><span>Lower</span><span>Higher</span></div>
-                  </div>
-                  <div className="dm-accessibility-control">
-                    <div className="dm-accessibility-label"><label htmlFor="accessibility-saturation">Saturation</label><output htmlFor="accessibility-saturation">{accessibility.saturation}%</output></div>
-                    <input id="accessibility-saturation" type="range" min="0" max="200" step="1" value={accessibility.saturation} aria-valuetext={`${accessibility.saturation} percent saturation`} onChange={(event) => changeAccessibility('saturation', event.target.value)} />
-                    <div className="dm-accessibility-scale"><span>Grayscale</span><span>Vivid</span></div>
-                  </div>
-                  <div className="dm-accessibility-motion">
-                    <span><strong>Animations</strong><small>Always enabled in Glean. Your device’s Reduce Motion preference is still respected.</small></span>
-                  </div>
-                  <p className="dm-accessibility-save" role="status">{isSavingAccessibility ? 'Saving to your profile…' : accessibilitySaved ? 'Saved to your profile.' : 'Changes save automatically.'}</p>
-                  {settingsError ? <p className="dm-settings-error" role="alert">{settingsError}</p> : null}
-                </section>
-              ) : settingsTab === 'info' ? (
-                <section className="dm-info-screen" aria-labelledby="glean-info-name">
-                  <img src="/glean-mark.svg" alt="Glean logo" />
-                  <div className="dm-info-brandline">
-                    <h2 id="glean-info-name">Glean</h2>
-                    <span>Beta</span>
-                  </div>
-                  <p>Version <strong>{CURRENT_RELEASE.version}</strong></p>
-                  <div className="dm-developer-mode-setting">
-                    <span><strong>Developer Mode</strong><small>Show local performance and network diagnostics.</small></span>
-                    <button className="dm-accessibility-switch" type="button" role="switch" aria-checked={developerMode} onClick={() => setDeveloperModeEnabled(!developerMode)}>{developerMode ? 'On' : 'Off'}</button>
-                  </div>
-                </section>
-              ) : (
-                <>
-                  <section className="dm-security-form dm-e2ee-recovery" aria-labelledby="dm-encryption-title">
-                    <h2 id="dm-encryption-title">DM encryption</h2>
-                    <p className="dm-e2ee-description">{dmKeyStatus === 'checking'
-                      ? 'Checking this browser’s encryption key…'
-                      : dmKeyStatus === 'mismatch'
-                        ? 'This browser’s saved key does not match Glean’s active key, so it cannot send DMs yet.'
-                        : dmKeyStatus === 'ready'
-                          ? 'This browser has the active key for sending encrypted DMs.'
-                          : 'The browser could not verify its DM key. You can start a fresh key.'}</p>
-                    <p className="dm-e2ee-warning">Resetting creates a key for future messages. Old encrypted messages stay on Glean, but this browser can only read them if it still has their original key. The reset does not delete message history.</p>
-                    <form onSubmit={resetDmEncryption}>
-                      <label className="dm-bio-label" htmlFor="dm-key-reset-password">Current password</label>
-                      <input id="dm-key-reset-password" className="dm-username-input" type="password" value={dmKeyPassword} onChange={(event) => setDmKeyPassword(event.target.value)} autoComplete="current-password" maxLength={256} required />
-                      <label className="dm-e2ee-acknowledge">
-                        <input type="checkbox" checked={dmKeyAcknowledged} onChange={(event) => setDmKeyAcknowledged(event.target.checked)} />
-                        <span>I understand that resetting will not recover messages that need my old key.</span>
-                      </label>
-                      <GleanButton type="submit" disabled={dmKeyBusy || !dmKeyPassword || !dmKeyAcknowledged}>
-                        {dmKeyBusy ? 'Resetting key…' : 'Reset DM key and enable chat'}
-                      </GleanButton>
-                    </form>
-                    {dmKeyNote ? <p className="dm-settings-note" role="status">{dmKeyNote}</p> : null}
-                    {dmKeyError ? <p className="dm-settings-error" role="alert">{dmKeyError}</p> : null}
-                  </section>
-                  <form className="dm-security-form" onSubmit={savePassword}>
-                    <h2>Password</h2>
-                    <label className="dm-bio-label" htmlFor="current-password">Current password</label>
-                    <input id="current-password" className="dm-username-input" type="password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} autoComplete="current-password" />
-                    <label className="dm-bio-label" htmlFor="new-password">New password</label>
-                    <input id="new-password" className="dm-username-input" type="password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} autoComplete="new-password" minLength="10" />
-                    <label className="dm-bio-label" htmlFor="confirm-password">Confirm new password</label>
-                    <input id="confirm-password" className="dm-username-input" type="password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" minLength="10" />
-                    {passwordNote ? <p className="dm-settings-note">{passwordNote}</p> : null}
-                    {settingsError ? <p className="dm-settings-error" role="alert">{settingsError}</p> : null}
-                    <div className="dm-bio-actions">
-                      <small>Changing your password signs out every other device.</small>
-                      <GleanButton type="submit" disabled={isSavingPassword}>{isSavingPassword ? 'Saving…' : 'Update password'}</GleanButton>
-                    </div>
-                  </form>
-                  {account?.platformAdmin ? (
-                    <form className="dm-security-form dm-admin-password-reset" onSubmit={resetUserPasswordForAdmin}>
-                      <h2>Reset another user’s password</h2>
-                      <p>Use this only to help a user regain access. Resetting signs them out of every device.</p>
-                      <label className="dm-bio-label" htmlFor="reset-username">Username</label>
-                      <input id="reset-username" className="dm-username-input" value={resetUsername} onChange={(event) => setResetUsername(event.target.value)} placeholder="gruntjvnk" autoComplete="off" required />
-                      <label className="dm-bio-label" htmlFor="reset-password">Temporary password</label>
-                      <input id="reset-password" className="dm-username-input" type="password" value={resetPassword} onChange={(event) => setResetPassword(event.target.value)} autoComplete="new-password" minLength="10" required />
-                      {resetNote ? <p className="dm-settings-note">{resetNote}</p> : null}
-                      <GleanButton type="submit" disabled={isResettingPassword}>{isResettingPassword ? 'Resetting…' : 'Reset password'}</GleanButton>
-                    </form>
-                  ) : null}
-                  <section className="dm-notify-settings">
-                    <h2>Devices</h2>
-                    <p>Revoke a device to sign it out immediately.</p>
-                    <div className="dm-session-list">
-                      {sessions.map((session) => (
-                        <div className={`dm-session-row${session.current ? ' is-current' : ''}`} key={session.id}>
-                          <span>
-                            <strong>{session.device}</strong>
-                            <small>Session access control</small>
-                          </span>
-                          <GleanButton className="is-compact" variant="quiet" type="button" onClick={() => revokeSession(session)} disabled={Boolean(sessionsBusy)}>
-                            {sessionsBusy === session.id ? 'Revoking…' : session.current ? 'Sign out' : 'Revoke'}
-                          </GleanButton>
-                        </div>
-                      ))}
-                    </div>
-                    {sessions.some((session) => !session.current) ? (
-                      <GleanButton type="button" onClick={revokeOthers} disabled={Boolean(sessionsBusy)}>
-                        {sessionsBusy === 'others' ? 'Revoking…' : 'Revoke other devices'}
-                      </GleanButton>
-                    ) : null}
-                  </section>
-                  <section className="dm-delete-account-section" aria-labelledby="delete-account-title">
-                    <h2 id="delete-account-title">Delete account</h2>
-                    <p>Permanently delete your Glean account, your messages, your direct-message history, and every server you own.</p>
-                    <GleanButton type="button" variant="danger" onClick={openDeleteWarning}>Delete my account</GleanButton>
-                  </section>
-                </>
-              )}
+                )}
+              </div>
               <div className="dm-settings-signout-block">
                 <button type="button" className="dm-settings-info-mobile" onClick={() => { setSettingsTab('info'); setSettingsError(''); }}>Info</button>
                 <GleanButton className="dm-settings-signout" variant="danger" type="button" onClick={handleSignOut} disabled={isSigningOut}>{isSigningOut ? 'Signing out…' : 'Sign out'}</GleanButton>
@@ -1168,12 +878,11 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
       {profileBackgroundOpen ? (
         <BannerEditor
           banner={account?.profileBackground}
-          allowImage={false}
           previewAccount={account}
           previewTarget="profileBackground"
           saveBanner={updateAccountProfileBackground}
           title="Profile background"
-          lead="Choose a solid color or a two-color gradient behind your full profile card."
+          lead="Choose a color, gradient, or image behind your profile. Adjust image contrast, saturation, and blur without changing your banner."
           saveLabel="Save background"
           onClose={() => setProfileBackgroundOpen(false)}
           onSaved={(next) => onAccountUpdated(next)}

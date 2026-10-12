@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { PROFILE_BACKGROUND_URL, profileImageAdjustments } from '../../app/profileBackground';
 
 export const BANNER_HEX = /^#[0-9a-f]{6}$/i;
 const AVATAR_URL = /^\/api\/v1\/avatars\/[a-z0-9._-]+$/i;
@@ -216,6 +217,26 @@ function hexLuma(hex) {
 }
 
 export function profileThemeStyle(banner) {
+  if (banner?.kind === 'image' && typeof banner.imageUrl === 'string'
+    && (PROFILE_BACKGROUND_URL.test(banner.imageUrl) || /^blob:[^"\\\s]+$/.test(banner.imageUrl))) {
+    const adjustments = profileImageAdjustments(banner);
+    return {
+      backgroundColor: '#101a23',
+      backgroundImage: `url("${banner.imageUrl}")`,
+      backgroundSize: 'cover',
+      backgroundPosition: 'center',
+      '--dm-profile-background': `#101a23 url("${banner.imageUrl}") center / cover no-repeat`,
+      '--dm-profile-background-inset': `${-2 * adjustments.blur}px`,
+      '--dm-profile-background-scale': '1',
+      '--dm-profile-blur': `${adjustments.blur}px`,
+      '--dm-profile-contrast': `${adjustments.contrast}%`,
+      '--dm-profile-saturation': `${adjustments.saturation}%`,
+      '--dm-profile-scrim': 'rgba(0, 0, 0, .6)',
+      '--dm-profile-text': '#f7fbff',
+      '--dm-profile-muted': 'rgba(247, 251, 255, .86)',
+      '--dm-profile-line': 'rgba(247, 251, 255, .24)',
+    };
+  }
   const style = bannerStyle(banner);
   if (!style) return undefined;
   const values = banner?.kind === 'solid'

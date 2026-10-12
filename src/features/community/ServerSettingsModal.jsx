@@ -16,6 +16,7 @@ import {
   clearServerChannelMessages,
   updateServerChannelMessageCleanup,
   updateServer,
+  setServerBotInstalled,
   updateServerBanner,
   updateServerIcon,
 } from '../../app/dmApi';
@@ -28,6 +29,8 @@ import { CloseIcon, CopyIcon, EditIcon, TrashIcon } from '../dm/icons';
 import { CommunityAvatar, ServerIcon } from './CommunityAvatar';
 import { ServerInvitePreview } from './ServerInviteCard';
 import useHoldReorder from './useHoldReorder';
+import ServerModelPanel from './ServerModelPanel';
+import ServerCategorySettings from './ServerCategorySettings';
 
 const ICON_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
 const EXPIRY_OPTIONS = [
@@ -213,6 +216,7 @@ export default function ServerSettingsModal({
   canManageMembers,
   canManageInvites,
   isOwner,
+  canUseModel = false,
   accountId,
   roleName,
   roleColor,
@@ -248,6 +252,7 @@ export default function ServerSettingsModal({
   onClose,
 }) {
   const fileRef = useRef(null);
+  const [modelControlsTarget, setModelControlsTarget] = useState(null);
   const [onPage, setOnPage] = useState(startOnPage);
   const [nameDraft, setNameDraft] = useState(server.name || '');
   const [descriptionDraft, setDescriptionDraft] = useState(server.description || '');
@@ -278,6 +283,7 @@ export default function ServerSettingsModal({
   const [memberRoleBusy, setMemberRoleBusy] = useState(false);
   const [memberModerationBusy, setMemberModerationBusy] = useState('');
   const [channelBusy, setChannelBusy] = useState('');
+  const [botBusy, setBotBusy] = useState(false);
   const cropSourceRef = useRef(null);
   cropSourceRef.current = cropSource;
   const reorderableRoles = useMemo(() => (server.roles || []).filter((role) => role.permissions !== 'owner' && role.name !== 'Member'), [server.roles]);
@@ -305,6 +311,8 @@ export default function ServerSettingsModal({
       label: 'Server',
       items: [
         { id: 'overview', label: 'Overview' },
+        ...(isOwner ? [{ id: 'bots', label: 'Bots' }] : []),
+        ...(canUseModel ? [{ id: 'model', label: 'ML model' }] : []),
         ...(canManageChannels || canManageMessages ? [{ id: 'channels', label: 'Channels' }] : []),
         ...(canManageInvites ? [{ id: 'invites', label: 'Invites' }] : []),
         ...(canManageRoles ? [{ id: 'roles', label: 'Roles' }] : []),
@@ -317,10 +325,13 @@ export default function ServerSettingsModal({
       label: 'Danger',
       items: [{ id: 'danger', label: isOwner ? 'Delete server' : 'Leave server' }],
     },
-  ]), [canManageChannels, canManageMessages, canManageInvites, canManageMembers, canManageRoles, canModerate, isOwner]);
+  ]), [canManageChannels, canManageMessages, canManageInvites, canManageMembers, canManageRoles, canModerate, isOwner, canUseModel]);
+  useEffect(() => { if (tab === 'model' && !canUseModel) onTabChange('overview'); }, [tab, canUseModel, onTabChange]);
 
   const titles = {
     overview: 'Overview',
+    bots: 'Bots',
+    model: 'ML model',
     channels: 'Channels',
     invites: 'Invites',
     roles: 'Roles',
@@ -518,6 +529,22 @@ export default function ServerSettingsModal({
       setOverviewError(error.message);
     } finally {
       setSavingVisibility(false);
+    }
+  };
+
+  const toggleNuraInstall = async () => {
+    if (!isOwner || botBusy) return;
+    setBotBusy(true);
+    try {
+      const installed = (server.bots || []).some((bot) => bot.id === 'nura');
+      const { bots } = await setServerBotInstalled(server.id, 'nura', !installed);
+      const next = { ...server, bots: bots || [] };
+      onServerUpdated?.(next);
+      onNotice?.(installed ? 'Nura was removed from this server.' : 'Nura was added to this server.');
+    } catch (error) {
+      onNotice?.(error.message || 'Could not update this server’s bots.');
+    } finally {
+      setBotBusy(false);
     }
   };
 
@@ -726,7 +753,7 @@ export default function ServerSettingsModal({
   };
 
   return (
-    <div className="community-overlay" onMouseDown={(event) => { if (event.target === event.currentTarget && !cropSource && !bannerOpen) onClose(); }}>
+    <div className="community-overlay is-settings-workspace" onMouseDown={(event) => { if (event.target === event.currentTarget && !cropSource && !bannerOpen) onClose(); }}>
       <section className={`community-settings${onPage ? ' is-page' : ''}`} role="dialog" aria-modal="true" aria-labelledby="server-settings-title">
         <aside className="community-settings-nav">
           <div className="community-settings-brand">
@@ -753,10 +780,11 @@ export default function ServerSettingsModal({
             </div>
           ))}
         </aside>
-        <div className="community-settings-content">
+        <div className={`community-settings-content${tab === 'model' ? ' is-model' : ''}`}>
           <header className="community-settings-toolbar">
             <button type="button" className="community-settings-back" onClick={() => setOnPage(false)} aria-label="Back to settings">‹</button>
             <h2 id="server-settings-title">{titles[tab] || 'Settings'}</h2>
+            {tab === 'model' && canUseModel ? <div className="server-model-header-controls" ref={setModelControlsTarget} /> : null}
             <button type="button" className="community-settings-close" onClick={onClose} aria-label="Close settings"><CloseIcon /></button>
           </header>
 
@@ -910,8 +938,30 @@ export default function ServerSettingsModal({
             </form>
           ) : null}
 
+          {tab === 'model' && canUseModel ? <ServerModelPanel server={server} onServerUpdated={onServerUpdated} controlsTarget={modelControlsTarget} /> : null}
+          {tab === 'bots' && isOwner ? (
+            <div className="community-settings-section community-bots-settings">
+              <p>Add helpful bots to your server. Only the server owner can install or remove bots.</p>
+              <article className="community-bot-card">
+                <div className="community-bot-identity">
+                  <img src="/nura-avatar.png" alt="" />
+                  <div><h3>Nura</h3><p>Glean’s AI companion</p></div>
+                  <span className={`community-bot-status${(server.bots || []).some((bot) => bot.id === 'nura') ? ' is-installed' : ''}`}>
+                    {(server.bots || []).some((bot) => bot.id === 'nura') ? 'In server' : 'Available'}
+                  </span>
+                </div>
+                <p className="community-bot-description">Nura can chat when someone uses <code>/chat</code>, or respond automatically in channels activated with <code>/activate</code>. Use <code>/deactivate</code> to stop automatic replies in that channel.</p>
+                <p className="community-bot-privacy">Messages sent with <code>/chat</code> and messages in active channels are sent to Groq for Nura’s response. Nura’s server chats are separate from private DMs.</p>
+                <button type="button" className={(server.bots || []).some((bot) => bot.id === 'nura') ? 'community-overview-remove' : 'community-dialog-primary'} onClick={toggleNuraInstall} disabled={botBusy}>
+                  {botBusy ? 'Updating…' : (server.bots || []).some((bot) => bot.id === 'nura') ? 'Remove Nura' : 'Add Nura'}
+                </button>
+              </article>
+            </div>
+          ) : null}
+
           {tab === 'channels' && (canManageChannels || canManageMessages) ? (
             <div className="community-settings-section">
+              {canManageChannels ? <ServerCategorySettings server={server} onServerUpdated={onServerUpdated} /> : null}
               <p>Manage channel settings and message cleanup. Clearing a channel permanently deletes its messages and attachments.</p>
               <div className="community-settings-channel-list">
                 {(server.channels || []).map((item) => (

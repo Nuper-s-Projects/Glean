@@ -6,6 +6,7 @@ const DB_NAME = 'glean-e2ee';
 const DB_VERSION = 2;
 const STORE = 'identities';
 const VAULT = 'vault';
+const PROFILE_BACKUP_ITERATIONS = 600_000;
 const identityCache = new Map();
 let storedIdentityRequest = null;
 const encoder = new TextEncoder();
@@ -58,6 +59,55 @@ async function fingerprintPublicKey(publicKey) {
   const canonical = JSON.stringify({ crv: publicKey.crv, kty: publicKey.kty, x: publicKey.x, y: publicKey.y });
   const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(canonical)));
   return Array.from(digest.slice(0, 16), (value) => value.toString(16).padStart(2, '0')).join('');
+}
+
+async function deriveProfileBackupKey(password, salt) {
+  if (typeof password !== 'string' || !password.length || password.length > 256) throw new Error('Sign in with your Glean password to restore your DM key.');
+  const material = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: PROFILE_BACKUP_ITERATIONS, hash: 'SHA-256' }, material, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+
+function profileBackupAad(accountId) { return encoder.encode(`glean-account-key-backup-v1:${Number(accountId)}`); }
+
+async function encryptProfileKeyBackup(accountId, password, payload) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveProfileBackupKey(password, salt);
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: profileBackupAad(accountId) }, key, encoder.encode(JSON.stringify(payload)));
+  return { version: 1, kdf: 'PBKDF2-SHA256', iterations: PROFILE_BACKUP_ITERATIONS, salt: bytesToBase64Url(salt), iv: bytesToBase64Url(iv), ciphertext: bytesToBase64Url(ciphertext) };
+}
+
+async function decryptProfileKeyBackup(accountId, password, backup) {
+  if (!backup || backup.version !== 1 || backup.kdf !== 'PBKDF2-SHA256' || backup.iterations !== PROFILE_BACKUP_ITERATIONS) throw new Error('Unsupported Glean DM key backup. Update Glean and sign in again.');
+  const key = await deriveProfileBackupKey(password, base64UrlToBytes(backup.salt));
+  const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: base64UrlToBytes(backup.iv), additionalData: profileBackupAad(accountId) }, key, base64UrlToBytes(backup.ciphertext));
+  const payload = JSON.parse(decoder.decode(plaintext));
+  if (!Array.isArray(payload.identities) || payload.identities.length > 64 || typeof payload.activeFingerprint !== 'string') throw new Error('The saved Glean DM key backup is invalid.');
+  return payload;
+}
+
+async function accountIdentityRecords(accountId, username, extra = []) {
+  const all = await listStoredIdentities();
+  const records = new Map();
+  for (const item of [...all.filter(item => Number(item.accountId) === Number(accountId)), ...extra]) {
+    if (!item?.publicKey || !item?.fingerprint) continue;
+    const privateJwk = item.privateJwk || await crypto.subtle.exportKey('jwk', item.privateKey);
+    if (!samePublicKey(item.publicKey, privateJwk) || item.fingerprint !== await fingerprintPublicKey(item.publicKey)) continue;
+    records.set(item.fingerprint, { fingerprint: item.fingerprint, publicKey: item.publicKey, privateJwk });
+  }
+  if (records.size > 64) throw new Error('Your DM key archive has reached its limit.');
+  return [...records.values()];
+}
+
+async function saveProfileKeyBackup(accountId, password, identity, revision, extra = []) {
+  const identities = await accountIdentityRecords(accountId, identity.username, [...extra, identity]);
+  if (!identities.some(item => item.fingerprint === identity.fingerprint)) throw new Error('Could not include the active DM key in its backup.');
+  const backup = await encryptProfileKeyBackup(accountId, password, { version: 1, activeFingerprint: identity.fingerprint, identities });
+  const result = await apiRequest('/e2ee/profile-key', {
+    method: 'PUT',
+    body: JSON.stringify({ revision, publicKey: identity.publicKey, fingerprint: identity.fingerprint, backup }),
+  });
+  return result.revision;
 }
 
 async function hydrateIdentity(record) {
@@ -223,6 +273,105 @@ const syncCheckedAt = new Map();
 export function createKeySyncCode() { return randomToken(32); }
 export async function savedKeySyncCode(accountId) { return await syncCode(accountId) || ''; }
 
+export async function restoreAccountE2EEIdentity(accountId, username, password) {
+  const id = Number(accountId);
+  if (!Number.isSafeInteger(id) || id <= 0) throw new Error('Sign in again before restoring your DM key.');
+  const remote = await apiRequest('/e2ee/profile-key');
+  const stored = (await listStoredIdentities()).filter(record => Number(record.accountId) === id);
+  const activePublicKey = remote.publicKey;
+  const localMatch = activePublicKey && stored.find(record => samePublicKey(record.publicKey, activePublicKey));
+  const mismatchIdentity = () => {
+    const local = stored[0];
+    const mismatch = local
+      ? { ...local, accountId: id, username: username || local.username || null, serverKeyMismatch: true }
+      : { accountId: id, username: username || null, publicKey: activePublicKey, fingerprint: remote.fingerprint || '', serverKeyMismatch: true };
+    identityCache.set(id, mismatch);
+    syncCheckedAt.set(id, Date.now());
+    return mismatch;
+  };
+
+  if (remote.backup) {
+    try {
+      const payload = await decryptProfileKeyBackup(id, password, remote.backup);
+      const restored = [];
+      for (const record of payload.identities) {
+        if (!record?.publicKey || record.fingerprint !== await fingerprintPublicKey(record.publicKey)) throw new Error('The saved Glean DM key backup is invalid.');
+        const identity = await hydrateIdentity({ ...record, accountId: id, username, createdAt: new Date().toISOString() });
+        if (!identity) throw new Error('The saved Glean DM key backup is invalid.');
+        restored.push(identity);
+      }
+      const active = restored.find(record => record.fingerprint === payload.activeFingerprint);
+      if (!active || (activePublicKey && !samePublicKey(active.publicKey, activePublicKey))) throw new Error('The saved DM key does not match your account’s active key. Your existing messages were left untouched.');
+      for (const identity of restored) await writeIdentity(identity);
+      const merged = await accountIdentityRecords(id, username, stored);
+      let selected = { ...active, accountId: id, username: username || active.username || null, serverKeyMismatch: false };
+      if (merged.length !== restored.length) await saveProfileKeyBackup(id, password, selected, remote.revision, stored);
+      identityCache.set(id, selected);
+      syncCheckedAt.set(id, Date.now());
+      return selected;
+    } catch (error) {
+      if (localMatch) {
+        const selected = { ...localMatch, accountId: id, username: username || localMatch.username || null, serverKeyMismatch: false };
+        try { await saveProfileKeyBackup(id, password, selected, remote.revision, stored); }
+        catch (backupError) { console.warn('Could not refresh the account DM key backup.', backupError.name); }
+        identityCache.set(id, selected);
+        syncCheckedAt.set(id, Date.now());
+        return selected;
+      }
+      console.warn('Could not unlock the account DM key backup.', error.name);
+      return mismatchIdentity();
+    }
+  }
+
+  let identity = localMatch;
+  if (!identity && activePublicKey) {
+    const code = await syncCode(id);
+    const legacy = await apiRequest('/e2ee/sync');
+    if (code && legacy.envelope) {
+      try { identity = await syncEncryptionKeys(id, username, code); } catch { return mismatchIdentity(); }
+    } else return mismatchIdentity();
+  }
+  if (!identity) identity = stored[0] || await ensureLocalIdentity(id, username);
+  if (identity.serverKeyMismatch) return mismatchIdentity();
+  try {
+    await saveProfileKeyBackup(id, password, identity, remote.revision, stored);
+  } catch (error) {
+    if (error.status === 409) {
+      const latest = await apiRequest('/e2ee/profile-key');
+      const matching = (await listStoredIdentities()).find(record => Number(record.accountId) === id && samePublicKey(record.publicKey, latest.publicKey));
+      if (matching) return restoreAccountE2EEIdentity(id, username, password);
+      return mismatchIdentity();
+    }
+    throw error;
+  }
+  identityCache.set(id, identity);
+  syncCheckedAt.set(id, Date.now());
+  return identity;
+}
+
+export async function prepareProfileKeyBackupForPasswordChange(accountId, username, currentPassword, newPassword) {
+  const id = Number(accountId);
+  const remote = await apiRequest('/e2ee/profile-key');
+  let payload = null;
+  if (remote.backup) {
+    try { payload = await decryptProfileKeyBackup(id, currentPassword, remote.backup); }
+    catch { /* A local matching key can rebuild a backup after an administrative password reset. */ }
+  }
+  const stored = (await listStoredIdentities()).filter(record => Number(record.accountId) === id);
+  const identities = new Map((payload?.identities || []).map(record => [record.fingerprint, record]));
+  const localRecords = await accountIdentityRecords(id, username, stored);
+  for (const record of localRecords) identities.set(record.fingerprint, record);
+  const active = payload?.activeFingerprint
+    ? identities.get(payload.activeFingerprint)
+    : stored.find(record => remote.publicKey && samePublicKey(record.publicKey, remote.publicKey));
+  if (!active || (remote.publicKey && !samePublicKey(active.publicKey, remote.publicKey))) {
+    if (remote.publicKey) throw new Error('This browser does not have the active DM key. Sign in from a device that can still read your DMs before changing your password.');
+    return null;
+  }
+  const key = await encryptProfileKeyBackup(id, newPassword, { version: 1, activeFingerprint: active.fingerprint, identities: [...identities.values()] });
+  return { revision: remote.revision, publicKey: active.publicKey, fingerprint: active.fingerprint, backup: key };
+}
+
 async function saveSyncCode(accountId, code) {
   const db = await openDatabase();
   try {
@@ -275,16 +424,28 @@ export function resetE2EEIdentity(accountId, username, password) {
       encoder.encode(payload),
     );
     const vault = await apiRequest('/e2ee/sync');
+    let accountKeyBackup = null;
+    if (String(username || '').toLowerCase() === 'nuper') {
+      const profileVault = await apiRequest('/e2ee/profile-key');
+      const backup = await encryptProfileKeyBackup(id, password, {
+        version: 1,
+        activeFingerprint: identity.fingerprint,
+        identities: [{ privateJwk, publicKey, fingerprint: identity.fingerprint }],
+      });
+      accountKeyBackup = { revision: profileVault.revision, publicKey, fingerprint: identity.fingerprint, backup };
+    }
     // Stage the private key locally before committing the server-side rotation.
     await writeVaultIdentity(identity);
     await apiRequest('/e2ee/reset', {
       method: 'POST',
       body: JSON.stringify({
         password,
+        ...(String(username || '').toLowerCase() === 'nuper' ? { deleteDirectMessages: true } : {}),
         revision: vault.revision,
         publicKey,
         fingerprint: identity.fingerprint,
         envelope: { version: 1, iv: bytesToBase64Url(iv), ciphertext: bytesToBase64Url(ciphertext) },
+        ...(accountKeyBackup ? { accountKeyBackup } : {}),
       }),
     });
 
@@ -368,39 +529,50 @@ export async function syncEncryptionKeys(accountId, username, suppliedCode) {
 export async function ensureE2EEIdentity(accountId, username) {
   const id = Number(accountId);
   if (resetRequests.has(id)) return resetRequests.get(id).then((result) => result.identity);
-  if (Date.now() - (syncCheckedAt.get(id) || 0) < 30_000) return ensureLocalIdentity(id, username);
+  if (Date.now() - (syncCheckedAt.get(id) || 0) < 30_000 && identityCache.has(id)) return identityCache.get(id);
   if (syncRequests.has(id)) return syncRequests.get(id);
-  // Startup restores local keys only. It must never rewrite the shared vault.
   const pending = (async () => {
-    const local = await ensureLocalIdentity(id, username);
-    const remote = await apiRequest('/e2ee/sync');
-    if (!remote.envelope) return local;
+    const profileRequest = String(username || '').toLowerCase() === 'nuper' ? apiRequest('/e2ee/profile-key') : Promise.resolve({});
+    const [remote, legacy] = await Promise.all([profileRequest, apiRequest('/e2ee/sync')]);
+    const activePublicKey = remote.publicKey || legacy.publicKey;
+    const stored = (await listStoredIdentities()).filter(record => Number(record.accountId) === id);
     const code = await syncCode(id);
-    if (code) {
+    if (legacy.envelope && code) {
       try {
         const key = await crypto.subtle.importKey('raw', base64UrlToBytes(code), 'AES-GCM', false, ['decrypt']);
-        const clear = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: base64UrlToBytes(remote.envelope.iv), additionalData: encoder.encode(`glean-key-sync-v1:${id}`) }, key, base64UrlToBytes(remote.envelope.ciphertext));
+        const clear = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: base64UrlToBytes(legacy.envelope.iv), additionalData: encoder.encode(`glean-key-sync-v1:${id}`) }, key, base64UrlToBytes(legacy.envelope.ciphertext));
         const payload = JSON.parse(decoder.decode(clear));
         if (!Array.isArray(payload.identities) || payload.identities.length > 64) throw new Error('Invalid saved encryption vault.');
-        const restored = [];
+        let active;
+        const prior = stored.find(record => !samePublicKey(record.publicKey, activePublicKey));
+        if (prior) await writeIdentity(prior);
         for (const record of payload.identities) {
           if (record.fingerprint !== await fingerprintPublicKey(record.publicKey)) throw new Error('Invalid saved key fingerprint.');
-          const hydrated = await hydrateIdentity({ ...record, accountId: id, username, createdAt: new Date().toISOString() });
-          if (!hydrated) throw new Error('Invalid saved private key.');
-          restored.push(hydrated);
+          const restored = await hydrateIdentity({ ...record, accountId: id, username, createdAt: new Date().toISOString() });
+          if (!restored) throw new Error('Invalid saved private key.');
+          await writeIdentity(restored);
+          if (record.fingerprint === payload.activeFingerprint) active = restored;
         }
-        // Archive the existing identity before any active identity is replaced.
-        await writeIdentity(local);
-        for (const record of restored) await writeIdentity(record);
+        if (!active || (activePublicKey && !samePublicKey(active.publicKey, activePublicKey))) throw new Error('Saved active key does not match the account.');
+        identityCache.set(id, active);
+        return active;
       } catch (error) {
         console.warn('Glean could not restore the saved encrypted key vault; existing local keys are preserved.', error.name);
       }
     }
-    const stored = await listStoredIdentities();
-    const matching = stored.find(record => Number(record.accountId) === id && samePublicKey(record.publicKey, remote.publicKey));
+    const matching = activePublicKey && stored.find(record => samePublicKey(record.publicKey, activePublicKey));
+    if (activePublicKey && !matching) {
+      const local = stored[0];
+      const mismatch = local
+        ? { ...local, accountId: id, username: username || local.username || null, serverKeyMismatch: true }
+        : { accountId: id, username: username || null, publicKey: activePublicKey, fingerprint: remote.fingerprint || await fingerprintPublicKey(activePublicKey), serverKeyMismatch: true };
+      identityCache.set(id, mismatch);
+      return mismatch;
+    }
     const selected = matching
       ? { ...matching, accountId: id, username: username || matching.username || null, serverKeyMismatch: false }
-      : { ...local, serverKeyMismatch: true };
+      : stored[0] || await ensureLocalIdentity(id, username);
+    if (!activePublicKey) await apiRequest('/e2ee/key', { method: 'PUT', body: JSON.stringify({ publicKey: selected.publicKey, fingerprint: selected.fingerprint }) });
     identityCache.set(id, selected);
     return selected;
   })().then(identity => { syncCheckedAt.set(id, Date.now()); return identity; });
@@ -523,6 +695,7 @@ export async function decryptMessage(identity, message, conversationId) {
     message = { ...message, replyTo: { ...message.replyTo, body: reply.body } };
   }
   if (!message?.encrypted || !message.crypto) return message;
+  if (!identity?.privateKey) return { ...message, body: 'Sign in again with your Glean password to restore this account’s DM key.', decryptionFailed: true };
   const stored = await listStoredIdentities();
   const matching = stored.filter((record) => peerPublicKeyForIdentity(record, message.crypto));
   const seen = new Set();

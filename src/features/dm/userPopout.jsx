@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { acceptFriendRequest, blockUser, cancelFriendRequest, declineFriendRequest, getUserProfile, openDirectConversation, sendFriendRequest, unblockUser, unfriendUser } from '../../app/dmApi';
+import { acceptFriendRequest, blockUser, cancelFriendRequest, declineFriendRequest, getUserProfile, openDirectConversation, unblockUser, unfriendUser } from '../../app/dmApi';
 import { presenceLabel, usePresence, usePresenceHidden } from '../../app/presence';
 import { profileThemeStyle, useContactBannerStyle } from './banner';
 import { formatJoinedDate } from './formatters';
@@ -208,19 +208,10 @@ export function UserPopoutProvider({ account, children, inlineUser = null, onMes
     }
   };
 
-  const addUser = async () => {
+  const addUser = () => {
     if (!user?.username || busy) return;
-    setBusy('add');
-    setNotice('');
-    try {
-      await sendFriendRequest(user.username);
-      const { user: profile } = await getUserProfile(user.username);
-      patchUser(user.username, profile);
-    } catch (error) {
-      setNotice(error.message);
-    } finally {
-      setBusy('');
-    }
+    window.dispatchEvent(new CustomEvent('glean-open-friend-request', { detail: { username: user.username } }));
+    close();
   };
 
   const acceptUser = async () => {
@@ -328,99 +319,101 @@ export function UserPopoutProvider({ account, children, inlineUser = null, onMes
           style={{ ...(inlineUser ? {} : { top: coords.top, left: coords.left }), ...(profileBackgroundStyle || {}) }}
           aria-label={`${user.username || 'User'}'s profile`}
         >
-          {inMagnet ? (
-            <div className="dm-profile-ribbon is-magnet" aria-hidden="true">
-              <span>MAGNET</span>
-            </div>
-          ) : null}
-          {inLaredoCollege ? (
-            <div className="dm-profile-ribbon is-lc" aria-hidden="true">
-              <span>LC</span>
-            </div>
-          ) : null}
-          <div className="dm-contact-banner" style={banner} />
-          <div className={`dm-contact-avatar-wrap${livePresence === 'offline' ? ' is-offline' : ''}`}>
-            <span className={`dm-avatar dm-avatar-large is-${livePresence || 'offline'}`} aria-hidden="true">
-              {user.avatarUrl ? <img src={user.avatarUrl} alt="" /> : <UserIcon size={46} />}
-            </span>
-          </div>
-          <div className="dm-contact-identity">
-            <h2><DisplayName user={user} className="dm-profile-display-name" /></h2>
-            <p className={`dm-contact-status is-${hidden ? 'offline' : livePresence}`}>{statusText}</p>
-            {handle || user.discordUsername ? (
-              <div className="dm-contact-handles">
-                {handle ? (
-                  <button className="dm-contact-handle" type="button" onClick={copyUsername} title="Copy username">
-                    {copied === 'glean' ? 'Copied' : handle}
-                    <CopyIcon />
-                  </button>
-                ) : null}
-                {user.discordUsername ? (
-                  <button className="dm-contact-handle is-discord" type="button" onClick={copyDiscord} title="Copy Discord username">
-                    <DiscordIcon />
-                    {copied === 'discord' ? 'Copied' : user.discordUsername}
-                    <CopyIcon />
-                  </button>
-                ) : null}
-                {instagramUrl ? <a className="dm-contact-handle is-instagram" href={instagramUrl} target="_blank" rel="noreferrer"><InstagramIcon />{user.socialLinks?.instagramUsername ? `@${user.socialLinks.instagramUsername}` : 'Instagram'}</a> : null}
-                {tiktokUrl ? <a className="dm-contact-handle is-tiktok" href={tiktokUrl} target="_blank" rel="noreferrer"><TikTokIcon />{user.socialLinks?.tiktokUsername ? `@${user.socialLinks.tiktokUsername}` : 'TikTok'}</a> : null}
+          <div className="dm-profile-scroll" tabIndex={inlineUser ? undefined : 0} role="region" aria-label="Profile details">
+            {inMagnet ? (
+              <div className="dm-profile-ribbon is-magnet" aria-hidden="true">
+                <span>MAGNET</span>
               </div>
             ) : null}
-            <div className="dm-contact-chips">
-              {(user.badges || []).map((badge) => (
-                <span className={`dm-profile-badge is-${badge.id}`} key={badge.id}>{badge.label}</span>
-              ))}
-              <CustomBadges badges={user.customBadges} />
-              {user.schoolLabel ? (
-                <span className="dm-contact-chip is-school" key="school" style={schoolBadgeStyle(user.schoolHex) || undefined}>{user.schoolLabel}</span>
+            {inLaredoCollege ? (
+              <div className="dm-profile-ribbon is-lc" aria-hidden="true">
+                <span>LC</span>
+              </div>
+            ) : null}
+            <div className="dm-contact-banner" style={banner} />
+            <div className={`dm-contact-avatar-wrap${livePresence === 'offline' ? ' is-offline' : ''}`}>
+              <span className={`dm-avatar dm-avatar-large is-${livePresence || 'offline'}`} aria-hidden="true">
+                {user.avatarUrl ? <img src={user.avatarUrl} alt="" /> : <UserIcon size={46} />}
+              </span>
+            </div>
+            <div className="dm-contact-identity">
+              <h2><DisplayName user={user} className="dm-profile-display-name" /></h2>
+              <p className={`dm-contact-status is-${hidden ? 'offline' : livePresence}`}>{statusText}</p>
+              {handle || user.discordUsername ? (
+                <div className="dm-contact-handles">
+                  {handle ? (
+                    <button className="dm-contact-handle" type="button" onClick={copyUsername} title="Copy username">
+                      {copied === 'glean' ? 'Copied' : handle}
+                      <CopyIcon />
+                    </button>
+                  ) : null}
+                  {user.discordUsername ? (
+                    <button className="dm-contact-handle is-discord" type="button" onClick={copyDiscord} title="Copy Discord username">
+                      <DiscordIcon />
+                      {copied === 'discord' ? 'Copied' : user.discordUsername}
+                      <CopyIcon />
+                    </button>
+                  ) : null}
+                  {instagramUrl ? <a className="dm-contact-handle is-instagram" href={instagramUrl} target="_blank" rel="noreferrer"><InstagramIcon />{user.socialLinks?.instagramUsername ? `@${user.socialLinks.instagramUsername}` : 'Instagram'}</a> : null}
+                  {tiktokUrl ? <a className="dm-contact-handle is-tiktok" href={tiktokUrl} target="_blank" rel="noreferrer"><TikTokIcon />{user.socialLinks?.tiktokUsername ? `@${user.socialLinks.tiktokUsername}` : 'TikTok'}</a> : null}
+                </div>
               ) : null}
-              {visiblePrograms.map((program) => (
-                <span className="dm-contact-chip is-program" key={program.id} style={schoolBadgeStyle(program.hex) || undefined}>{program.id === 'laredo-college' ? 'Early College' : program.label}</span>
-              ))}
+              <div className="dm-contact-chips">
+                {(user.badges || []).map((badge) => (
+                  <span className={`dm-profile-badge is-${badge.id}`} key={badge.id}>{badge.label}</span>
+                ))}
+                <CustomBadges badges={user.customBadges} />
+                {user.schoolLabel ? (
+                  <span className="dm-contact-chip is-school" key="school" style={schoolBadgeStyle(user.schoolHex) || undefined}>{user.schoolLabel}</span>
+                ) : null}
+                {visiblePrograms.map((program) => (
+                  <span className="dm-contact-chip is-program" key={program.id} style={schoolBadgeStyle(program.hex) || undefined}>{program.id === 'laredo-college' ? 'Early College' : program.label}</span>
+                ))}
+              </div>
             </div>
-          </div>
-          <div className="dm-contact-body">
-            {profileFooter}
-            <div className="dm-contact-section">
-              <h3>About me</h3>
-              <p className="dm-contact-bio">{user.bio || 'No bio yet.'}</p>
-            </div>
-            {joined ? (
+            <div className="dm-contact-body">
+              {profileFooter}
               <div className="dm-contact-section">
-                <h3>Member since</h3>
-                <p>{joined}</p>
+                <h3>About me</h3>
+                <p className="dm-contact-bio">{user.bio || 'No bio yet.'}</p>
               </div>
-            ) : null}
-            {notice ? <p className="dm-contact-error">{notice}</p> : null}
-            {relation === 'self' ? null : (
-              <div className="dm-contact-actions">
-                {relation === 'blocked' ? (
-                  <button className="dm-small-action" type="button" disabled={Boolean(busy)} onClick={unblock}>{busy === 'unblock' ? 'Unblocking…' : 'Unblock'}</button>
-                ) : relation === 'friend' ? (
-                  <>
-                    <button className="dm-small-action" type="button" disabled={Boolean(busy)} onClick={messageUser}>{busy === 'message' ? 'Opening…' : 'Message'}</button>
-                    <button className="dm-small-action is-quiet" type="button" disabled={Boolean(busy)} onClick={unfriend}>{busy === 'unfriend' ? 'Removing…' : 'Unfriend'}</button>
-                    <button className="dm-small-action is-danger" type="button" disabled={Boolean(busy)} onClick={block}>{busy === 'block' ? 'Blocking…' : 'Block'}</button>
-                  </>
-                ) : relation === 'incoming' ? (
-                  <>
-                    <button className="dm-small-action" type="button" disabled={Boolean(busy)} onClick={acceptUser}>{busy === 'accept' ? 'Accepting…' : 'Accept'}</button>
-                    <button className="dm-small-action is-quiet" type="button" disabled={Boolean(busy)} onClick={declineUser}>{busy === 'decline' ? 'Declining…' : 'Decline'}</button>
-                    <button className="dm-small-action is-danger" type="button" disabled={Boolean(busy)} onClick={block}>{busy === 'block' ? 'Blocking…' : 'Block'}</button>
-                  </>
-                ) : relation === 'outgoing' ? (
-                  <>
-                    <button className="dm-small-action is-quiet" type="button" disabled={Boolean(busy)} onClick={cancelUser}>{busy === 'cancel' ? 'Canceling…' : 'Cancel request'}</button>
-                    <button className="dm-small-action is-danger" type="button" disabled={Boolean(busy)} onClick={block}>{busy === 'block' ? 'Blocking…' : 'Block'}</button>
-                  </>
-                ) : (
-                  <>
-                    <button className="dm-small-action" type="button" disabled={Boolean(busy)} onClick={addUser}>{busy === 'add' ? 'Sending…' : 'Add friend'}</button>
-                    <button className="dm-small-action is-danger" type="button" disabled={Boolean(busy)} onClick={block}>{busy === 'block' ? 'Blocking…' : 'Block'}</button>
-                  </>
-                )}
-              </div>
-            )}
+              {joined ? (
+                <div className="dm-contact-section">
+                  <h3>Member since</h3>
+                  <p>{joined}</p>
+                </div>
+              ) : null}
+              {notice ? <p className="dm-contact-error">{notice}</p> : null}
+              {relation === 'self' ? null : (
+                <div className="dm-contact-actions">
+                  {relation === 'blocked' ? (
+                    <button className="dm-small-action" type="button" disabled={Boolean(busy)} onClick={unblock}>{busy === 'unblock' ? 'Unblocking…' : 'Unblock'}</button>
+                  ) : relation === 'friend' ? (
+                    <>
+                      <button className="dm-small-action" type="button" disabled={Boolean(busy)} onClick={messageUser}>{busy === 'message' ? 'Opening…' : 'Message'}</button>
+                      <button className="dm-small-action is-quiet" type="button" disabled={Boolean(busy)} onClick={unfriend}>{busy === 'unfriend' ? 'Removing…' : 'Unfriend'}</button>
+                      <button className="dm-small-action is-danger" type="button" disabled={Boolean(busy)} onClick={block}>{busy === 'block' ? 'Blocking…' : 'Block'}</button>
+                    </>
+                  ) : relation === 'incoming' ? (
+                    <>
+                      <button className="dm-small-action" type="button" disabled={Boolean(busy)} onClick={acceptUser}>{busy === 'accept' ? 'Accepting…' : 'Accept'}</button>
+                      <button className="dm-small-action is-quiet" type="button" disabled={Boolean(busy)} onClick={declineUser}>{busy === 'decline' ? 'Declining…' : 'Decline'}</button>
+                      <button className="dm-small-action is-danger" type="button" disabled={Boolean(busy)} onClick={block}>{busy === 'block' ? 'Blocking…' : 'Block'}</button>
+                    </>
+                  ) : relation === 'outgoing' ? (
+                    <>
+                      <button className="dm-small-action is-quiet" type="button" disabled={Boolean(busy)} onClick={cancelUser}>{busy === 'cancel' ? 'Canceling…' : 'Cancel request'}</button>
+                      <button className="dm-small-action is-danger" type="button" disabled={Boolean(busy)} onClick={block}>{busy === 'block' ? 'Blocking…' : 'Block'}</button>
+                    </>
+                  ) : (
+                    <>
+                      <button className="dm-small-action" type="button" disabled={Boolean(busy)} onClick={addUser}>{busy === 'add' ? 'Sending…' : 'Add friend'}</button>
+                      <button className="dm-small-action is-danger" type="button" disabled={Boolean(busy)} onClick={block}>{busy === 'block' ? 'Blocking…' : 'Block'}</button>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
         </section>
       ) : null}

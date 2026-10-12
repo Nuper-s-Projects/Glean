@@ -1,0 +1,91 @@
+/* These tokens exist only while a main-Glean route has an active theme. Loop never inherits them. */
+html.glean-themed-main:root {
+  /* Neutral translucent fills reveal the actual theme, including uploaded photos. */
+  --accent-soft: var(--text);
+  --input-border: var(--card-border);
+  --glean-theme-inset: color-mix(in srgb, var(--text) 6%, transparent);
+  --glean-theme-hover: color-mix(in srgb, var(--text) 10%, transparent);
+  --glean-theme-selected: color-mix(in srgb, var(--text) 14%, transparent);
+  --glean-theme-emphasis: color-mix(in srgb, var(--text) 55%, transparent);
+  --page-background: #f2f6fb;
+  --card-background: rgba(255, 255, 255, .74);
+  --input-background: rgba(255, 255, 255, .86);
+  --card-border: rgba(255, 255, 255, .5);
+  --glean-theme-overlay: rgba(255, 255, 255, .2);
+  --glean-theme-surface: rgba(255, 255, 255, .72);
+  --glean-theme-rail: rgba(255, 255, 255, .6);
+}
+html.glean-themed-main[data-theme='dark'] {
+  --page-background: #151515;
+  --card-background: rgba(20, 20, 20, .72);
+  --input-background: rgba(12, 12, 12, .66);
+  --card-border: rgba(255, 255, 255, .18);
+  --glean-theme-overlay: rgba(0, 0, 0, .24);
+  --glean-theme-surface: rgba(14, 14, 14, .62);
+  --glean-theme-rail: rgba(12, 12, 12, .7);
+}
+@media (prefers-color-scheme: dark) {
+  html.glean-themed-main:not([data-theme='light']) {
+    --page-background: #151515;
+    --card-background: rgba(20, 20, 20, .72);
+    --input-background: rgba(12, 12, 12, .66);
+    --card-border: rgba(255, 255, 255, .18);
+    --glean-theme-overlay: rgba(0, 0, 0, .24);
+    --glean-theme-surface: rgba(14, 14, 14, .62);
+    --glean-theme-rail: rgba(12, 12, 12, .7);
+  }
+}
+.glean-theme-backdrop { position: fixed; inset: 0; z-index: -1; overflow: hidden; pointer-events: none; background: var(--page-background); }
+.glean-theme-backdrop::before { position: absolute; inset: calc(-1 * var(--glean-theme-bleed, 0px)); content: ''; background-image: var(--glean-theme-background); background-size: cover; background-position: center; filter: var(--glean-theme-filter, none); }
+.glean-theme-backdrop::after { position: absolute; inset: 0; content: ''; background: var(--glean-theme-overlay); }
+html.glean-themed-main body { background: transparent; isolation: isolate; }
+html.glean-themed-main :is(.dm-app, .community-app) { background: transparent; --dm-panel: var(--glean-theme-surface); --dm-panel-muted: var(--glean-theme-rail); --dm-border: var(--card-border); }
+html.glean-themed-main :is(.dm-main-panel, .community-chat) { background: var(--glean-theme-surface); }
+html.glean-themed-main :is(.dm-settings-backdrop, .community-overlay.is-settings-workspace) { background: transparent; -webkit-backdrop-filter: none; backdrop-filter: none; }
+/* Transparent settings reveal the theme, never the chat UI underneath. */
+html.glean-themed-main :is(.dm-app, .community-app):has(.dm-settings-backdrop, .community-overlay.is-settings-workspace) { visibility: hidden; }
+html.glean-themed-main :is(.dm-settings-backdrop, .community-overlay.is-settings-workspace) { visibility: visible; }
+html.glean-themed-main :is(.dm-crop-backdrop, .dm-delete-account-backdrop, .dm-release-backdrop, .community-overlay) { visibility: visible; }
+html.glean-themed-main:root .dm-settings-redesigned {
+  --settings-bg: var(--glean-theme-surface);
+  --settings-rail: var(--glean-theme-rail);
+  --settings-border: var(--card-border);
+  --settings-input: var(--input-background);
+  --settings-text: var(--text);
+  --settings-muted: var(--muted-text);
+  background: transparent;
+}
+html.glean-themed-main .dm-settings-redesigned .dm-settings-content { background: var(--glean-theme-surface); }
+html.glean-themed-main .dm-settings-redesigned .dm-settings-header { background: var(--glean-theme-rail); }
+html.glean-themed-main .community-settings { background: var(--glean-theme-surface); }
+html.glean-themed-main .community-settings-nav { background: var(--glean-theme-rail); }
+
+/* Backplates inherit the theme beneath them; the Glean brand/action accent stays blue. */
+html.glean-themed-main :is(.dm-profile-bar, .dm-reply-quote, .dm-composer .dm-reply-bar) {
+  background: var(--glean-theme-inset);
+}
+html.glean-themed-main .dm-reply-quote {
+  border-color: var(--dm-border);
+  border-left-color: var(--glean-theme-emphasis);
+}
+html.glean-themed-main .dm-reply-quote:hover {
+  background: var(--glean-theme-hover);
+  border-color: var(--glean-theme-emphasis);
+}
+html.glean-themed-main .dm-reply-quote-author { color: var(--text); }
+html.glean-themed-main .dm-composer .dm-reply-bar { border-left-color: var(--glean-theme-emphasis); }
+html.glean-themed-main :is(.dm-message.is-mentioned, .community-message.is-mentioned) {
+  background: var(--glean-theme-selected);
+  box-shadow: inset 3px 0 0 var(--glean-theme-emphasis);
+}
+html.glean-themed-main :is(.community-channel.is-active, .dm-workspace .dm-tabs > button.is-active, .dm-inbox-row.is-selected) {
+  background: var(--glean-theme-selected);
+  border-color: var(--dm-border);
+  box-shadow: inset 0 0 0 1px var(--dm-border);
+}
+html.glean-themed-main :is(.community-channel.is-active, .dm-inbox-row.is-selected)::before {
+  background: var(--glean-theme-emphasis);
+}
+html.glean-themed-main :is(.community-channel:hover, .dm-workspace .dm-tabs > button:hover, .dm-inbox-row:hover) {
+  background: var(--glean-theme-hover);
+}

@@ -1,6 +1,7 @@
 import { createPortal } from 'react-dom';
 import { useEffect, useRef, useState } from 'react';
 import { updateAccountBanner } from '../../app/dmApi';
+import { PROFILE_IMAGE_DEFAULTS, profileImageAdjustments } from '../../app/profileBackground';
 import { schoolBadgeStyle } from '../../app/laredoSchools';
 import { ServerInvitePreview } from '../community/ServerInviteCard';
 import { BANNER_HEX, bannerStyle, normalizeHex, profileThemeStyle } from './banner';
@@ -101,7 +102,7 @@ function ColorField({ label, value, onChange }) {
   );
 }
 
-function ProfileLivePreview({ account, banner, profileBackground }) {
+export function ProfileLivePreview({ account, banner, profileBackground, showLabel = true }) {
   const backgroundStyle = profileThemeStyle(profileBackground) || undefined;
   const bannerPreviewStyle = bannerStyle(banner) || undefined;
   const programs = account?.programs || [];
@@ -126,7 +127,7 @@ function ProfileLivePreview({ account, banner, profileBackground }) {
 
   return (
     <aside className="dm-banner-live-preview" aria-label="Live profile preview">
-      <p className="dm-banner-live-label">Live preview</p>
+      {showLabel ? <p className="dm-banner-live-label">Live preview</p> : null}
       <div className={rootClass} style={backgroundStyle}>
         {inMagnet ? (
           <div className="dm-profile-ribbon is-magnet" aria-hidden="true"><span>MAGNET</span></div>
@@ -204,6 +205,8 @@ export default function BannerEditor({
   previewAccount = null,
   previewTarget = 'banner',
 }) {
+  const isProfileBackground = previewTarget === 'profileBackground';
+  const editorRef = useRef(null);
   const stageRef = useRef(null);
   const dragRef = useRef(null);
   const fileRef = useRef(null);
@@ -225,12 +228,28 @@ export default function BannerEditor({
   const [dragging, setDragging] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  const [adjustments, setAdjustments] = useState(() => profileImageAdjustments(banner || {}));
   const animatedGif = preserveAnimatedGif && sourceFile?.type === 'image/gif';
+
+  useEffect(() => {
+    const previousFocus = document.activeElement;
+    editorRef.current?.querySelector('button')?.focus();
+    return () => { if (previousFocus?.isConnected) previousFocus.focus(); };
+  }, []);
 
   useEffect(() => () => { if (sourceUrl) URL.revokeObjectURL(sourceUrl); }, [sourceUrl]);
 
   useEffect(() => {
     const onKey = (event) => {
+      if (event.key === 'Tab') {
+        const elements = Array.from(editorRef.current?.querySelectorAll('button:not(:disabled), input:not(:disabled):not([type="hidden"]), [tabindex="0"]') || []).filter(node => node.getClientRects().length);
+        const first = elements[0];
+        const last = elements[elements.length - 1];
+        if (!first) return;
+        if (event.shiftKey && (document.activeElement === first || !editorRef.current.contains(document.activeElement))) { event.preventDefault(); last.focus(); }
+        else if (!event.shiftKey && (document.activeElement === last || !editorRef.current.contains(document.activeElement))) { event.preventDefault(); first.focus(); }
+        return;
+      }
       if (event.key !== 'Escape' || saving) return;
       event.stopPropagation();
       onClose();
@@ -275,20 +294,22 @@ export default function BannerEditor({
 
   useEffect(() => {
     const node = stageRef.current;
-    if (animatedGif || !node || !bitmap) return undefined;
+    if (isProfileBackground || animatedGif || !node || !bitmap) return undefined;
     const onWheel = (event) => {
       event.preventDefault();
       setZoom((current) => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, current + (event.deltaY > 0 ? -0.08 : 0.08))));
     };
     node.addEventListener('wheel', onWheel, { passive: false });
     return () => node.removeEventListener('wheel', onWheel);
-  }, [bitmap, animatedGif]);
+  }, [bitmap, animatedGif, isProfileBackground]);
 
   const draft = kind === 'solid'
     ? { kind: 'solid', color }
     : kind === 'gradient'
       ? { kind: 'gradient', from, to, angle }
-      : sourceUrl && bitmap
+      : isProfileBackground && (sourceUrl || existingUrl)
+        ? { kind: 'image', imageUrl: sourceUrl || existingUrl, ...adjustments }
+        : sourceUrl && bitmap
         ? null
         : existingUrl
           ? { kind: 'image', imageUrl: existingUrl }
@@ -301,8 +322,8 @@ export default function BannerEditor({
 
   const takeFile = (file) => {
     if (!file) return;
-    if (file.size > 8 * 1024 * 1024 || (file.type && !TYPES.has(file.type))) {
-      setError('Choose a JPG, PNG, WebP, or GIF up to 8 MB.');
+    if (file.size > 8 * 1024 * 1024 || (file.type && !TYPES.has(file.type)) || (isProfileBackground && file.type === 'image/gif')) {
+      setError(isProfileBackground ? 'Choose a still JPG, PNG, or WebP up to 8 MB.' : 'Choose a JPG, PNG, WebP, or GIF up to 8 MB.');
       return;
     }
     setError('');
@@ -310,6 +331,7 @@ export default function BannerEditor({
     if (sourceUrl) URL.revokeObjectURL(sourceUrl);
     setSourceFile(file);
     setSourceUrl(URL.createObjectURL(file));
+    setBitmap(null);
   };
 
   const pickFile = (event) => {
@@ -349,13 +371,15 @@ export default function BannerEditor({
     setError('');
     try {
       let result;
-      if (kind === 'image' && animatedGif && sourceFile) {
+      if (kind === 'image' && isProfileBackground && sourceFile && bitmap) {
+        result = await saveBanner(sourceFile, adjustments);
+      } else if (kind === 'image' && animatedGif && sourceFile) {
         result = await saveBanner(sourceFile);
       } else if (kind === 'image' && bitmap && sourceUrl) {
         const file = await exportBanner(bitmap, offset, zoom, frame.w, frame.h);
         result = await saveBanner(file);
       } else if (kind === 'image' && existingUrl) {
-        result = await saveBanner({ kind: 'image', imageUrl: existingUrl });
+        result = await saveBanner({ kind: 'image', imageUrl: existingUrl, ...(isProfileBackground ? adjustments : {}) });
       } else if (kind === 'solid') {
         result = await saveBanner({ kind: 'solid', color });
       } else if (kind === 'gradient') {
@@ -389,12 +413,12 @@ export default function BannerEditor({
     }
   };
 
-  const cropActive = kind === 'image' && sourceUrl && bitmap && !animatedGif;
+  const cropActive = kind === 'image' && sourceUrl && bitmap && !animatedGif && !isProfileBackground;
   const pendingImage = kind === 'image' && sourceUrl && bitmap
     ? { kind: 'image', imageUrl: sourceUrl }
     : null;
   const liveBanner = pendingImage || draft;
-  const liveProfileBackground = previewTarget === 'profileBackground' ? draft : previewAccount?.profileBackground || null;
+  const liveProfileBackground = isProfileBackground ? draft : previewAccount?.profileBackground || null;
   const previewBanner = previewTarget === 'banner' ? liveBanner : previewAccount?.banner || null;
   const liveServer = invitePreview
     ? { ...invitePreview, banner: liveBanner || invitePreview.banner || null }
@@ -402,7 +426,7 @@ export default function BannerEditor({
 
   return createPortal(
     <div className="dm-banner-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !saving) onClose(); }}>
-      <section className={`dm-banner-editor${previewAccount ? ' has-live-preview' : ''}`} role="dialog" aria-modal="true" aria-labelledby="banner-title" aria-busy={saving}>
+      <section ref={editorRef} className={`dm-banner-editor${previewAccount ? ' has-live-preview' : ''}`} role="dialog" aria-modal="true" aria-labelledby="banner-title" aria-busy={saving}>
         <div className="dm-banner-editor-form">
           <h2 id="banner-title">{title}</h2>
           <p className="dm-banner-lead">{lead}</p>
@@ -411,10 +435,10 @@ export default function BannerEditor({
             <p className="dm-banner-hint">Live invite preview</p>
             <ServerInvitePreview server={liveServer} goDisabled goLabel="Go to Server" />
           </div>
-          ) : cropActive ? null : (
+          ) : cropActive || (isProfileBackground && kind === 'image') ? null : (
             <div className="dm-banner-preview" style={previewStyle} />
           )}
-          <div className={`dm-banner-tabs${allowImage ? '' : ' is-color-only'}`} role="tablist" aria-label={allowImage ? 'Banner type' : 'Profile background type'}>
+          <div className={`dm-banner-tabs${allowImage ? '' : ' is-color-only'}`} role="group" aria-label={isProfileBackground ? 'Profile background type' : 'Banner type'}>
           <button type="button" className={kind === 'solid' ? 'is-active' : ''} aria-pressed={kind === 'solid'} onClick={() => setKind('solid')}>Solid color</button>
           <button type="button" className={kind === 'gradient' ? 'is-active' : ''} aria-pressed={kind === 'gradient'} onClick={() => setKind('gradient')}>Gradient</button>
           {allowImage ? <button type="button" className={kind === 'image' ? 'is-active' : ''} aria-pressed={kind === 'image'} onClick={() => setKind('image')}>Image</button> : null}
@@ -461,8 +485,10 @@ export default function BannerEditor({
           ) : null}
           {kind === 'image' ? (
           <div className="dm-banner-panel">
-            <p className="dm-banner-hint">{animatedGif ? 'Animated GIFs stay animated. Glean saves the original GIF without flattening it into a still image.' : sourceUrl ? 'Drag to reposition. Scroll or use the slider to zoom, then save.' : 'Choose a photo, then crop it to the banner shape.'}</p>
-            {cropActive ? (
+            <p className="dm-banner-hint">{isProfileBackground ? 'Choose a still JPG, PNG, or WebP up to 8 MB. Your image fills the background, not the banner. Adjustments appear in the live profile preview.' : animatedGif ? 'Animated GIFs stay animated. Glean saves the original GIF without flattening it into a still image.' : sourceUrl ? 'Drag to reposition. Scroll or use the slider to zoom, then save.' : 'Choose a photo, then crop it to the banner shape.'}</p>
+            {isProfileBackground && (sourceUrl || existingUrl) ? (
+              <img className="dm-background-source" alt="Selected profile background" src={sourceUrl || existingUrl} />
+            ) : cropActive ? (
               <div
                 ref={stageRef}
                 className={`dm-banner-stage${dragging ? ' is-dragging' : ''}`}
@@ -499,15 +525,27 @@ export default function BannerEditor({
             ) : null}
             <div className="dm-banner-file-row">
               <button type="button" className="dm-small-action" onClick={() => fileRef.current?.click()}>{sourceUrl || existingUrl ? 'Replace photo' : 'Choose photo'}</button>
-              <input ref={fileRef} type="file" accept="image/jpeg,image/png,image/webp,image/gif" hidden onChange={pickFile} />
+              <input ref={fileRef} type="file" accept={isProfileBackground ? 'image/jpeg,image/png,image/webp' : 'image/jpeg,image/png,image/webp,image/gif'} hidden onChange={pickFile} />
             </div>
+            {isProfileBackground && (sourceUrl || existingUrl) ? (
+              <fieldset className="dm-background-adjustments" disabled={saving}>
+                <legend>Image adjustments</legend>
+                {['contrast', 'saturation', 'blur'].map(key => (
+                  <label className="dm-banner-angle" key={key}>
+                    <span>{key[0].toUpperCase() + key.slice(1)} <output>{adjustments[key]}{key === 'blur' ? 'px' : '%'}</output></span>
+                    <input aria-label={`Background ${key}`} type="range" min="0" max={key === 'blur' ? 100 : 200} step="1" value={adjustments[key]} onChange={event => setAdjustments(current => ({ ...current, [key]: Number(event.target.value) }))} />
+                  </label>
+                ))}
+                <button type="button" className="dm-small-action" onClick={() => setAdjustments({ ...PROFILE_IMAGE_DEFAULTS })}>Reset adjustments</button>
+              </fieldset>
+            ) : null}
           </div>
           ) : null}
           {error ? <p className="dm-crop-error" role="alert">{error}</p> : null}
           <div className="dm-crop-actions">
           <button type="button" onClick={reset} disabled={saving}>Reset</button>
           <button type="button" onClick={onClose} disabled={saving}>Cancel</button>
-          <button type="button" className="dm-crop-save" onClick={save} disabled={saving}>{saving ? 'Saving…' : animatedGif ? 'Save animated GIF' : saveLabel}</button>
+          <button type="button" className="dm-crop-save" onClick={save} disabled={saving || Boolean(kind === 'image' && sourceUrl && !bitmap)}>{saving ? 'Saving…' : animatedGif ? 'Save animated GIF' : saveLabel}</button>
           </div>
         </div>
         {previewAccount ? <ProfileLivePreview account={previewAccount} banner={previewBanner} profileBackground={liveProfileBackground} /> : null}

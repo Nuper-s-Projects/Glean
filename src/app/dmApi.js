@@ -25,7 +25,11 @@ export async function registerE2EEKey(publicKey, fingerprint) {
 }
 
 export async function getFriends() { return request('/friends'); }
-export async function getPeople() { return request('/people'); }
+export async function getPeople({ query = '', filter = 'all', attributes = [], cursor = 0, limit = 50, signal } = {}) {
+  const params = new URLSearchParams({ query, filter, cursor: String(cursor), limit: String(limit) });
+  if (attributes.length) params.set('attributes', attributes.join(','));
+  return request(`/people?${params}`, { signal });
+}
 export async function getAnalytics() { return request('/analytics'); }
 export async function getAnalyticsPeople({ query = '', cursor = 0, limit = 50 } = {}) {
   const params = new URLSearchParams({ query, cursor: String(cursor), limit: String(limit) });
@@ -99,6 +103,16 @@ export async function getServerAuditLog(serverId, { before = null } = {}) {
   return request(apiRoutes.serverAuditLog(serverId, before));
 }
 export async function updateServer(id, payload) { return request(apiRoutes.server(id), { method: 'PATCH', body: JSON.stringify(payload) }); }
+export async function getServerModelPlans(id) { return request(`/servers/${id}/model`); }
+export async function startServerModelChat(id) { return request(`/servers/${id}/model/chats`, { method: 'POST', body: '{}' }); }
+export async function prepareServerModelPlan(id, prompt, allowAll = false, chatId) { return request(`/servers/${id}/model`, { method: 'POST', timeoutMs: 135_000, body: JSON.stringify({ prompt, allowAll, chatId }) }); }
+export async function applyServerModelPlan(id, planId) { return request(`/servers/${id}/model/${encodeURIComponent(planId)}/apply`, { method: 'POST', timeoutMs: 135_000, body: JSON.stringify({}) }); }
+export async function setServerBotInstalled(serverId, botId, installed) {
+  const path = `${apiRoutes.server(serverId)}/bots${installed ? '' : `/${encodeURIComponent(botId)}`}`;
+  return request(path, installed
+    ? { method: 'POST', body: JSON.stringify({ botId }) }
+    : { method: 'DELETE' });
+}
 export async function updateServerIcon(id, file) {
   const form = new FormData();
   form.append('icon', file);
@@ -121,11 +135,14 @@ export async function deleteServer(serverId) {
   invalidateServersCache();
   return request(`/servers/${serverId}`, { method: 'DELETE' });
 }
-export async function createChannel(serverId, name, type = 'text') { return request(apiRoutes.serverChannels(serverId), { method: 'POST', body: JSON.stringify({ name, type }) }); }
+export async function createChannel(serverId, name, type = 'text', categoryId = null) { return request(apiRoutes.serverChannels(serverId), { method: 'POST', body: JSON.stringify({ name, type, categoryId }) }); }
+export async function createServerCategory(serverId, name) { return request(`/servers/${serverId}/categories`, { method: 'POST', body: JSON.stringify({ name }) }); }
+export async function renameServerCategory(serverId, categoryId, name) { return request(`/servers/${serverId}/categories/${categoryId}`, { method: 'PATCH', body: JSON.stringify({ name }) }); }
+export async function reorderServerCategories(serverId, categoryIds) { return request(`/servers/${serverId}/categories/order`, { method: 'PATCH', body: JSON.stringify({ categoryIds }) }); }
 export async function updateChannel(serverId, channelId, payload) { return request(apiRoutes.serverChannel(serverId, channelId), { method: 'PATCH', body: JSON.stringify(payload) }); }
 export async function clearServerChannelMessages(serverId, channelId) { return request(apiRoutes.serverChannelClearMessages(serverId, channelId), { method: 'POST', body: '{}' }); }
 export async function updateServerChannelMessageCleanup(serverId, channelId, intervalSeconds) { return request(apiRoutes.serverChannelMessageCleanup(serverId, channelId), { method: 'POST', body: JSON.stringify({ intervalSeconds }) }); }
-export async function reorderChannels(serverId, channelIds) { return request(`/servers/${serverId}/channels/order`, { method: 'PATCH', body: JSON.stringify({ channelIds }) }); }
+export async function reorderChannels(serverId, channelIds, scope) { return request(`/servers/${serverId}/channels/order`, { method: 'PATCH', body: JSON.stringify({ channelIds, ...(scope ? { scope } : {}) }) }); }
 export async function deleteChannel(serverId, channelId) { return request(apiRoutes.serverChannel(serverId, channelId), { method: 'DELETE' }); }
 export async function createRole(serverId, role) { return request(`/servers/${serverId}/roles`, { method: 'POST', body: JSON.stringify(role) }); }
 export async function reorderRoles(serverId, roleIds) { return request(`/servers/${serverId}/roles/order`, { method: 'PATCH', body: JSON.stringify({ roleIds }) }); }
@@ -201,11 +218,11 @@ export async function openDirectConversation(username) {
   return request(apiRoutes.directConversation(username), { method: 'POST' });
 }
 
-export async function getMessages(conversationId, { before = null, limit = 50 } = {}) {
+export async function getMessages(conversationId, { before = null, limit = 50, signal } = {}) {
   const pageSize = Math.min(100, Math.max(1, Number.isInteger(Number(limit)) ? Number(limit) : 50));
   const params = new URLSearchParams({ limit: String(pageSize) });
   if (before) params.set('before', String(before));
-  const payload = await request(`${apiRoutes.conversationMessages(conversationId)}?${params}`);
+  const payload = await request(`${apiRoutes.conversationMessages(conversationId)}?${params}`, { signal });
   if (!Array.isArray(payload.messages)) throw new Error('Direct-message history could not be read. Try again.');
   return payload;
 }
@@ -328,8 +345,26 @@ export async function updateAccountBanner(payload) {
   return account;
 }
 
-export async function updateAccountProfileBackground(payload) {
+export async function updateAccountProfileBackground(payload, adjustments) {
+  if (payload instanceof File) {
+    const form = new FormData();
+    form.append('background', payload);
+    form.append('adjustments', JSON.stringify(adjustments || {}));
+    const { account } = await request('/account/profile-background', { method: 'POST', body: form });
+    return account;
+  }
   const { account } = await request('/account/profile-background', { method: 'POST', body: JSON.stringify(payload) });
+  return account;
+}
+
+export async function updateAccountMainTheme(payload, photo) {
+  let body = JSON.stringify(payload);
+  if (photo) {
+    body = new FormData();
+    body.append('background', photo);
+    body.append('adjustments', JSON.stringify(payload.theme));
+  }
+  const { account } = await request('/account/theme', { method: 'POST', body });
   return account;
 }
 
@@ -366,8 +401,8 @@ export async function sendPushAnnouncement(message) {
   return request('/push/announcement', { method: 'POST', body: JSON.stringify({ message }) });
 }
 
-export async function changePassword(currentPassword, newPassword) {
-  return request('/account/password', { method: 'POST', body: JSON.stringify({ currentPassword, newPassword }) });
+export async function changePassword(currentPassword, newPassword, profileKeyBackup = null) {
+  return request('/account/password', { method: 'POST', body: JSON.stringify({ currentPassword, newPassword, ...(profileKeyBackup ? { profileKeyBackup } : {}) }) });
 }
 export async function deleteAccount(password) {
   return request('/account', { method: 'DELETE', body: JSON.stringify({ password }) });

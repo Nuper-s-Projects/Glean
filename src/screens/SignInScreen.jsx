@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import AuthCard from '../components/AuthCard';
 import { PasswordField, TextField, FormMessage } from '../components/FormFields';
 import { signIn } from '../app/storage';
@@ -11,19 +11,6 @@ export default function SignInScreen({ goTo, onAuthenticated }) {
   const [visible, setVisible] = useState(false);
   const [message, setMessage] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [stats, setStats] = useState(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    const loadStats = () => fetch('/api/v1/auth/stats', { headers: { Accept: 'application/json' } })
-      .then((response) => response.ok ? response.json() : null)
-      .then((next) => { if (!cancelled && next && Number.isFinite(next.online) && Number.isFinite(next.total)) setStats(next); })
-      .catch(() => {});
-    loadStats();
-    const timer = window.setInterval(loadStats, 30_000);
-    return () => { cancelled = true; window.clearInterval(timer); };
-  }, []);
-
   function update(setter) {
     return (value) => {
       setter(value);
@@ -48,15 +35,16 @@ export default function SignInScreen({ goTo, onAuthenticated }) {
   }
 
   return (
-    <AuthCard variant="signin-card">
+    <AuthCard
+      variant="signin-card"
+      brandContent={<div className="auth-brand-intro"><h2>Welcome to Glean!</h2><p>Let’s get started by creating your account. Already been here? Welcome back.</p></div>}
+    >
       <div className="auth-layout signin-layout">
         <section className="intro intro-signin">
           <h1>Sign in to Glean</h1>
-          <p>Use your Glean account to continue.</p>
-          {stats ? <div className="auth-community-stats" aria-label={`${stats.online} users online, ${stats.total} total users`}><span><i className="auth-online-dot" />{stats.online.toLocaleString()} online</span><b>—</b><span>{stats.total.toLocaleString()} total users</span></div> : null}
         </section>
         <form className="auth-form" onSubmit={submit} noValidate>
-          <TextField
+            <TextField
             id="signin-username"
             label="Username"
             placeholder="Enter your username"

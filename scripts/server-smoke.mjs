@@ -1,11 +1,12 @@
 import { parseInviteInput } from '../src/app/invite.js';
 import { createHash, createHmac, webcrypto } from 'node:crypto';
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import http from 'node:http';
+import sharp from 'sharp';
 import { CONDUCT_VERSION, TERMS_VERSION } from '../src/app/agreements.js';
 
 const port = 5300 + Math.floor(Math.random() * 500);
@@ -26,6 +27,24 @@ function fingerprint(jwk) {
 async function publicKey() {
   const pair = await webcrypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
   return webcrypto.subtle.exportKey('jwk', pair.publicKey);
+}
+async function accountKeyBackup(accountId, password, identity = null) {
+  const pair = identity ? null : await webcrypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+  const publicKeyJwk = identity?.publicKey || await webcrypto.subtle.exportKey('jwk', pair.publicKey);
+  const privateJwk = identity?.privateJwk || await webcrypto.subtle.exportKey('jwk', pair.privateKey);
+  const activeFingerprint = fingerprint(publicKeyJwk);
+  const salt = webcrypto.getRandomValues(new Uint8Array(16));
+  const iv = webcrypto.getRandomValues(new Uint8Array(12));
+  const passwordMaterial = await webcrypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']);
+  const key = await webcrypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: 600_000, hash: 'SHA-256' }, passwordMaterial, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+  const clear = JSON.stringify({ version: 1, activeFingerprint, identities: [{ fingerprint: activeFingerprint, publicKey: publicKeyJwk, privateJwk }] });
+  const ciphertext = await webcrypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: new TextEncoder().encode(`glean-account-key-backup-v1:${accountId}`) }, key, new TextEncoder().encode(clear));
+  return {
+    publicKey: publicKeyJwk,
+    fingerprint: activeFingerprint,
+    backup: { version: 1, kdf: 'PBKDF2-SHA256', iterations: 600_000, salt: Buffer.from(salt).toString('base64url'), iv: Buffer.from(iv).toString('base64url'), ciphertext: Buffer.from(ciphertext).toString('base64url') },
+    clear,
+  };
 }
 async function makeClient(accessToken = '') {
   let cookie = '';
@@ -205,10 +224,40 @@ try {
   const apiRoot = await fetch(base);
   const apiMetadata = await apiRoot.json();
   if (!apiRoot.ok || apiMetadata.baseUrl !== '/api/v1' || apiMetadata.routes?.servers !== '/api/v1/servers') throw new Error('API root metadata is not routable.');
+  const nuraAvatar = await fetch(`http://127.0.0.1:${port}/nura-avatar.png`);
+  const nuraAvatarBytes = Buffer.from(await nuraAvatar.arrayBuffer());
+  if (!nuraAvatar.ok || nuraAvatar.headers.get('content-type') !== 'image/png' || !nuraAvatarBytes.equals(readFileSync(new URL('../public/nura-avatar.png', import.meta.url)))) throw new Error('Nura avatar asset is not served correctly.');
   const alice = await makeClient();
   const bob = await makeClient();
   const aliceSignup = await alice('/auth/signup', { method: 'POST', body: JSON.stringify({ username: 'alice_test', password: 'correct-horse-123' }) });
   await acceptCurrentAgreements(alice);
+  const nuraLink = await alice('/friends/requests', { method: 'POST', body: JSON.stringify({ username: 'Nura' }) });
+  if (!nuraLink.accepted || !nuraLink.conversationId) throw new Error('Adding Nura did not immediately accept the request and open a DM.');
+  const repeatedNuraLink = await alice('/friends/requests', { method: 'POST', body: JSON.stringify({ username: 'nura' }) });
+  if (!repeatedNuraLink.accepted || Number(repeatedNuraLink.conversationId) !== Number(nuraLink.conversationId)) throw new Error('Re-adding Nura did not return the existing chat.');
+  const nuraConversations = await alice('/conversations');
+  const nuraConversation = nuraConversations.conversations?.find((item) => Number(item.id) === Number(nuraLink.conversationId));
+  if (!nuraConversation?.user?.isBot || nuraConversation.user.publicKey || nuraConversation.user.avatarUrl !== '/nura-avatar.png' || nuraConversation.user.bio !== 'hi! im nura, you can chat with me through dms!') throw new Error('Nura must expose the configured profile bio and avatar without appearing E2EE-capable.');
+  await alice(`/conversations/${nuraLink.conversationId}/messages`, { method: 'POST', body: JSON.stringify({ body: 'Nura smoke test' }) });
+  let nuraMessages = [];
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    nuraMessages = (await alice(`/conversations/${nuraLink.conversationId}/messages?limit=10`)).messages || [];
+    if (nuraMessages.some((item) => item.sender?.username === 'Nura')) break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  if (!nuraMessages.some((item) => item.sender?.username === 'Nura' && !item.encrypted && /groq/i.test(item.body || ''))) throw new Error('Nura did not produce the expected safe Groq-unavailable reply in the isolated smoke environment.');
+  const nuraImage = await sharp({ create: { width: 1, height: 1, channels: 3, background: '#1688cc' } }).png().toBuffer();
+  const nuraImageForm = new FormData();
+  nuraImageForm.append('body', 'What is in this image?');
+  nuraImageForm.append('files', new Blob([nuraImage], { type: 'image/png' }), 'tiny.png');
+  const nuraImageSend = await alice(`/conversations/${nuraLink.conversationId}/messages`, { method: 'POST', body: nuraImageForm });
+  if (nuraImageSend.message?.attachments?.[0]?.type !== 'image/png' || nuraImageSend.message.encrypted) throw new Error('Nura image input was not stored as an unencrypted image attachment.');
+  const nuraVideoForm = new FormData();
+  nuraVideoForm.append('body', 'Summarize this video');
+  nuraVideoForm.append('files', new Blob(['video'], { type: 'video/mp4' }), 'clip.mp4');
+  const nuraVideoResponse = await alice.raw(`/conversations/${nuraLink.conversationId}/messages`, { method: 'POST', body: nuraVideoForm });
+  if (nuraVideoResponse.status !== 400) throw new Error('Nura must reject video attachments.');
+  if ((await fetch(`${base}/auth/stats`).then((response) => response.json())).total !== 1) throw new Error('Nura was incorrectly counted as a Glean user.');
   const voiceIce = await alice('/voice/ice-servers');
   const turnServer = voiceIce.iceServers?.find((item) => item.urls?.some((url) => url.startsWith('turn:')));
   const turnExpiry = Number(turnServer?.username?.split(':')[0]);
@@ -342,7 +391,9 @@ try {
     senderPublicKey: aliceKey,
     recipientPublicKey: bobKey,
   };
-  await alice(`/conversations/${conversation.id}/messages`, { method: 'POST', body: JSON.stringify({ envelope, attachmentMeta: [] }) });
+  const originalDm = await alice(`/conversations/${conversation.id}/messages`, { method: 'POST', body: JSON.stringify({ envelope, attachmentMeta: [] }) });
+  const retriedDm = await alice(`/conversations/${conversation.id}/messages`, { method: 'POST', body: JSON.stringify({ envelope, attachmentMeta: [] }) });
+  if (!retriedDm.duplicate || retriedDm.message?.id !== originalDm.message.id || retriedDm.message?.crypto?.ciphertext !== envelope.ciphertext) throw new Error('DM retry must return the original encrypted message without creating a duplicate.');
   const bobUnread = await bob('/conversations');
   const bobThread = bobUnread.conversations?.find((item) => item.id === conversation.id);
   if (!bobThread || bobThread.unreadCount !== 1) throw new Error('DM unread missing.');
@@ -352,8 +403,8 @@ try {
   const message = result.messages[0];
   if (!message?.encrypted || message.body !== null || message.crypto?.ciphertext !== envelope.ciphertext) throw new Error('Encrypted DM contract failed.');
   const rotatedAliceKey = await publicKey();
-  const rotatedAliceKeyRegistration = await alice('/e2ee/key', { method: 'PUT', body: JSON.stringify({ publicKey: rotatedAliceKey, fingerprint: fingerprint(rotatedAliceKey) }) });
-  if (!rotatedAliceKeyRegistration.changed) throw new Error('A genuinely rotated encryption key must still report a key change.');
+  const rotatedAliceKeyRegistration = await alice.raw('/e2ee/key', { method: 'PUT', body: JSON.stringify({ publicKey: rotatedAliceKey, fingerprint: fingerprint(rotatedAliceKey) }) });
+  if (rotatedAliceKeyRegistration.status !== 409) throw new Error('An unlinked device replaced the account’s active encryption key.');
   const bobAfterOpen = await bob('/conversations');
   if (bobAfterOpen.conversations?.find((item) => item.id === conversation.id)?.unreadCount) throw new Error('Opening a DM should mark it read.');
   await alice(`/conversations/${conversation.id}/messages`, { method: 'POST', body: JSON.stringify({ body: 'second ping' }) });
@@ -385,7 +436,7 @@ try {
     ciphertext: Buffer.from(webcrypto.getRandomValues(new Uint8Array(48))).toString('base64url'),
     iv: Buffer.from(webcrypto.getRandomValues(new Uint8Array(12))).toString('base64url'),
     salt: Buffer.from(webcrypto.getRandomValues(new Uint8Array(32))).toString('base64url'),
-    senderPublicKey: rotatedAliceKey,
+    senderPublicKey: aliceKey,
     recipientPublicKey: resetBobKey,
   };
   const sentWithResetKey = await alice(`/conversations/${conversation.id}/messages`, { method: 'POST', body: JSON.stringify({ envelope: resetMessageEnvelope, attachmentMeta: [] }) });
@@ -510,11 +561,44 @@ try {
   const firstDiscoverPage = await alice('/people?limit=1');
   const secondDiscoverPage = await alice(`/people?limit=1&cursor=${firstDiscoverPage.nextCursor}`);
   if (!firstDiscoverPage.nextCursor || firstDiscoverPage.people?.length !== 1 || secondDiscoverPage.people?.length !== 1 || firstDiscoverPage.people[0].id === secondDiscoverPage.people[0].id) throw new Error('Discover people pagination failed.');
+  const directoryDatabase = new DatabaseSync(join(dataDir, 'glean-auth.sqlite'));
+  const directoryFixtureIds = [];
+  try {
+    const insertDirectoryPerson = directoryDatabase.prepare('INSERT INTO users(email,password_hash,password_salt,username,bio,created_at,last_visited_at,program_json,school) VALUES(?,?,?,?,?,?,?,?,?)');
+    const now = new Date().toISOString();
+    directoryDatabase.exec('BEGIN');
+    for (let index = 0; index < 550; index++) {
+      const name = `discover_fixture_${String(index).padStart(4, '0')}`;
+      directoryFixtureIds.push(Number(insertDirectoryPerson.run(`${name}@test.invalid`, 'fixture-only', 'fixture-only', name, 'Pagination fixture', now, now, index === 549 ? '["laredo-college"]' : '[]', index === 548 ? 'vmt-magnet' : 'united-hs').lastInsertRowid));
+    }
+    directoryDatabase.exec('COMMIT');
+    const ids = new Set();
+    let cursor = 0;
+    do {
+      const result = await alice(`/people?query=discover_fixture_&cursor=${cursor}&limit=50`);
+      if (result.total !== 550 || result.counts?.all !== 550 || result.people.length > 50) throw new Error('People totals or page sizes were capped.');
+      for (const person of result.people) { if (ids.has(person.id)) throw new Error('Duplicate directory person.'); ids.add(person.id); }
+      cursor = result.nextCursor;
+    } while (cursor !== null);
+    if (ids.size !== 550 || !ids.has(directoryFixtureIds.at(-1))) throw new Error('Directory pagination stopped at 500 people.');
+    const distantSearch = await alice('/people?query=discover_fixture_0549&limit=50');
+    if (distantSearch.total !== 1 || distantSearch.people[0]?.id !== directoryFixtureIds.at(-1)) throw new Error('Directory search could not reach a person beyond 500.');
+    const attributeSearch = await alice('/people?query=discover_fixture_&attributes=magnet,laredo-college&limit=50');
+    if (attributeSearch.total !== 2 || attributeSearch.attributeCounts?.magnet !== 1 || attributeSearch.attributeCounts?.['laredo-college'] !== 1) throw new Error('Server-side directory attributes failed.');
+    const requestPeople = await alice('/people?filter=pending&limit=50');
+    if (requestPeople.people.some(person => !['incoming', 'outgoing'].includes(person.relation))) throw new Error('Server-side directory relationship filter failed.');
+    if ((await alice.raw('/people?filter=invalid')).status !== 400 || (await alice.raw('/people?attributes=invalid')).status !== 400) throw new Error('Invalid directory filters were accepted.');
+  } finally {
+    if (directoryDatabase.isTransaction) directoryDatabase.exec('ROLLBACK');
+    const removeFixture = directoryDatabase.prepare('DELETE FROM users WHERE id = ?');
+    for (const id of directoryFixtureIds) removeFixture.run(id);
+    directoryDatabase.close();
+  }
   const invalidDiscoverFilter = await bob.raw('/people?program=not-a-program');
   if (invalidDiscoverFilter.status !== 400) throw new Error('Unknown Discover program filters should be rejected.');
   const publicUserStatsResponse = await fetch(`${base}/auth/stats`);
   const publicUserStats = await publicUserStatsResponse.json();
-  if (!publicUserStatsResponse.ok || publicUserStats.total !== 3) throw new Error('Public Glean user count is inaccurate.');
+  if (!publicUserStatsResponse.ok || publicUserStats.total !== 3 || !Number.isFinite(publicUserStats.servers)) throw new Error('Public Glean account or server counts are inaccurate.');
   const programCard = await bob('/users/alice_test');
   if (!programCard.user?.programs?.some((item) => item.label === 'MAGNET')) throw new Error('MAGNET missing from profile.');
   if (!programCard.user?.programs?.some((item) => item.label === 'Laredo College')) throw new Error('Laredo College missing from profile.');
@@ -633,6 +717,13 @@ try {
   await alice(`/servers/${moderationServer.id}`, { method: 'PATCH', body: JSON.stringify({ moderationEnabled: true }) });
   const enabledModeration = await alice(`/servers/${moderationServer.id}`);
   if (enabledModeration.server?.moderationEnabled !== true) throw new Error('Server moderation did not turn on.');
+  const unavailableModeration = await alice.raw(`/channels/${moderationChannelId}/messages`, { method: 'POST', body: JSON.stringify({ body: 'A harmless message that Groq is unavailable to classify.' }) });
+  const unavailablePayload = await unavailableModeration.json();
+  if (unavailableModeration.status !== 503 || !/temporarily unavailable/.test(unavailablePayload.error || '')) throw new Error('Messages must not pass silently when Groq moderation falls back to the word list.');
+  const heldForReview = await alice.raw(`/channels/${moderationChannelId}/messages`, { method: 'POST', body: JSON.stringify({ body: 'Keep this our little secret.' }) });
+  if (heldForReview.status !== 503) throw new Error('A flagged message must not pass when the Groq decision is unavailable.');
+  const afterUnavailableModeration = await alice(`/channels/${moderationChannelId}/messages?limit=20`);
+  if (afterUnavailableModeration.messages?.some((item) => /Groq is unavailable to classify|little secret/.test(item.body || ''))) throw new Error('Unverified messages were stored despite moderation being unavailable.');
   const blockedProfanity = await alice.raw(`/channels/${moderationChannelId}/messages`, { method: 'POST', body: JSON.stringify({ body: 'fuck' }) });
   if (blockedProfanity.status !== 422) throw new Error('Enabled moderation should block profanity.');
   const deniedModerationChange = await bob.raw(`/servers/${moderationServer.id}`, { method: 'PATCH', body: JSON.stringify({ moderationEnabled: false }) });
@@ -722,6 +813,40 @@ try {
   const voiceIds = orderedServer.server.channels.filter((item) => item.voice).map((item) => item.id);
   if (textIds.join() !== textOrder.join()) throw new Error('Text channel order did not persist.');
   if (voiceIds.join() !== voiceOrder.join()) throw new Error('Voice channel order did not persist.');
+  const nuraPermissionCheck = await bob.raw(`/servers/${server.id}/bots`, { method: 'POST', body: JSON.stringify({ botId: 'nura' }) });
+  if (nuraPermissionCheck.status !== 403) throw new Error('A non-owner installed a server bot.');
+  const { channel: botChannel } = await alice(`/servers/${server.id}/channels`, { method: 'POST', body: JSON.stringify({ name: 'bot-lab' }) });
+  const preInstallCommand = await alice.raw(`/channels/${botChannel.id}/messages`, { method: 'POST', body: JSON.stringify({ body: '/activate' }) });
+  if (preInstallCommand.status !== 409) throw new Error('Nura commands worked before the server owner installed Nura.');
+  const installedBots = await alice(`/servers/${server.id}/bots`, { method: 'POST', body: JSON.stringify({ botId: 'nura' }) });
+  if (!installedBots.bots?.some((bot) => bot.id === 'nura')) throw new Error('The server owner could not install Nura.');
+  const serverWithNura = await alice(`/servers/${server.id}`);
+  if (!serverWithNura.server.members.some((member) => member.username === 'Nura' && member.isBot) || !serverWithNura.server.channels.some((item) => item.id === botChannel.id && !item.nuraActive)) throw new Error('Installed Nura is missing from the server or channel state.');
+  const activated = await alice(`/channels/${botChannel.id}/messages`, { method: 'POST', body: JSON.stringify({ body: '/activate' }) });
+  if (activated.message?.author?.username !== 'Nura' || !activated.message.author.isBot || !/use \/deactivate/.test(activated.message.body || '')) throw new Error('/activate did not return Nura’s confirmation as a bot.');
+  let activeServerChannel = await alice(`/servers/${server.id}`);
+  if (!activeServerChannel.server.channels.find((item) => item.id === botChannel.id)?.nuraActive) throw new Error('/activate did not persist the channel activation.');
+  const explicitChat = await alice(`/channels/${botChannel.id}/messages`, { method: 'POST', body: JSON.stringify({ body: '/chat say hi' }) });
+  if (explicitChat.message?.author?.username !== 'alice_test') throw new Error('/chat did not create the invoking member message.');
+  let botReplies = [];
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    botReplies = (await alice(`/channels/${botChannel.id}/messages?limit=30`)).messages?.filter((item) => item.author?.username === 'Nura') || [];
+    if (botReplies.some((item) => /groq just now/.test(item.body || ''))) break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  if (!botReplies.some((item) => item.author?.isBot && /groq just now/.test(item.body || ''))) throw new Error('/chat did not produce Nura’s safe Groq-unavailable response as a bot.');
+  const deactivated = await alice(`/channels/${botChannel.id}/messages`, { method: 'POST', body: JSON.stringify({ body: '/deactivate' }) });
+  if (deactivated.message?.author?.username !== 'Nura' || !/deactivated/.test(deactivated.message.body || '')) throw new Error('/deactivate did not return Nura’s confirmation.');
+  activeServerChannel = await alice(`/servers/${server.id}`);
+  if (activeServerChannel.server.channels.find((item) => item.id === botChannel.id)?.nuraActive) throw new Error('/deactivate did not turn off automatic channel replies.');
+  await alice(`/channels/${botChannel.id}/messages`, { method: 'POST', body: JSON.stringify({ body: 'normal message after deactivation' }) });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  const afterDeactivation = await alice(`/channels/${botChannel.id}/messages?limit=30`);
+  if (afterDeactivation.messages?.some((item) => item.author?.username === 'Nura' && /groq just now/.test(item.body || '') && item.id > deactivated.message.id)) throw new Error('Nura replied automatically after /deactivate.');
+  const removedBots = await alice(`/servers/${server.id}/bots/nura`, { method: 'DELETE' });
+  if (removedBots.bots?.some((bot) => bot.id === 'nura')) throw new Error('Nura was not removed from the server.');
+  const serverAfterNuraRemoval = await alice(`/servers/${server.id}`);
+  if (serverAfterNuraRemoval.server.members.some((member) => member.username === 'Nura')) throw new Error('Removing Nura did not remove its server membership.');
   try {
     await alice(`/servers/${server.id}/channels/order`, { method: 'PATCH', body: JSON.stringify({ channelIds: [general.id, channel.id] }) });
     throw new Error('Mixed channel order should fail.');
@@ -768,10 +893,62 @@ try {
   const banList = await alice(`/servers/${server.id}/bans`);
   if (!Array.isArray(banList.bans)) throw new Error('Ban list missing.');
   const nuper = await makeClient();
-  await nuper('/auth/signup', { method: 'POST', body: JSON.stringify({ username: 'Nuper', password: 'correct-horse-789', grade: 'no_response', school: 'no_response' }) });
+  const nuperSignup = await nuper('/auth/signup', { method: 'POST', body: JSON.stringify({ username: 'Nuper', password: 'correct-horse-789', grade: 'no_response', school: 'no_response' }) });
   await acceptCurrentAgreements(nuper);
   const nuperMe = await nuper('/auth/me');
   if (!nuperMe.account?.platformAdmin) throw new Error('Nuper is not platform admin.');
+  const nonNuperBackup = await alice.raw('/e2ee/profile-key');
+  if (nonNuperBackup.status !== 404) throw new Error('Account-key recovery was enabled for an account other than Nuper.');
+  if ((await nuper('/e2ee/profile-key')).revision !== 0) throw new Error('Nuper should start without a profile key backup.');
+  const nuperBackup = await accountKeyBackup(nuperMe.account.id, 'correct-horse-789');
+  const nuperBackupSaved = await nuper('/e2ee/profile-key', { method: 'PUT', body: JSON.stringify({ revision: 0, publicKey: nuperBackup.publicKey, fingerprint: nuperBackup.fingerprint, backup: nuperBackup.backup }) });
+  if (nuperBackupSaved.revision !== 1) throw new Error('Nuper account DM key backup did not initialize.');
+  const nuperBackupRead = await nuper('/e2ee/profile-key');
+  const nuperKeyDevice = await makeClient(nuperSignup.accessToken);
+  const passwordMaterial = await webcrypto.subtle.importKey('raw', new TextEncoder().encode('correct-horse-789'), 'PBKDF2', false, ['deriveKey']);
+  const backupKey = await webcrypto.subtle.deriveKey({ name: 'PBKDF2', salt: Buffer.from(nuperBackupRead.backup.salt, 'base64url'), iterations: 600_000, hash: 'SHA-256' }, passwordMaterial, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
+  const backupClear = await webcrypto.subtle.decrypt({ name: 'AES-GCM', iv: Buffer.from(nuperBackupRead.backup.iv, 'base64url'), additionalData: new TextEncoder().encode(`glean-account-key-backup-v1:${nuperMe.account.id}`) }, backupKey, Buffer.from(nuperBackupRead.backup.ciphertext, 'base64url'));
+  if (new TextDecoder().decode(backupClear) !== nuperBackup.clear) throw new Error('A new device could not unlock Nuper’s account DM key with the Glean password.');
+  const invalidNuperKey = await nuperKeyDevice.raw('/e2ee/key', { method: 'PUT', body: JSON.stringify({ publicKey: await publicKey() }) });
+  if (invalidNuperKey.status !== 409) throw new Error('A new device replaced Nuper’s account DM identity.');
+  const passwordChangedBackup = await accountKeyBackup(nuperMe.account.id, 'correct-horse-789-new', { publicKey: nuperBackup.publicKey, privateJwk: JSON.parse(nuperBackup.clear).identities[0].privateJwk });
+  const passwordChanged = await nuper('/account/password', { method: 'POST', body: JSON.stringify({ currentPassword: 'correct-horse-789', newPassword: 'correct-horse-789-new', profileKeyBackup: { revision: 1, publicKey: passwordChangedBackup.publicKey, fingerprint: passwordChangedBackup.fingerprint, backup: passwordChangedBackup.backup } }) });
+  if (!passwordChanged.ok) throw new Error('Changing Nuper’s password did not rewrap the account DM key backup.');
+  const nuperAfterPasswordChange = await makeClient(nuperSignup.accessToken);
+  const updatedBackupRead = await nuperAfterPasswordChange('/e2ee/profile-key');
+  const updatedMaterial = await webcrypto.subtle.importKey('raw', new TextEncoder().encode('correct-horse-789-new'), 'PBKDF2', false, ['deriveKey']);
+  const updatedKey = await webcrypto.subtle.deriveKey({ name: 'PBKDF2', salt: Buffer.from(updatedBackupRead.backup.salt, 'base64url'), iterations: 600_000, hash: 'SHA-256' }, updatedMaterial, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
+  await webcrypto.subtle.decrypt({ name: 'AES-GCM', iv: Buffer.from(updatedBackupRead.backup.iv, 'base64url'), additionalData: new TextEncoder().encode(`glean-account-key-backup-v1:${nuperMe.account.id}`) }, updatedKey, Buffer.from(updatedBackupRead.backup.ciphertext, 'base64url'));
+  const resetAccountKey = await accountKeyBackup(nuperMe.account.id, 'correct-horse-789-new');
+  const resetFixtureDb = new DatabaseSync(join(dataDir, 'glean-auth.sqlite'));
+  const aliceAccountId = Number((await alice('/auth/me')).account.id);
+  const dmFixtureId = Number(resetFixtureDb.prepare("INSERT INTO conversations (kind, created_at) VALUES ('direct', ?) RETURNING id").get(new Date().toISOString()).id);
+  resetFixtureDb.prepare('INSERT INTO conversation_members (conversation_id, user_id, joined_at) VALUES (?, ?, ?)').run(dmFixtureId, nuperMe.account.id, new Date().toISOString());
+  resetFixtureDb.prepare('INSERT INTO conversation_members (conversation_id, user_id, joined_at) VALUES (?, ?, ?)').run(dmFixtureId, aliceAccountId, new Date().toISOString());
+  const dmFixtureMessageId = Number(resetFixtureDb.prepare('INSERT INTO messages (conversation_id, sender_id, body, created_at) VALUES (?, ?, ?, ?) RETURNING id').get(dmFixtureId, nuperMe.account.id, 'old direct message', new Date().toISOString()).id);
+  const dmFixtureFile = 'dm-reset-fixture-attachment.bin';
+  writeFileSync(join(dataDir, 'uploads', dmFixtureFile), 'old dm attachment');
+  resetFixtureDb.prepare('INSERT INTO message_attachments (message_id, conversation_id, uploaded_by, storage_name, original_name, mime_type, size_bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(dmFixtureMessageId, dmFixtureId, nuperMe.account.id, dmFixtureFile, 'old.bin', 'application/octet-stream', 17, new Date().toISOString());
+  const serverMessagesBeforeDmReset = Number(resetFixtureDb.prepare('SELECT COUNT(*) AS count FROM channel_messages').get().count);
+  resetFixtureDb.close();
+  const resetIV = webcrypto.getRandomValues(new Uint8Array(12));
+  const resetVaultEnvelope = { version: 1, iv: Buffer.from(resetIV).toString('base64url'), ciphertext: Buffer.from(webcrypto.getRandomValues(new Uint8Array(64))).toString('base64url') };
+  const resetAccountResult = await nuper('/e2ee/reset', { method: 'POST', body: JSON.stringify({
+    password: 'correct-horse-789-new', revision: 0, publicKey: resetAccountKey.publicKey, fingerprint: resetAccountKey.fingerprint,
+    envelope: resetVaultEnvelope,
+    accountKeyBackup: { revision: 2, publicKey: resetAccountKey.publicKey, fingerprint: resetAccountKey.fingerprint, backup: resetAccountKey.backup },
+    deleteDirectMessages: true,
+  }) });
+  const resetAccountBackup = await nuper('/e2ee/profile-key');
+  if (!resetAccountResult.ok || resetAccountResult.directMessagesDeleted !== true || resetAccountBackup.revision !== 3 || fingerprint(resetAccountBackup.publicKey) !== resetAccountKey.fingerprint) throw new Error('Nuper key reset did not atomically update the account-bound backup and delete DMs.');
+  const resetVerifyDb = new DatabaseSync(join(dataDir, 'glean-auth.sqlite'));
+  const oldDmStillExists = resetVerifyDb.prepare('SELECT 1 FROM conversations WHERE id = ?').get(dmFixtureId)
+    || resetVerifyDb.prepare('SELECT 1 FROM messages WHERE id = ?').get(dmFixtureMessageId)
+    || resetVerifyDb.prepare('SELECT 1 FROM message_attachments WHERE storage_name = ?').get(dmFixtureFile);
+  const serverMessagesAfterDmReset = Number(resetVerifyDb.prepare('SELECT COUNT(*) AS count FROM channel_messages').get().count);
+  resetVerifyDb.close();
+  if (oldDmStillExists || existsSync(join(dataDir, 'uploads', dmFixtureFile))) throw new Error('Nuper DM reset did not fully remove direct conversations and their uploaded files.');
+  if (serverMessagesAfterDmReset !== serverMessagesBeforeDmReset) throw new Error('Nuper DM reset changed server-channel messages.');
   const initialNuperServers = await nuper('/servers');
   const official = initialNuperServers.servers.find((item) => item.officialAnnouncements);
   if (!official || official.name !== 'Glean') throw new Error('Official Glean server missing.');

@@ -9,6 +9,7 @@ import DisplayName from '../dm/DisplayName';
 import CustomBadges from '../dm/CustomBadges';
 import ChannelPoll from './ChannelPoll';
 import EmojiPicker from '../dm/EmojiPicker';
+import { MoreIcon } from '../dm/icons';
 
 function messageId(value) {
   return Number(value?.id ?? value);
@@ -46,6 +47,11 @@ const ChannelMessageRow = memo(function ChannelMessageRow({
   const canDelete = isAuthor || canModerate;
   const grouped = isGroupedMessage(previous, message);
   const id = messageId(message);
+  const saved = Number.isFinite(id) && id > 0;
+  const hasActions = saved && ((!inspecting && canPost) || (canEdit && canPost) || canDelete);
+  const [actionsOpen, setActionsOpen] = useState(false);
+  const actionsButton = useRef(null);
+  const act = (callback) => { setActionsOpen(false); callback(); };
   const pickerRef = useRef(null);
   const [pickerPlacement, setPickerPlacement] = useState('below');
   const pickerOpen = Number(reactionPickerId) === id;
@@ -68,29 +74,23 @@ const ChannelMessageRow = memo(function ChannelMessageRow({
   return (
     <div className="community-message-row">
       {shouldShowDivider(previous, message) ? <div className="community-date-divider"><span>{formatDateDivider(message.createdAt)}</span></div> : null}
-      <article className={`community-message${grouped ? ' is-grouped' : ''}${messageMentionsUser(message.body, accountUsername) ? ' is-mentioned' : ''}`} id={Number.isFinite(id) ? `m-${id}` : undefined}>
-        {grouped ? <span className="community-avatar-spacer" /> : <CommunityAvatar user={message.author} onContextMenu={(event) => onModerationContextMenu?.(event, message.author)} />}
+      <article className={`community-message${grouped ? ' is-grouped' : ''}${actionsOpen ? ' has-open-actions' : ''}${messageMentionsUser(message.body, accountUsername) ? ' is-mentioned' : ''}`} id={Number.isFinite(id) ? `m-${id}` : undefined} onKeyDown={(event) => {
+        if (event.key === 'Escape' && actionsOpen) { event.stopPropagation(); setActionsOpen(false); actionsButton.current?.focus(); }
+      }}>
+        {grouped ? <span className="community-avatar-spacer"><time dateTime={message.createdAt}>{formatMessageTime(message.createdAt)}</time></span> : <CommunityAvatar user={message.author} onContextMenu={(event) => onModerationContextMenu?.(event, message.author)} />}
         <div className="community-message-body">
+          {hasActions ? <button ref={actionsButton} type="button" className="community-message-tools-toggle" aria-label="Message actions" aria-expanded={actionsOpen} aria-controls={`server-message-actions-${id}`} onClick={() => setActionsOpen(value => !value)}><MoreIcon /></button> : null}
           {grouped ? null : (
             <div className="community-message-meta">
               <div className="dm-message-author-line">
                 <button type="button" className="dm-message-author" onClick={(event) => onOpenAuthor(message.author, event.currentTarget)}><DisplayName user={message.author} /></button>
                 <CustomBadges badges={message.author.customBadges} inline />
+                {message.author.isBot ? <span className="community-bot-badge">BOT</span> : null}
               </div>
               <time dateTime={message.createdAt}>{formatMessageTime(message.createdAt)}</time>
               {message.editedAt ? <small className="community-edited-label">edited</small> : null}
             </div>
           )}
-          <MessageHoverActions
-            canReply={!inspecting && canPost && Number.isFinite(id)}
-            canReact={!inspecting && canPost && Number.isFinite(id)}
-            canEdit={canEdit && canPost && Number.isFinite(id)}
-            canDelete={canDelete && Number.isFinite(id)}
-            onReply={() => onReply(message)}
-            onReact={() => onOpenReactions(Number(reactionPickerId) === id ? null : id)}
-            onEdit={() => onEdit(message)}
-            onDelete={() => onDelete(message)}
-          />
           {isEditing ? (
             <form className="community-edit-form" onSubmit={(event) => onSubmitEdit(event, message)}>
               <textarea value={editDraft} onChange={(event) => onEditDraft(event.target.value)} maxLength="4000" autoFocus aria-label="Edit message" />
@@ -119,6 +119,19 @@ const ChannelMessageRow = memo(function ChannelMessageRow({
               {pickerOpen ? <span ref={pickerRef} className={`community-reaction-picker${pickerPlacement === 'above' ? ' is-above' : ''}`}><EmojiPicker onPick={(emoji) => { onToggleReaction(message, emoji); onOpenReactions(null); }} /></span> : null}
             </div>
           )}
+          {message.status === 'sending' ? <small className="community-message-pending" role="status">Sending…</small> : null}
+          <div id={`server-message-actions-${id}`} className="community-message-tools">
+            <MessageHoverActions
+              canReply={!inspecting && canPost && saved}
+              canReact={!inspecting && canPost && saved}
+              canEdit={canEdit && canPost && saved}
+              canDelete={canDelete && saved}
+              onReply={() => act(() => onReply(message))}
+              onReact={() => act(() => onOpenReactions(pickerOpen ? null : id))}
+              onEdit={() => act(() => onEdit(message))}
+              onDelete={() => act(() => onDelete(message))}
+            />
+          </div>
         </div>
       </article>
     </div>
@@ -160,7 +173,7 @@ function ChannelTranscript({
   handlersRef.current = { onOpenAuthor, onModerationContextMenu, onReply, onEdit, onDelete, onEditDraft, onSubmitEdit, onCancelEdit, onToggleReaction, onOpenReactions, onVotePoll, onClosePoll };
   const stableHandlers = useMemo(() => Object.fromEntries(MESSAGE_CALLBACKS.map((name) => [name, (...args) => handlersRef.current[name]?.(...args)])), []);
   if (isLoading) {
-    return <div className="community-chat-loading"><span className="community-spinner" />Loading messages…</div>;
+    return <div role="status" aria-label="Loading messages">{Array.from({ length: 6 }, (_, index) => <div key={index} className="community-message-skeleton" aria-hidden="true"><i /><span><b /><b /></span></div>)}</div>;
   }
   if (loadError) {
     return <div className="dm-history-error" role="alert"><p>{loadError}</p><button type="button" onClick={onRetry}>Try again</button></div>;

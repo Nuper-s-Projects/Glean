@@ -1,5 +1,6 @@
 import { createHash, createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { DatabaseSync } from 'node:sqlite';
 import { createServer } from 'node:http';
 import { extname, join, resolve, sep } from 'node:path';
@@ -16,11 +17,18 @@ import { normalizeDiscordUsername, publicDiscordUsername } from './src/app/disco
 import { normalizeSocialUrl, normalizeSocialUsername } from './src/app/socialLinks.js';
 import { NAME_FONT_IDS } from './src/features/dm/nameFonts.js';
 import { parseMultipart, sendLocalFile } from './server/files.mjs';
+import { readProfileBackgroundImage } from './server/profileBackground.mjs';
+import { PROFILE_BACKGROUND_URL, profileImageAdjustments } from './src/app/profileBackground.js';
+import { MAIN_THEME_IMAGE_URL, normalizeMainThemes } from './src/app/mainTheme.js';
+import { createMainThemeService } from './server/mainThemes.mjs';
+import { createServerModelService } from './server/serverModel.mjs';
+import { createServerCategories } from './server/serverCategories.mjs';
 import { applySecurityHeaders, isSameOriginRequest, pruneRateLimits, requestId, takeRateLimit } from './server/security.mjs';
 import { createRealtimeHub } from './server/realtime.mjs';
 import { createPushService } from './server/push.mjs';
 import { createScheduledNotifications } from './server/scheduledNotifications.mjs';
 import { createOfficialAnnouncements } from './server/officialAnnouncements.mjs';
+import { applyNuraMoodDelta, buildNuraMessages, formatNuraMoodContext, NURA_IMAGE_TYPES, NURA_MAX_IMAGE_BYTES, NURA_MAX_IMAGES, requestNuraReply } from './server/nura.mjs';
 import { getManagedSchoolAccessState, getSchoolAccessState } from './server/schoolSchedule.mjs';
 import { createAppService } from './server/apps.mjs';
 import { createLoopService } from './server/loop.mjs';
@@ -274,6 +282,25 @@ database.exec(`
     kind TEXT NOT NULL DEFAULT 'text' CHECK(kind = 'text'),
     position INTEGER NOT NULL DEFAULT 0
   ) STRICT;
+  CREATE TABLE IF NOT EXISTS server_bot_installs (
+    server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+    bot_key TEXT NOT NULL,
+    bot_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    installed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    installed_at TEXT NOT NULL,
+    PRIMARY KEY (server_id, bot_key),
+    UNIQUE (server_id, bot_user_id)
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS server_bot_channels (
+    server_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL REFERENCES server_channels(id) ON DELETE CASCADE,
+    bot_key TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0, 1)),
+    activated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (channel_id, bot_key),
+    FOREIGN KEY (server_id, bot_key) REFERENCES server_bot_installs(server_id, bot_key) ON DELETE CASCADE
+  ) STRICT;
   CREATE TABLE IF NOT EXISTS server_audit_log (
     id INTEGER PRIMARY KEY,
     server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
@@ -367,6 +394,12 @@ if (!serverChannelColumns.some((column) => column.name === 'channel_kind')) data
 if (!serverChannelColumns.some((column) => column.name === 'locked')) database.exec('ALTER TABLE server_channels ADD COLUMN locked INTEGER NOT NULL DEFAULT 0');
 if (!serverChannelColumns.some((column) => column.name === 'slowmode')) database.exec('ALTER TABLE server_channels ADD COLUMN slowmode INTEGER NOT NULL DEFAULT 0');
 if (!serverChannelColumns.some((column) => column.name === 'topic')) database.exec("ALTER TABLE server_channels ADD COLUMN topic TEXT NOT NULL DEFAULT ''");
+const serverCategories = createServerCategories({
+  database, withTransaction, readJson, sendJson,
+  authorize: (user, id) => Boolean(findServerById.get(id)) && canServerPermission(user, id, 'manageChannels'),
+  notify: (...args) => notifyServerMembers(...args),
+  audit: (...args) => writeServerAudit(...args),
+});
 database.exec(`
   CREATE TABLE IF NOT EXISTS server_timeouts (
     server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
@@ -432,6 +465,7 @@ if (!existingUserColumns.some((column) => column.name === 'private_notes_enabled
 if (!existingUserColumns.some((column) => column.name === 'presence_status')) database.exec("ALTER TABLE users ADD COLUMN presence_status TEXT NOT NULL DEFAULT 'auto'");
 if (!existingUserColumns.some((column) => column.name === 'avatar_url')) database.exec('ALTER TABLE users ADD COLUMN avatar_url TEXT');
 if (!existingUserColumns.some((column) => column.name === 'public_key_jwk')) database.exec('ALTER TABLE users ADD COLUMN public_key_jwk TEXT');
+if (!existingUserColumns.some((column) => column.name === 'is_bot')) database.exec('ALTER TABLE users ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0 CHECK(is_bot IN (0, 1))');
 if (!existingUserColumns.some((column) => column.name === 'key_fingerprint')) database.exec('ALTER TABLE users ADD COLUMN key_fingerprint TEXT');
 if (!existingUserColumns.some((column) => column.name === 'is_admin')) database.exec('ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0');
 if (!existingUserColumns.some((column) => column.name === 'banner_json')) database.exec('ALTER TABLE users ADD COLUMN banner_json TEXT');
@@ -467,6 +501,7 @@ if (!existingUserColumns.some((column) => column.name === 'accessibility_glass_f
 if (!existingUserColumns.some((column) => column.name === 'accessibility_glass_depth')) database.exec('ALTER TABLE users ADD COLUMN accessibility_glass_depth INTEGER NOT NULL DEFAULT 20 CHECK(accessibility_glass_depth BETWEEN 0 AND 100)');
 if (!existingUserColumns.some((column) => column.name === 'accessibility_glass_refraction')) database.exec('ALTER TABLE users ADD COLUMN accessibility_glass_refraction INTEGER NOT NULL DEFAULT 100 CHECK(accessibility_glass_refraction BETWEEN 0 AND 100)');
 if (!existingUserColumns.some((column) => column.name === 'accessibility_theme')) database.exec("ALTER TABLE users ADD COLUMN accessibility_theme TEXT NOT NULL DEFAULT 'system' CHECK(accessibility_theme IN ('system', 'light', 'dark'))");
+if (!existingUserColumns.some((column) => column.name === 'main_theme_json')) database.exec('ALTER TABLE users ADD COLUMN main_theme_json TEXT');
 if (!existingUserColumns.some((column) => column.name === 'agreement_prompted_at')) database.exec('ALTER TABLE users ADD COLUMN agreement_prompted_at TEXT');
 const migrateProgramFromSchool = database.prepare("SELECT id, school, program_json FROM users WHERE school IN ('magnet', 'laredo-college')");
 const writeMigratedProgram = database.prepare('UPDATE users SET program_json = ?, school = NULL WHERE id = ?');
@@ -537,10 +572,19 @@ database.exec(`CREATE TABLE IF NOT EXISTS e2ee_key_history (
   envelope TEXT,
   archived_at TEXT NOT NULL
 ) STRICT; CREATE INDEX IF NOT EXISTS e2ee_key_history_user_index ON e2ee_key_history(user_id, id)`);
+database.exec(`CREATE TABLE IF NOT EXISTS e2ee_profile_key_backups (
+  user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  revision INTEGER NOT NULL,
+  backup TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+) STRICT`);
 const readSyncVault = database.prepare('SELECT revision, envelope, active_public_key FROM e2ee_sync_vaults WHERE user_id = ?');
 const createSyncVault = database.prepare('INSERT OR IGNORE INTO e2ee_sync_vaults VALUES (?, 1, ?, ?)');
 const replaceSyncVault = database.prepare('UPDATE e2ee_sync_vaults SET revision = revision + 1, envelope = ?, active_public_key = ? WHERE user_id = ? AND revision = ?');
 const archiveSyncVault = database.prepare('INSERT INTO e2ee_key_history (user_id, fingerprint, public_key, envelope, archived_at) VALUES (?, ?, ?, ?, ?)');
+const readProfileKeyBackup = database.prepare('SELECT revision, backup FROM e2ee_profile_key_backups WHERE user_id = ?');
+const createProfileKeyBackup = database.prepare('INSERT OR IGNORE INTO e2ee_profile_key_backups (user_id, revision, backup, updated_at) VALUES (?, 1, ?, ?)');
+const replaceProfileKeyBackup = database.prepare('UPDATE e2ee_profile_key_backups SET revision = revision + 1, backup = ?, updated_at = ? WHERE user_id = ? AND revision = ?');
 database.exec('CREATE INDEX IF NOT EXISTS server_members_user_sort_index ON server_members(user_id, sort_order, server_id)');
 database.exec('CREATE INDEX IF NOT EXISTS channel_message_mentions_message_index ON channel_message_mentions(message_id)');
 database.exec('CREATE INDEX IF NOT EXISTS channel_messages_live_id_index ON channel_messages(channel_id, id) WHERE deleted_at IS NULL');
@@ -660,8 +704,9 @@ const findUserByEmail = database.prepare('SELECT * FROM users WHERE email = ?');
 const findUserById = database.prepare('SELECT * FROM users WHERE id = ?');
 const findKeepInformationSecret = database.prepare('SELECT keep_information_secret FROM users WHERE id = ?');
 const findUserByUsername = database.prepare('SELECT id FROM users WHERE username = ? COLLATE NOCASE');
+const findNuraAccount = database.prepare('SELECT id, email, is_bot FROM users WHERE username = ? COLLATE NOCASE');
 const findUserBySession = database.prepare(`
-  SELECT users.id, users.email, users.username, users.bio, users.custom_badges_json, users.private_notes_enabled, users.presence_status, users.avatar_url, users.banner_json, users.profile_background_json, users.name_style_json, users.public_key_jwk, users.key_fingerprint, users.created_at, users.last_visited_at, users.presence_hidden, users.keep_information_secret, users.show_inspect_servers, users.grade, users.school, users.program_json, users.discord_username, users.instagram_url, users.instagram_username, users.tiktok_url, users.tiktok_username, users.social_prompt_seen, users.accessibility_contrast, users.accessibility_saturation, users.accessibility_reduce_motion, users.accessibility_glass_frost, users.accessibility_glass_depth, users.accessibility_glass_refraction, users.accessibility_theme, users.agreement_prompted_at
+  SELECT users.main_theme_json, users.id, users.email, users.username, users.bio, users.custom_badges_json, users.private_notes_enabled, users.presence_status, users.avatar_url, users.banner_json, users.profile_background_json, users.name_style_json, users.public_key_jwk, users.key_fingerprint, users.created_at, users.last_visited_at, users.presence_hidden, users.keep_information_secret, users.show_inspect_servers, users.grade, users.school, users.program_json, users.discord_username, users.instagram_url, users.instagram_username, users.tiktok_url, users.tiktok_username, users.social_prompt_seen, users.accessibility_contrast, users.accessibility_saturation, users.accessibility_reduce_motion, users.accessibility_glass_frost, users.accessibility_glass_depth, users.accessibility_glass_refraction, users.accessibility_theme, users.agreement_prompted_at
   FROM sessions JOIN users ON users.id = sessions.user_id
   WHERE sessions.token_hash = ? AND sessions.expires_at > ?
 `);
@@ -704,7 +749,7 @@ const findSessionTokenByPublicId = database.prepare('SELECT token_hash FROM sess
 for (const row of database.prepare("SELECT token_hash FROM sessions WHERE public_id IS NULL OR public_id = ''").all()) {
   updateSessionPublicId.run(randomBase32(12), row.token_hash);
 }
-const findPublicUserByUsername = database.prepare('SELECT id, username, public_key_jwk, key_fingerprint FROM users WHERE username = ? COLLATE NOCASE');
+const findPublicUserByUsername = database.prepare('SELECT id, username, public_key_jwk, key_fingerprint, is_bot FROM users WHERE username = ? COLLATE NOCASE');
 const updateUserPublicKey = database.prepare('UPDATE users SET public_key_jwk = ?, key_fingerprint = ? WHERE id = ?');
 const findFriendship = database.prepare('SELECT 1 FROM friendships WHERE user_one_id = ? AND user_two_id = ?');
 const deleteFriendship = database.prepare('DELETE FROM friendships WHERE user_one_id = ? AND user_two_id = ?');
@@ -726,8 +771,59 @@ const findExistingRequest = database.prepare(`
 const findIncomingRequest = database.prepare('SELECT id, sender_id FROM friend_requests WHERE id = ? AND receiver_id = ? AND status = \'pending\'');
 const updateFriendRequestAccepted = database.prepare('UPDATE friend_requests SET status = \'accepted\' WHERE id = ?');
 const insertFriendship = database.prepare('INSERT OR IGNORE INTO friendships (user_one_id, user_two_id, created_at) VALUES (?, ?, ?)');
+const setUserAsBot = database.prepare("UPDATE users SET is_bot = 1, bio = 'hi! im nura, you can chat with me through dms!', presence_status = 'online', public_key_jwk = NULL, key_fingerprint = NULL WHERE id = ?");
+const nuraAccount = findNuraAccount.get('Nura');
+if (nuraAccount && (Number(nuraAccount.is_bot) !== 1 || nuraAccount.email !== 'nura@bot.glean.internal')) {
+  throw new Error('Cannot create the Nura bot because the username Nura is already used by a regular Glean account.');
+}
+if (!nuraAccount) {
+  const createdAt = new Date().toISOString();
+  const id = Number(nextAccountId.get().id);
+  const salt = randomBytes(32).toString('base64url');
+  const unreachablePasswordHash = scryptSync(randomBytes(64), salt, 64).toString('base64url');
+  insertUser.run(id, 'nura@bot.glean.internal', unreachablePasswordHash, salt, 'Nura', createdAt, createdAt, null, null);
+  setUserAsBot.run(id);
+}
+const findNuraId = database.prepare("SELECT id FROM users WHERE username = 'Nura' COLLATE NOCASE AND is_bot = 1");
+const NURA_USER_ID = Number(findNuraId.get().id);
+database.prepare('UPDATE users SET avatar_url = ? WHERE id = ?').run('/nura-avatar.png', NURA_USER_ID);
+database.prepare('UPDATE users SET bio = ? WHERE id = ?').run('hi! im nura, you can chat with me through dms!', NURA_USER_ID);
+database.exec(`
+  CREATE TABLE IF NOT EXISTS nura_mood_state (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    energy REAL NOT NULL DEFAULT 5,
+    patience REAL NOT NULL DEFAULT 5,
+    happiness REAL NOT NULL DEFAULT 5,
+    stress REAL NOT NULL DEFAULT 3,
+    updated_at TEXT NOT NULL
+  ) STRICT;
+  INSERT OR IGNORE INTO nura_mood_state (id, updated_at) VALUES (1, '${new Date().toISOString()}');
+  CREATE TABLE IF NOT EXISTS nura_user_bonds (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    trust REAL NOT NULL DEFAULT 5,
+    affection REAL NOT NULL DEFAULT 5,
+    annoyance REAL NOT NULL DEFAULT 0,
+    last_event TEXT,
+    updated_at TEXT NOT NULL
+  ) STRICT;
+`);
+const readNuraMood = database.prepare('SELECT energy, patience, happiness, stress FROM nura_mood_state WHERE id = 1');
+const readNuraBond = database.prepare('SELECT trust, affection, annoyance, last_event FROM nura_user_bonds WHERE user_id = ?');
+const writeNuraMood = database.prepare('UPDATE nura_mood_state SET energy = ?, patience = ?, happiness = ?, stress = ?, updated_at = ? WHERE id = 1');
+const writeNuraBond = database.prepare(`
+  INSERT INTO nura_user_bonds (user_id, trust, affection, annoyance, last_event, updated_at)
+  VALUES (?, ?, ?, ?, ?, ?)
+  ON CONFLICT(user_id) DO UPDATE SET trust = excluded.trust, affection = excluded.affection,
+    annoyance = excluded.annoyance, last_event = COALESCE(excluded.last_event, nura_user_bonds.last_event), updated_at = excluded.updated_at
+`);
+const listNuraHistory = database.prepare(`
+  SELECT messages.body, messages.sender_id
+  FROM messages
+  WHERE messages.conversation_id = ? AND messages.deleted_at IS NULL AND messages.encryption_version = 0
+  ORDER BY messages.id DESC LIMIT 30
+`);
 const listFriends = database.prepare(`
-  SELECT users.id, users.username, users.avatar_url, users.name_style_json
+  SELECT users.id, users.username, users.avatar_url, users.name_style_json, users.is_bot
   FROM friendships
   JOIN users ON users.id = CASE WHEN friendships.user_one_id = ? THEN friendships.user_two_id ELSE friendships.user_one_id END
   WHERE friendships.user_one_id = ? OR friendships.user_two_id = ?
@@ -748,16 +844,17 @@ const listOutgoingRequests = database.prepare(`
 const deleteOutgoingRequest = database.prepare(`DELETE FROM friend_requests WHERE id = ? AND sender_id = ? AND status = 'pending'`);
 const deleteIncomingRequest = database.prepare(`DELETE FROM friend_requests WHERE id = ? AND receiver_id = ? AND status = 'pending'`);
 const findOutgoingRequest = database.prepare(`SELECT id, receiver_id FROM friend_requests WHERE id = ? AND sender_id = ? AND status = 'pending'`);
-const listUserCensus = database.prepare('SELECT grade, school, program_json, created_at FROM users WHERE username IS NOT NULL');
+const listUserCensus = database.prepare('SELECT grade, school, program_json, created_at FROM users WHERE username IS NOT NULL AND is_bot = 0');
 const listAnalyticsPeople = database.prepare(`
   SELECT id, username, avatar_url, grade, school, program_json, created_at
   FROM users
-  WHERE username IS NOT NULL AND id > ? AND instr(lower(username), lower(?)) > 0
+  WHERE username IS NOT NULL AND is_bot = 0 AND id > ? AND instr(lower(username), lower(?)) > 0
   ORDER BY id ASC
   LIMIT ?
 `);
-const listDiscoverPeople = database.prepare(`
-  WITH params AS (SELECT ? AS viewer_id, ? AS cursor, ? AS query, ? AS school, ? AS program, ? AS grade)
+const discoverPeopleSql = `
+  WITH params AS (SELECT ? AS viewer_id, ? AS query, ? AS school, ? AS program, ? AS grade, ? AS relation_filter, ? AS attributes),
+  directory AS (
   SELECT users.id, users.username, users.avatar_url, users.bio, users.grade, users.school, users.program_json, users.custom_badges_json,
     CASE
       WHEN friend.user_one_id IS NOT NULL THEN 'friend'
@@ -765,7 +862,13 @@ const listDiscoverPeople = database.prepare(`
       WHEN incoming.id IS NOT NULL THEN 'incoming'
       ELSE 'none'
     END AS relation,
-    COALESCE(outgoing.id, incoming.id) AS request_id
+    COALESCE(outgoing.id, incoming.id) AS request_id,
+    (users.school = 'vmt-magnet' OR EXISTS (
+      SELECT 1 FROM json_each(CASE WHEN json_valid(users.program_json) THEN users.program_json ELSE '[]' END) WHERE value = 'magnet'
+    )) AS magnet,
+    EXISTS (
+      SELECT 1 FROM json_each(CASE WHEN json_valid(users.program_json) THEN users.program_json ELSE '[]' END) WHERE value = 'laredo-college'
+    ) AS laredo_college
   FROM users CROSS JOIN params
   LEFT JOIN friendships friend
     ON (friend.user_one_id = params.viewer_id AND friend.user_two_id = users.id)
@@ -776,7 +879,7 @@ const listDiscoverPeople = database.prepare(`
     ON incoming.receiver_id = params.viewer_id AND incoming.sender_id = users.id AND incoming.status = 'pending'
   LEFT JOIN blocks blocked
     ON blocked.blocker_id = params.viewer_id AND blocked.blocked_id = users.id
-  WHERE users.username IS NOT NULL AND users.id != params.viewer_id AND users.id > params.cursor AND blocked.blocker_id IS NULL
+  WHERE users.username IS NOT NULL AND users.is_bot = 0 AND users.id != params.viewer_id AND blocked.blocker_id IS NULL
     AND (params.query = '' OR instr(lower(users.username), lower(params.query)) > 0 OR instr(lower(COALESCE(users.bio, '')), lower(params.query)) > 0)
     AND (params.school = '' OR users.school = params.school)
     AND (params.program = '' OR EXISTS (
@@ -784,23 +887,22 @@ const listDiscoverPeople = database.prepare(`
       WHERE selected_program.value = params.program
     ))
     AND (params.grade = '' OR users.grade = params.grade)
-  ORDER BY users.id ASC
-  LIMIT ?
-`);
-const countDiscoverPeople = database.prepare(`
-  WITH params AS (SELECT ? AS viewer_id, ? AS query, ? AS school, ? AS program, ? AS grade)
-  SELECT COUNT(*) AS total
-  FROM users CROSS JOIN params
-  LEFT JOIN blocks blocked
-    ON blocked.blocker_id = params.viewer_id AND blocked.blocked_id = users.id
-  WHERE users.username IS NOT NULL AND users.id != params.viewer_id AND blocked.blocker_id IS NULL
-    AND (params.query = '' OR instr(lower(users.username), lower(params.query)) > 0 OR instr(lower(COALESCE(users.bio, '')), lower(params.query)) > 0)
-    AND (params.school = '' OR users.school = params.school)
-    AND (params.program = '' OR EXISTS (
-      SELECT 1 FROM json_each(CASE WHEN json_valid(users.program_json) THEN users.program_json ELSE '[]' END) AS selected_program
-      WHERE selected_program.value = params.program
-    ))
-    AND (params.grade = '' OR users.grade = params.grade)
+  ), matches AS (
+    SELECT directory.* FROM directory CROSS JOIN params
+    WHERE (params.relation_filter = 'all'
+      OR (params.relation_filter = 'add' AND relation = 'none')
+      OR (params.relation_filter = 'friends' AND relation = 'friend')
+      OR (params.relation_filter = 'pending' AND relation IN ('incoming', 'outgoing')))
+    AND (params.attributes = ''
+      OR (instr(',' || params.attributes || ',', ',magnet,') > 0 AND magnet)
+      OR (instr(',' || params.attributes || ',', ',laredo-college,') > 0 AND laredo_college))
+  )
+`;
+const listDiscoverPeople = database.prepare(`${discoverPeopleSql} SELECT * FROM matches WHERE id > ? ORDER BY id ASC LIMIT ?`);
+const countDiscoverPeople = database.prepare(`${discoverPeopleSql}
+  SELECT COUNT(*) AS total, SUM(relation = 'none') AS to_add, SUM(relation = 'friend') AS friends,
+    SUM(relation IN ('incoming', 'outgoing')) AS pending, SUM(magnet) AS magnet, SUM(laredo_college) AS laredo_college,
+    (SELECT COUNT(*) FROM matches) AS matched_total FROM directory
 `);
 const findProfileByUsername = database.prepare(`
   SELECT users.id, users.username, users.avatar_url, users.banner_json, users.profile_background_json, users.name_style_json, users.bio, users.created_at, users.is_admin, users.grade, users.school, users.program_json, users.custom_badges_json, users.discord_username, users.instagram_url, users.instagram_username, users.tiktok_url, users.tiktok_username,
@@ -844,13 +946,13 @@ const listConversationPeerIdsForUser = database.prepare(`
   WHERE my_member.user_id = ? AND other_member.user_id != ?
 `);
 const findConversationPeer = database.prepare(`
-  SELECT users.id, users.username, users.avatar_url, users.public_key_jwk, users.key_fingerprint, users.custom_badges_json
+  SELECT users.id, users.username, users.avatar_url, users.public_key_jwk, users.key_fingerprint, users.custom_badges_json, users.is_bot
   FROM conversation_members JOIN users ON users.id = conversation_members.user_id
   WHERE conversation_members.conversation_id = ? AND users.id != ? LIMIT 1
 `);
 const listConversations = database.prepare(`
   SELECT conversations.id, other_user.id AS user_id, other_user.username, other_user.bio, other_user.avatar_url,
-    other_user.public_key_jwk, other_user.key_fingerprint, other_user.name_style_json, other_user.custom_badges_json,
+    other_user.public_key_jwk, other_user.key_fingerprint, other_user.name_style_json, other_user.custom_badges_json, other_user.is_bot,
     last_message.body AS last_message_body, last_message.ciphertext AS last_message_ciphertext, last_message.created_at AS last_message_at,
     last_message.id AS preview_id, last_message.sender_id AS preview_sender_id,
     last_message.iv AS preview_iv, last_message.salt AS preview_salt,
@@ -914,7 +1016,7 @@ const insertMessage = database.prepare(`
 `);
 const loadDirectMessageRow = database.prepare(`
   SELECT messages.id, messages.body, messages.ciphertext, messages.iv, messages.salt, messages.sender_public_key, messages.recipient_public_key,
-    messages.client_message_id, messages.encryption_version, messages.created_at, messages.edited_at, messages.reply_to_message_id,
+    messages.client_message_id, messages.encryption_version, messages.created_at, messages.edited_at, messages.reply_to_message_id, messages.deleted_at,
     users.id AS sender_id, users.username AS sender_username, users.avatar_url AS sender_avatar_url, users.name_style_json AS sender_name_style_json, users.custom_badges_json AS sender_custom_badges_json,
     reply.id AS reply_id, reply.body AS reply_body, reply.ciphertext AS reply_ciphertext, reply.deleted_at AS reply_deleted_at,
     reply.encryption_version AS reply_encryption_version, reply_user.username AS reply_username,
@@ -940,6 +1042,14 @@ const findDirectReplyParent = database.prepare(`
 `);
 const deleteMessage = database.prepare('DELETE FROM messages WHERE id = ?');
 const listConversationMemberIds = database.prepare('SELECT user_id FROM conversation_members WHERE conversation_id = ?');
+const listDirectMessageUploadsForUser = database.prepare(`
+  SELECT DISTINCT message_attachments.storage_name
+  FROM message_attachments
+  JOIN conversation_members ON conversation_members.conversation_id = message_attachments.conversation_id
+  WHERE conversation_members.user_id = ?
+`);
+const deleteDirectConversationsForUser = database.prepare('DELETE FROM conversations WHERE id IN (SELECT conversation_id FROM conversation_members WHERE user_id = ?)');
+const deleteDirectMessagePinsForUser = database.prepare('DELETE FROM conversation_pins WHERE user_id = ?');
 const markConversationRead = database.prepare(`
   UPDATE conversation_members SET last_read_message_id = CASE
     WHEN last_read_message_id IS NULL OR last_read_message_id < ? THEN ?
@@ -1051,13 +1161,14 @@ const listPublicServers = database.prepare(`
   ORDER BY member_count DESC, servers.id DESC
   LIMIT ? OFFSET ?
 `);
-const listUsersForAdmin = database.prepare('SELECT id, username, is_admin FROM users WHERE username IS NOT NULL');
+const listUsersForAdmin = database.prepare('SELECT id, username, is_admin FROM users WHERE username IS NOT NULL AND is_bot = 0');
+const countAuthServers = database.prepare('SELECT COUNT(*) AS count FROM servers');
 const setUserAdminFlag = database.prepare('UPDATE users SET is_admin = 1 WHERE id = ?');
 const findServerMember = database.prepare('SELECT server_members.role_id, server_roles.name AS role_name, server_roles.permissions, server_roles.permission_flags FROM server_members JOIN server_roles ON server_roles.id = server_members.role_id WHERE server_members.server_id = ? AND server_members.user_id = ?');
 const insertServerAudit = database.prepare('INSERT INTO server_audit_log (server_id, actor_user_id, actor_name, action, target_type, target_id, target_name, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
 const listServerAudit = database.prepare('SELECT id, actor_user_id AS actorUserId, actor_name AS actorName, action, target_type AS targetType, target_id AS targetId, target_name AS targetName, details_json AS detailsJson, created_at AS createdAt FROM server_audit_log WHERE server_id = ? AND id < ? ORDER BY id DESC LIMIT ?');
 const listServerMembers = database.prepare(`
-  SELECT users.id, users.username, users.avatar_url, users.bio, users.name_style_json, users.custom_badges_json, server_members.role_id, server_roles.name AS role_name, server_roles.color AS role_color, server_roles.permissions, server_roles.permission_flags, server_timeouts.until AS timeout_until
+  SELECT users.id, users.username, users.avatar_url, users.bio, users.name_style_json, users.custom_badges_json, users.is_bot, server_members.role_id, server_roles.name AS role_name, server_roles.color AS role_color, server_roles.permissions, server_roles.permission_flags, server_timeouts.until AS timeout_until
   FROM server_members
   JOIN users ON users.id = server_members.user_id
   JOIN server_roles ON server_roles.id = server_members.role_id
@@ -1066,7 +1177,7 @@ const listServerMembers = database.prepare(`
   ORDER BY server_roles.position DESC, users.username COLLATE NOCASE
 `);
 const listServerMembersPage = database.prepare(`
-  SELECT users.id, users.username, users.avatar_url, users.bio, users.name_style_json, users.custom_badges_json, server_members.role_id, server_roles.name AS role_name, server_roles.color AS role_color, server_roles.permissions, server_roles.permission_flags, server_timeouts.until AS timeout_until
+  SELECT users.id, users.username, users.avatar_url, users.bio, users.name_style_json, users.custom_badges_json, users.is_bot, server_members.role_id, server_roles.name AS role_name, server_roles.color AS role_color, server_roles.permissions, server_roles.permission_flags, server_timeouts.until AS timeout_until
   FROM server_members
   JOIN users ON users.id = server_members.user_id
   JOIN server_roles ON server_roles.id = server_members.role_id
@@ -1078,11 +1189,25 @@ const listServerMembersPage = database.prepare(`
 const countServerMembers = database.prepare('SELECT COUNT(*) AS count FROM server_members WHERE server_id = ?');
 const countServerMembersByRole = database.prepare('SELECT role_id AS roleId, COUNT(*) AS count FROM server_members WHERE server_id = ? GROUP BY role_id');
 const listServerMemberIds = database.prepare('SELECT DISTINCT user_id FROM server_members WHERE server_id = ?');
-const listServerChannels = database.prepare('SELECT server_channels.id, name, kind, voice, position, channel_kind, locked, slowmode, topic, cleanup.interval_seconds AS cleanup_interval_seconds, cleanup.next_run_at AS cleanup_next_run_at FROM server_channels LEFT JOIN channel_message_cleanup_schedules cleanup ON cleanup.channel_id = server_channels.id WHERE server_id = ? ORDER BY position, id');
+const listServerChannels = database.prepare("SELECT server_channels.id, name, kind, voice, position, category_id, channel_kind, locked, slowmode, topic, cleanup.interval_seconds AS cleanup_interval_seconds, cleanup.next_run_at AS cleanup_next_run_at, bot_channels.active AS nura_active FROM server_channels LEFT JOIN channel_message_cleanup_schedules cleanup ON cleanup.channel_id = server_channels.id LEFT JOIN server_bot_channels bot_channels ON bot_channels.channel_id = server_channels.id AND bot_channels.bot_key = 'nura' WHERE server_channels.server_id = ? ORDER BY position, server_channels.id");
+const listNuraServerHistory = database.prepare(`
+  SELECT channel_messages.body, channel_messages.user_id, users.username, users.is_bot
+  FROM channel_messages JOIN users ON users.id = channel_messages.user_id
+  WHERE channel_messages.channel_id = ? AND channel_messages.deleted_at IS NULL
+  ORDER BY channel_messages.id DESC LIMIT 12
+`);
+const listInstalledServerBots = database.prepare('SELECT installs.bot_key AS id, users.username AS name, users.avatar_url AS avatar_url, installs.installed_at AS installed_at FROM server_bot_installs installs JOIN users ON users.id = installs.bot_user_id WHERE installs.server_id = ? ORDER BY installs.installed_at, installs.bot_key');
+const serverHasNura = database.prepare("SELECT 1 FROM server_bot_installs WHERE server_id = ? AND bot_key = 'nura'");
+const installServerBot = database.prepare('INSERT INTO server_bot_installs (server_id, bot_key, bot_user_id, installed_by, installed_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(server_id, bot_key) DO NOTHING');
+const uninstallServerBot = database.prepare('DELETE FROM server_bot_installs WHERE server_id = ? AND bot_key = ?');
+const findServerDefaultMemberRole = database.prepare("SELECT id FROM server_roles WHERE server_id = ? AND permissions = 'member' ORDER BY position ASC, id ASC LIMIT 1");
+const removeServerBotMember = database.prepare('DELETE FROM server_members WHERE server_id = ? AND user_id = ?');
+const upsertNuraChannelActivation = database.prepare("INSERT INTO server_bot_channels (server_id, channel_id, bot_key, active, activated_by, updated_at) VALUES (?, ?, 'nura', ?, ?, ?) ON CONFLICT(channel_id, bot_key) DO UPDATE SET active = excluded.active, activated_by = excluded.activated_by, updated_at = excluded.updated_at");
+const getNuraChannelActivation = database.prepare("SELECT active FROM server_bot_channels WHERE channel_id = ? AND bot_key = 'nura'");
 const listServerRoles = database.prepare('SELECT id, name, color, permissions, permission_flags, position FROM server_roles WHERE server_id = ? ORDER BY position DESC, id');
 const channelMessageSelect = `
   SELECT channel_messages.id, channel_messages.body, channel_messages.created_at, channel_messages.edited_at, channel_messages.reply_to_message_id, channel_messages.poll_json,
-    users.id AS user_id, users.username, users.avatar_url, users.bio, users.name_style_json, users.custom_badges_json,
+    users.id AS user_id, users.username, users.avatar_url, users.bio, users.name_style_json, users.custom_badges_json, users.is_bot,
     reply.id AS reply_id, reply.body AS reply_body, reply.deleted_at AS reply_deleted_at, reply.poll_json AS reply_poll_json, reply_user.username AS reply_username
   FROM channel_messages
   JOIN users ON users.id = channel_messages.user_id
@@ -1185,13 +1310,14 @@ const listServerDeviceBans = database.prepare(`SELECT server_device_bans.device_
   COALESCE(users.username,'Deleted user') AS banned_by FROM server_device_bans
   LEFT JOIN users ON users.id=server_device_bans.created_by WHERE server_device_bans.server_id=? ORDER BY server_device_bans.created_at DESC`);
 const isChannelMember = database.prepare('SELECT 1 FROM server_members JOIN server_channels ON server_channels.server_id = server_members.server_id WHERE server_channels.id = ? AND server_members.user_id = ?');
-const findChannel = database.prepare('SELECT server_channels.id, server_channels.server_id, server_channels.name, server_channels.voice, server_channels.position, server_channels.channel_kind, server_channels.locked, server_channels.slowmode, server_channels.topic, servers.moderation_enabled FROM server_channels JOIN servers ON servers.id = server_channels.server_id WHERE server_channels.id = ?');
+const findChannel = database.prepare('SELECT server_channels.id, server_channels.server_id, server_channels.name, server_channels.voice, server_channels.position, server_channels.category_id, server_channels.channel_kind, server_channels.locked, server_channels.slowmode, server_channels.topic, servers.moderation_enabled FROM server_channels JOIN servers ON servers.id = server_channels.server_id WHERE server_channels.id = ?');
+const updateChannelCategory = database.prepare('UPDATE server_channels SET category_id = ? WHERE id = ? AND server_id = ?');
 const officialAnnouncements = createOfficialAnnouncements(database);
 function isOfficialServerHidden() {
   return readPlatformSetting.get('official_server_hidden')?.value === '1';
 }
 const findLastChannelMessageAt = database.prepare('SELECT created_at FROM channel_messages WHERE channel_id = ? AND user_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1');
-const updateChannelSettings = database.prepare('UPDATE server_channels SET name = ?, topic = ?, locked = ?, slowmode = ?, channel_kind = ? WHERE id = ? AND server_id = ?');
+const updateChannelSettings = database.prepare('UPDATE server_channels SET name = ?, topic = ?, locked = ?, slowmode = ?, channel_kind = ?, voice = ? WHERE id = ? AND server_id = ?');
 const findServerTimeout = database.prepare('SELECT until FROM server_timeouts WHERE server_id = ? AND user_id = ?');
 const upsertServerTimeout = database.prepare(`
   INSERT INTO server_timeouts (server_id, user_id, until, reason, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)
@@ -1312,6 +1438,14 @@ function publicKeyMatchesStored(publicKey, rawPublicKey, fingerprint) {
     || typeof publicKey.x !== 'string' || typeof publicKey.y !== 'string') return false;
   const expected = storedPublicKeyFingerprint(rawPublicKey, fingerprint);
   return Boolean(expected && publicKeyFingerprint(publicKey) === expected);
+}
+
+function validAccountKeyBackup(value) {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value)
+    && value.version === 1 && value.kdf === 'PBKDF2-SHA256' && value.iterations === 600_000
+    && typeof value.salt === 'string' && /^[A-Za-z0-9_-]{22}$/.test(value.salt)
+    && typeof value.iv === 'string' && /^[A-Za-z0-9_-]{16}$/.test(value.iv)
+    && typeof value.ciphertext === 'string' && /^[A-Za-z0-9_-]{22,90000}$/.test(value.ciphertext));
 }
 
 function parseCookies(request) {
@@ -1637,6 +1771,13 @@ function publicBanner(raw, imageUrlTest = BANNER_URL) {
 }
 
 function publicProfileBackground(raw) {
+  let data = raw;
+  if (typeof raw === 'string') {
+    try { data = JSON.parse(raw); } catch { return null; }
+  }
+  if (data?.kind === 'image' && typeof data.imageUrl === 'string' && PROFILE_BACKGROUND_URL.test(data.imageUrl)) {
+    return { kind: 'image', imageUrl: data.imageUrl, ...profileImageAdjustments(data) };
+  }
   const background = publicBanner(raw);
   return background?.kind === 'solid' || background?.kind === 'gradient' ? background : null;
 }
@@ -1883,6 +2024,7 @@ function publicAccount(user) {
     avatarUrl: user.avatar_url || null,
     banner: publicBanner(user.banner_json),
     profileBackground: publicProfileBackground(user.profile_background_json),
+    mainThemes: normalizeMainThemes(user.main_theme_json),
     nameStyle: publicNameStyle(user.name_style_json),
     grade,
     gradeLabel: gradeLabel(grade),
@@ -2096,13 +2238,14 @@ function publicServerMember(item) {
     bio: item.bio || '',
     nameStyle: publicNameStyle(item.name_style_json),
     customBadges: publicCustomBadges(item.custom_badges_json),
+    isBot: Boolean(Number(item.is_bot)),
     roleId: Number(item.role_id),
     roleName: item.role_name,
     roleColor: item.role_color,
     permissions: item.permissions,
     permissionFlags: roleFlags(item),
     timeoutUntil: item.timeout_until && Date.parse(item.timeout_until) > Date.now() ? item.timeout_until : null,
-    presence: publicPresence(item.id),
+    presence: Number(item.is_bot) ? 'online' : publicPresence(item.id),
   };
 }
 
@@ -2235,10 +2378,12 @@ function publicChannel(row, unread = null) {
     slowmode: voice ? 0 : Number(row.slowmode || 0),
     topic: voice ? '' : String(row.topic || ''),
     position: Number(row.position || 0),
+    categoryId: row.category_id == null ? null : Number(row.category_id),
     messageCleanupIntervalSeconds: row.cleanup_interval_seconds == null ? 0 : Number(row.cleanup_interval_seconds),
     messageCleanupNextRunAt: row.cleanup_next_run_at || null,
     unreadCount: voice ? 0 : Number(unread?.unreadCount || 0),
     mentionCount: voice ? 0 : Number(unread?.mentionCount || 0),
+    nuraActive: Boolean(Number(row.nura_active)),
   };
 }
 
@@ -3108,7 +3253,7 @@ function channelMessagePayload(message, reactions = [], attachments = [], votes 
     createdAt: message.created_at,
     editedAt: message.edited_at || null,
     replyTo: channelReplySnippet(message),
-    author: { id: Number(message.user_id), username: message.username, avatarUrl: message.avatar_url || null, bio: message.bio || '', nameStyle: publicNameStyle(message.name_style_json), customBadges: publicCustomBadges(message.custom_badges_json) },
+    author: { id: Number(message.user_id), username: message.username, avatarUrl: message.avatar_url || null, bio: message.bio || '', isBot: Boolean(Number(message.is_bot)), nameStyle: publicNameStyle(message.name_style_json), customBadges: publicCustomBadges(message.custom_badges_json) },
     reactions: reactions.map((reaction) => ({ emoji: reaction.emoji, count: Number(reaction.count), reacted: Boolean(reaction.reacted) })),
     attachments: attachments.map(channelAttachmentPayload),
     poll: publicPoll(message.poll_json, votes, viewerId),
@@ -3332,6 +3477,186 @@ function acceptFriendRequest(requestId, currentUserId, now) {
   return Number(request.sender_id);
 }
 
+const handleMainThemes = createMainThemeService({ database, uploadDirectory, requireSignedInUser, sendJson, readJson, sendLocalFile, takeRateLimit, randomBase32, removeStoredUploads, publicAccount });
+
+const modelMemberRows = database.prepare(`SELECT users.id, users.username, server_members.role_id AS roleId
+  FROM server_members JOIN users ON users.id = server_members.user_id WHERE server_members.server_id = ? ORDER BY users.username COLLATE NOCASE`);
+const modelRecentMessages = database.prepare(`SELECT channel_messages.id, channel_messages.channel_id AS channelId,
+  users.username, substr(channel_messages.body, 1, 300) AS body
+  FROM channel_messages JOIN server_channels ON server_channels.id = channel_messages.channel_id
+  JOIN users ON users.id = channel_messages.user_id
+  WHERE server_channels.server_id = ? AND channel_messages.deleted_at IS NULL ORDER BY channel_messages.id DESC LIMIT 40`);
+function serverModelContext(serverId, prompt = '', full = false) {
+  const members = modelMemberRows.all(serverId);
+  const named = members.filter((member) => prompt.toLowerCase().includes(member.username.toLowerCase()));
+  const selected = [...new Map([...named.slice(0, 200), ...members.slice(0, 40)].map((member) => [member.id, member])).values()];
+  return {
+    server: publicServerSummary(findServerById.get(serverId)),
+    roles: listServerRoles.all(serverId).map((role) => ({ ...role, permissionFlags: roleFlags(role) })),
+    channels: listServerChannels.all(serverId).map((channel) => publicChannel(channel)),
+    categories: serverCategories.list(serverId),
+    members: full ? members : selected, memberCount: members.length,
+    recentMessages: modelRecentMessages.all(serverId),
+  };
+}
+async function dispatchServerModelApi(parent, path, method, body) {
+  const bytes = Buffer.from(JSON.stringify(body || {}));
+  const request = Readable.from([bytes]);
+  request.method = method;
+  request.url = `${apiPrefix}${path}`;
+  request.headers = { ...parent.headers, 'content-type': 'application/json', 'content-length': String(bytes.length) };
+  delete request.headers['accept-encoding'];
+  request.socket = parent.socket;
+  let status = 500, payload = null;
+  const headers = new Map();
+  const response = {
+    req: request, destroyed: false, writableEnded: false,
+    setHeader: (name, value) => headers.set(name.toLowerCase(), value),
+    getHeader: (name) => headers.get(name.toLowerCase()),
+    writeHead: (code) => { status = code; },
+    end: (data) => { payload = JSON.parse(String(data)); response.writableEnded = true; },
+  };
+  await handleApi(request, response);
+  if (status >= 400 || !payload) throw new Error(payload?.error || 'The server could not apply this action.');
+  return payload;
+}
+const handleServerModel = createServerModelService({
+  database, readJson, sendJson, getContext: serverModelContext, callApi: dispatchServerModelApi,
+  authorize: (user, id) => {
+    const server = findServerById.get(id);
+    return Boolean(server && (Number(server.owner_id) === Number(user.id) || isNuperAdmin(user)));
+  },
+  takeLimit: (request, user, id) => takeRateLimit(request, `server-model:${user.id}:${id}`, 12, 60_000),
+  audit: (id, user, planId, results) => writeServerAudit(id, user, 'model.changes-applied', { targetType: 'server', targetId: id, targetName: findServerById.get(id)?.name || '', details: { planId, results } }),
+});
+
+async function answerWithNura(conversationId, userId, imageFiles) {
+  const sendTyping = (typing) => {
+    sendEvent(userId, 'typing', { conversationId, userId: NURA_USER_ID, username: 'Nura', typing });
+  };
+  sendTyping(true);
+  try {
+    const imageParts = imageFiles.map(({ mimeType, bytes }) => ({
+      type: 'image_url',
+      image_url: { url: `data:${mimeType};base64,${bytes.toString('base64')}` },
+    }));
+    const history = listNuraHistory.all(conversationId).reverse().map((message) => ({
+      role: Number(message.sender_id) === NURA_USER_ID ? 'assistant' : 'user',
+      content: String(message.body || '').slice(-4000) || (Number(message.sender_id) === NURA_USER_ID ? '' : 'What is in this image?'),
+    }));
+    let remaining = 24_000;
+    const boundedHistory = [];
+    for (const message of history.toReversed()) {
+      if (!remaining) break;
+      const content = message.content.slice(-Math.min(remaining, message.content.length));
+      if (content) boundedHistory.push({ ...message, content });
+      remaining -= content.length;
+    }
+    boundedHistory.reverse();
+    const user = findUserById.get(userId);
+    const currentUserMessage = [...boundedHistory].reverse().find((message) => message.role === 'user')?.content || '';
+    const currentMood = readNuraMood.get() || { energy: 5, patience: 5, happiness: 5, stress: 3 };
+    const currentBond = readNuraBond.get(userId) || { trust: 5, affection: 5, annoyance: 0, last_event: null };
+    const { mood: nextMood, bond: nextBond } = applyNuraMoodDelta(currentMood, currentBond, currentUserMessage);
+    const moodTimestamp = new Date().toISOString();
+    writeNuraMood.run(nextMood.energy, nextMood.patience, nextMood.happiness, nextMood.stress, moodTimestamp);
+    writeNuraBond.run(userId, nextBond.trust, nextBond.affection, nextBond.annoyance, nextBond.last_event, moodTimestamp);
+    const reply = await requestNuraReply({
+      apiKey: process.env.GROQ_API_KEY,
+      messages: buildNuraMessages(
+        boundedHistory,
+        user?.username || 'friend',
+        imageParts,
+        formatNuraMoodContext(nextMood, nextBond, user?.username || 'friend'),
+      ),
+    });
+    const now = new Date().toISOString();
+    const result = insertMessage.run(conversationId, NURA_USER_ID, reply, null, null, null, null, null, null, 0, now, null);
+    const responseMessage = directMessagePayload(loadDirectMessageRow.get(Number(result.lastInsertRowid)));
+    notifyDirectMessage(conversationId, responseMessage, NURA_USER_ID);
+  } catch (error) {
+    const fallback = error?.status === 429
+      ? 'groq is at its current rate limit. please try again shortly.'
+      : 'i couldn’t reach groq just now. please try again in a moment.';
+    try {
+      const now = new Date().toISOString();
+      const result = insertMessage.run(conversationId, NURA_USER_ID, fallback, null, null, null, null, null, null, 0, now, null);
+      const responseMessage = directMessagePayload(loadDirectMessageRow.get(Number(result.lastInsertRowid)));
+      notifyDirectMessage(conversationId, responseMessage, NURA_USER_ID);
+    } catch (storeError) {
+      console.error('Nura reply could not be stored:', storeError.message);
+    }
+  } finally {
+    sendTyping(false);
+  }
+}
+
+const nuraServerRepliesInFlight = new Set();
+
+async function postNuraServerMessage(channelId, serverId, body) {
+  const channel = findChannel.get(channelId);
+  if (!channel || Number(channel.server_id) !== Number(serverId)) return null;
+  let replyBody = String(body || '').trim().slice(0, 4000);
+  if (!replyBody) return null;
+  let moderationResult = null;
+  if (Number(channel.moderation_enabled) === 1) {
+    moderationResult = await moderateServerMessage(replyBody, moderationContext(channelId));
+    if (moderationResult.fallbackUsed) return null;
+    if (moderationResult?.action === 'block') {
+      auditModerationResult(channel, { id: NURA_USER_ID, username: 'Nura' }, 'blocked', moderationResult, channelId, 'bot-message');
+      replyBody = 'i can’t send that reply here because it was blocked by this server’s moderation settings.';
+      moderationResult = null;
+    }
+  }
+  const createdAt = new Date().toISOString();
+  const result = insertChannelMessage.run(channelId, NURA_USER_ID, replyBody, createdAt, null, null);
+  const messageId = Number(result.lastInsertRowid);
+  if (moderationResult && ['warn', 'flag'].includes(moderationResult.action)) auditModerationResult(channel, { id: NURA_USER_ID, username: 'Nura' }, moderationResult.action, moderationResult, messageId, 'bot-message');
+  const message = channelMessageFullPayload(channelId, messageId, NURA_USER_ID);
+  notifyChannelMessageCreated(serverId, { serverId: Number(serverId), channelId: Number(channelId), action: 'created', message }, NURA_USER_ID);
+  return message;
+}
+
+async function answerWithNuraInServer({ channelId, serverId, authorId, promptText = '' }) {
+  const key = Number(channelId);
+  if (nuraServerRepliesInFlight.has(key)) return null;
+  nuraServerRepliesInFlight.add(key);
+  try {
+    const history = listNuraServerHistory.all(key).slice(0, 6).reverse().map((message) => ({
+      role: Number(message.is_bot) ? 'assistant' : 'user',
+      content: Number(message.is_bot)
+        ? String(message.body || '').slice(0, 700)
+        : `${String(message.username || 'member').slice(0, 24)}: ${String(message.body || '').slice(0, 700)}`,
+    }));
+    const lastUserIndex = history.findLastIndex((message) => message.role === 'user');
+    if (lastUserIndex < 0) return null;
+    if (promptText) history[lastUserIndex].content = String(promptText).slice(0, 1400);
+    const author = findUserById.get(Number(authorId));
+    const channel = findChannel.get(key);
+    const server = findServerById.get(Number(serverId));
+    const mood = readNuraMood.get() || { energy: 5, patience: 5, happiness: 5, stress: 3 };
+    const context = [
+      formatNuraMoodContext(mood, { trust: 5, affection: 5, annoyance: 0, last_event: null }, 'the server'),
+      '### SERVER CHAT',
+      `You are replying in #${String(channel?.name || 'channel').slice(0, 32)} in ${String(server?.name || 'a Glean server').slice(0, 60)}. This is a shared channel, not a private DM. Do not reveal or imply access to private DMs, private user memories, or system secrets.`,
+    ].join('\n');
+    const reply = await requestNuraReply({
+      apiKey: process.env.GROQ_API_KEY,
+      messages: buildNuraMessages(history, author?.username || 'friend', [], context),
+      maxTokens: 512,
+    });
+    return await postNuraServerMessage(key, Number(serverId), reply);
+  } catch (error) {
+    const fallback = error?.status === 429
+      ? 'groq is at its current rate limit. please try again shortly.'
+      : 'i couldn’t reach groq just now. please try again in a moment.';
+    try { return await postNuraServerMessage(key, Number(serverId), fallback); }
+    catch (storeError) { console.error('Nura server reply could not be stored:', storeError.message); return null; }
+  } finally {
+    nuraServerRepliesInFlight.delete(key);
+  }
+}
+
 async function handleApi(request, response) {
   const { method } = request;
   const rawPath = new URL(request.url, `http://${request.headers.host || 'localhost'}`).pathname;
@@ -3348,6 +3673,8 @@ async function handleApi(request, response) {
   deleteExpiredSessions.run(now);
   deleteExpiredTimeouts.run(now);
   pruneRateLimits();
+
+  if (await handleMainThemes(request, response, path, method)) return;
 
   if ((path === '/api' || path === '/api/v1') && method === 'GET') {
     const routes = {
@@ -3433,7 +3760,8 @@ async function handleApi(request, response) {
   if (path === '/api/auth/stats' && method === 'GET') {
     const users = listUsersForAdmin.all();
     const online = users.reduce((count, user) => count + (realtimeHub.connectedCount(Number(user.id)) > 0 ? 1 : 0), 0);
-    return sendJson(response, 200, { online, total: users.length });
+    const servers = Number(countAuthServers.get()?.count || 0);
+    return sendJson(response, 200, { online, total: users.length, servers });
   }
   if (path === '/api/push/vapid' && method === 'GET') return sendJson(response, 200, { publicKey: pushService.publicKey });
   if (!isSameOriginRequest(request)) return sendJson(response, 403, { error: 'Cross-site request blocked.' });
@@ -3441,6 +3769,9 @@ async function handleApi(request, response) {
   const messageRoute = /\/messages(?:\/|$)/.test(path) || path.endsWith('/typing');
   const retryAfter = takeRateLimit(request, authRoute ? 'auth' : messageRoute ? 'messages' : 'api', authRoute ? 20 : messageRoute ? 240 : 600, 60_000);
   if (retryAfter) return sendJson(response, 429, { error: 'Too many requests. Try again shortly.' }, { 'Retry-After': String(retryAfter) });
+
+  if (await handleServerModel(request, response, path, method, user)) return;
+  if (await serverCategories.handle(request, response, path, method, user)) return;
 
   if (path === '/api/admin/access') {
     const admin = requireSignedInUser(request, response);
@@ -3725,8 +4056,37 @@ async function handleApi(request, response) {
     if (submittedHash.length !== storedHash.length || !timingSafeEqual(submittedHash, storedHash)) {
       return sendJson(response, 401, { error: 'That password is incorrect.' });
     }
+    const profileKeyBackup = input.profileKeyBackup;
+    const existingProfileBackup = readProfileKeyBackup.get(user.id);
+    const usesProfileKeyBackup = String(user.username || '').toLowerCase() === 'nuper';
+    if (usesProfileKeyBackup && (row.public_key_jwk || existingProfileBackup) && !profileKeyBackup) {
+      return sendJson(response, 409, { error: 'Update Glean before changing your password so your DM recovery backup stays usable.' });
+    }
+    let encodedProfileBackup = null;
+    if (profileKeyBackup) {
+      const currentFingerprint = storedPublicKeyFingerprint(row.public_key_jwk, row.key_fingerprint);
+      if (!Number.isSafeInteger(profileKeyBackup.revision) || profileKeyBackup.revision < 0
+        || !profileKeyBackup.publicKey || !publicKeyMatchesStored(profileKeyBackup.publicKey, row.public_key_jwk, row.key_fingerprint)
+        || String(profileKeyBackup.fingerprint || '').toLowerCase() !== currentFingerprint
+        || !validAccountKeyBackup(profileKeyBackup.backup)) return sendJson(response, 400, { error: 'The encrypted DM recovery backup is invalid. Your password was not changed.' });
+      if (Number(existingProfileBackup?.revision || 0) !== profileKeyBackup.revision) return sendJson(response, 409, { error: 'The DM recovery backup changed. Retry your password change.' });
+      encodedProfileBackup = JSON.stringify(profileKeyBackup.backup);
+    }
     const salt = randomBytes(16).toString('hex');
-    updatePassword.run(hashPassword(nextPassword, salt), salt, user.id);
+    try {
+      withTransaction(() => {
+        const backupResult = profileKeyBackup
+          ? profileKeyBackup.revision === 0
+            ? createProfileKeyBackup.run(user.id, encodedProfileBackup, now)
+            : replaceProfileKeyBackup.run(encodedProfileBackup, now, user.id, profileKeyBackup.revision)
+          : null;
+        if (profileKeyBackup && !backupResult?.changes) throw Object.assign(new Error('The DM recovery backup changed. Retry your password change.'), { code: 'E2EE_PROFILE_BACKUP_CONFLICT' });
+        updatePassword.run(hashPassword(nextPassword, salt), salt, user.id);
+      });
+    } catch (error) {
+      if (error.code === 'E2EE_PROFILE_BACKUP_CONFLICT') return sendJson(response, 409, { error: error.message });
+      throw error;
+    }
     const revoked = deleteOtherSessions.run(user.id, user.sessionHash);
     realtimeHub.dropUserExcept(user.id, user.sessionHash);
     return sendJson(response, 200, { ok: true, revoked: Number(revoked.changes || 0) });
@@ -3779,6 +4139,12 @@ async function handleApi(request, response) {
     if (avatarName) mediaNames.add(avatarName);
     const ownBannerName = bannerFileName(publicBanner(userRow.banner_json));
     if (ownBannerName) mediaNames.add(ownBannerName);
+    const backgroundName = publicProfileBackground(userRow.profile_background_json)?.imageUrl?.match(PROFILE_BACKGROUND_URL)?.[1];
+    if (backgroundName) mediaNames.add(backgroundName);
+    for (const theme of normalizeMainThemes(userRow.main_theme_json).custom) {
+      const themeName = theme.imageUrl?.match(MAIN_THEME_IMAGE_URL)?.[1];
+      if (themeName) mediaNames.add(themeName);
+    }
     for (const server of ownedServerRows) {
       const iconName = serverIconFileName(server.icon_url);
       const bannerName = bannerFileName(publicServerBanner(server.banner_json));
@@ -4027,11 +4393,26 @@ async function handleApi(request, response) {
       return sendJson(response, 401, { error: 'That password is incorrect.' });
     }
 
+    const accountKeyBackup = input.accountKeyBackup;
+    const isNuper = String(account.username || '').toLowerCase() === 'nuper';
+    if (isNuper && input.deleteDirectMessages !== true) return sendJson(response, 400, { error: 'Confirm that direct-message history should be deleted before resetting the account DM key.' });
+    if (input.deleteDirectMessages === true && !isNuper) return sendJson(response, 403, { error: 'Only the Nuper account can use the full DM reset.' });
+    const previousProfileBackup = readProfileKeyBackup.get(account.id);
+    if (isNuper && !accountKeyBackup) return sendJson(response, 400, { error: 'Refresh Glean before resetting your DM key so new devices can restore it.' });
+    if (accountKeyBackup && (!Number.isSafeInteger(accountKeyBackup.revision) || accountKeyBackup.revision < 0
+      || !publicKeyMatchesStored(accountKeyBackup.publicKey, JSON.stringify(publicKey), computedFingerprint)
+      || String(accountKeyBackup.fingerprint || '').toLowerCase() !== computedFingerprint
+      || !validAccountKeyBackup(accountKeyBackup.backup))) return sendJson(response, 400, { error: 'Invalid encrypted account DM key backup.' });
+    if (accountKeyBackup && Number(previousProfileBackup?.revision || 0) !== accountKeyBackup.revision) return sendJson(response, 409, { error: 'The account DM key backup changed. Refresh and retry.' });
+
     const encodedEnvelope = JSON.stringify({ version: 1, iv: envelope.iv, ciphertext: envelope.ciphertext });
+    const encodedAccountKeyBackup = accountKeyBackup ? JSON.stringify(accountKeyBackup.backup) : null;
     const encodedPublicKey = JSON.stringify(publicKey);
     const previousFingerprint = storedPublicKeyFingerprint(userRow.public_key_jwk, userRow.key_fingerprint);
     const previousVaultFingerprint = storedPublicKeyFingerprint(readSyncVault.get(account.id)?.active_public_key);
     const changed = [previousFingerprint, previousVaultFingerprint].some((value) => value && value !== computedFingerprint);
+    const dmAttachmentStorage = input.deleteDirectMessages === true ? listDirectMessageUploadsForUser.all(account.id).map((row) => row.storage_name) : [];
+    const dmPeerIds = input.deleteDirectMessages === true ? listConversationPeerIdsForUser.all(account.id, account.id).map((row) => Number(row.user_id)) : [];
     try {
       withTransaction(() => {
         const previousVault = readSyncVault.get(account.id);
@@ -4057,18 +4438,87 @@ async function handleApi(request, response) {
           throw conflict;
         }
         updateUserPublicKey.run(encodedPublicKey, computedFingerprint, account.id);
+        if (accountKeyBackup) {
+          const backupResult = accountKeyBackup.revision === 0
+            ? createProfileKeyBackup.run(account.id, encodedAccountKeyBackup, now)
+            : replaceProfileKeyBackup.run(encodedAccountKeyBackup, now, account.id, accountKeyBackup.revision);
+          if (!backupResult.changes) {
+            const conflict = new Error('The account DM key backup changed. Refresh and retry.');
+            conflict.code = 'E2EE_PROFILE_BACKUP_CONFLICT';
+            throw conflict;
+          }
+        }
+        // This operation is intentionally limited to direct conversations. Server
+        // channels/messages and all non-DM account data are outside this transaction.
+        if (input.deleteDirectMessages === true) {
+          deleteDirectConversationsForUser.run(account.id);
+          deleteDirectMessagePinsForUser.run(account.id);
+        }
       });
     } catch (error) {
       if (error.code === 'E2EE_RESET_CONFLICT') return sendJson(response, 409, { error: error.message });
+      if (error.code === 'E2EE_PROFILE_BACKUP_CONFLICT') return sendJson(response, 409, { error: error.message });
       throw error;
     }
 
+    removeStoredUploads(dmAttachmentStorage);
+
     if (changed) {
-      for (const conversation of listConversations.all(account.id, account.id)) {
-        sendEvent(conversation.user_id, 'key-changed', { userId: Number(account.id), fingerprint: computedFingerprint });
-      }
+      for (const peerId of dmPeerIds) sendEvent(peerId, 'key-changed', { userId: Number(account.id), fingerprint: computedFingerprint });
     }
-    return sendJson(response, 200, { ok: true, revision: revision + 1, fingerprint: computedFingerprint });
+    return sendJson(response, 200, { ok: true, revision: revision + 1, fingerprint: computedFingerprint, directMessagesDeleted: input.deleteDirectMessages === true });
+  }
+
+  if (path === '/api/e2ee/profile-key' && ['GET', 'PUT'].includes(method)) {
+    const user = requireSignedInUser(request, response);
+    if (!user) return;
+    if (String(user.username || '').toLowerCase() !== 'nuper') return sendJson(response, 404, { error: 'Account DM backup not found.' });
+    if (method === 'GET') {
+      const row = findUserById.get(user.id);
+      const backup = readProfileKeyBackup.get(user.id);
+      let publicKey = null;
+      try { publicKey = JSON.parse(String(row?.public_key_jwk || '')) || null; } catch { publicKey = null; }
+      return sendJson(response, 200, {
+        revision: Number(backup?.revision || 0),
+        backup: backup ? safeJsonParse(backup.backup) : null,
+        publicKey,
+        fingerprint: publicKey ? storedPublicKeyFingerprint(row?.public_key_jwk, row?.key_fingerprint) : null,
+      });
+    }
+    const retry = takeRateLimit(request, `e2ee-profile-key:${user.id}`, 20, 60_000);
+    if (retry) return sendJson(response, 429, { error: 'Too many account-key backup attempts.' }, { 'Retry-After': String(retry) });
+    let input;
+    try { input = await readJson(request, 100_000); } catch (error) { return sendJson(response, 400, { error: error.message }); }
+    const { revision, publicKey, fingerprint, backup } = input;
+    if (!Number.isSafeInteger(revision) || revision < 0 || !publicKey || publicKey.kty !== 'EC' || publicKey.crv !== 'P-256'
+      || !/^[A-Za-z0-9_-]{43}$/.test(publicKey.x || '') || !/^[A-Za-z0-9_-]{43}$/.test(publicKey.y || '')
+      || !validAccountKeyBackup(backup)) return sendJson(response, 400, { error: 'Invalid encrypted account-key backup.' });
+    const computedFingerprint = publicKeyFingerprint(publicKey);
+    if (typeof fingerprint !== 'string' || fingerprint.toLowerCase() !== computedFingerprint) return sendJson(response, 400, { error: 'Account-key fingerprint does not match.' });
+    const current = findUserById.get(user.id);
+    const currentFingerprint = storedPublicKeyFingerprint(current?.public_key_jwk, current?.key_fingerprint);
+    if (currentFingerprint && currentFingerprint !== computedFingerprint) return sendJson(response, 409, { error: 'This device does not have the active Glean message key.' });
+    const previous = readProfileKeyBackup.get(user.id);
+    if (Number(previous?.revision || 0) !== revision) return sendJson(response, 409, { error: 'The account key backup changed on another device. Sign in again and retry.' });
+    const encodedBackup = JSON.stringify(backup);
+    try {
+      withTransaction(() => {
+        const latestUser = findUserById.get(user.id);
+        const latestFingerprint = storedPublicKeyFingerprint(latestUser?.public_key_jwk, latestUser?.key_fingerprint);
+        if (latestFingerprint && latestFingerprint !== computedFingerprint) throw Object.assign(new Error('This device does not have the active Glean message key.'), { code: 'E2EE_PROFILE_KEY_MISMATCH' });
+        const latestBackup = readProfileKeyBackup.get(user.id);
+        if (Number(latestBackup?.revision || 0) !== revision) throw Object.assign(new Error('The account key backup changed on another device. Sign in again and retry.'), { code: 'E2EE_PROFILE_BACKUP_CONFLICT' });
+        if (!latestFingerprint) updateUserPublicKey.run(JSON.stringify(publicKey), computedFingerprint, user.id);
+        const result = revision === 0
+          ? createProfileKeyBackup.run(user.id, encodedBackup, now)
+          : replaceProfileKeyBackup.run(encodedBackup, now, user.id, revision);
+        if (!result.changes) throw Object.assign(new Error('The account key backup changed on another device. Sign in again and retry.'), { code: 'E2EE_PROFILE_BACKUP_CONFLICT' });
+      });
+    } catch (error) {
+      if (['E2EE_PROFILE_KEY_MISMATCH', 'E2EE_PROFILE_BACKUP_CONFLICT'].includes(error.code)) return sendJson(response, 409, { error: error.message });
+      throw error;
+    }
+    return sendJson(response, 200, { ok: true, revision: revision + 1 });
   }
 
   if (path === '/api/e2ee/sync' && ['GET', 'PUT'].includes(method)) {
@@ -4098,9 +4548,15 @@ async function handleApi(request, response) {
     return sendJson(response, 200, { revision: revision + 1, envelope: JSON.parse(encoded) });
   }
 
-  if (method === 'PUT' && path === '/api/e2ee/key') {
+  if (['GET', 'PUT'].includes(method) && path === '/api/e2ee/key') {
     const user = requireSignedInUser(request, response);
     if (!user) return;
+    if (method === 'GET') {
+      const row = findUserById.get(user.id);
+      let publicKey = null;
+      try { publicKey = JSON.parse(String(row?.public_key_jwk || '')) || null; } catch { publicKey = null; }
+      return sendJson(response, 200, { publicKey, fingerprint: publicKey ? storedPublicKeyFingerprint(row?.public_key_jwk, row?.key_fingerprint) : null });
+    }
     const { publicKey, fingerprint } = await readJson(request);
     const encoded = JSON.stringify(publicKey || {});
     if (!publicKey || publicKey.kty !== 'EC' || publicKey.crv !== 'P-256' || typeof publicKey.x !== 'string' || typeof publicKey.y !== 'string' || encoded.length > 2048) {
@@ -4109,6 +4565,8 @@ async function handleApi(request, response) {
     const computedFingerprint = publicKeyFingerprint(publicKey);
     const vault = readSyncVault.get(user.id);
     if (vault && computedFingerprint !== publicKeyFingerprint(JSON.parse(vault.active_public_key))) return sendJson(response, 409, { error: 'This device does not have the active Glean message key.' });
+    const existingFingerprint = storedPublicKeyFingerprint(user.public_key_jwk, user.key_fingerprint);
+    if (existingFingerprint && computedFingerprint !== existingFingerprint) return sendJson(response, 409, { error: 'This device does not have the active Glean message key. Sign in on a device that can read your DMs to restore your account key.' });
     if (fingerprint && String(fingerprint).toLowerCase() !== computedFingerprint) return sendJson(response, 400, { error: 'Encryption key fingerprint does not match the public key.' });
     const previousFingerprint = storedPublicKeyFingerprint(user.public_key_jwk, user.key_fingerprint);
     const changed = Boolean(user.public_key_jwk && previousFingerprint && previousFingerprint !== computedFingerprint);
@@ -4300,22 +4758,61 @@ async function handleApi(request, response) {
   if (method === 'POST' && path === '/api/account/profile-background') {
     const user = requireSignedInUser(request, response);
     if (!user) return;
-    let input;
-    try { input = await readJson(request); } catch (error) { return sendJson(response, 400, { error: error.message }); }
     let next = null;
-    if (input.kind === 'none') {
-      next = null;
-    } else if (input.kind === 'solid') {
-      next = publicProfileBackground({ kind: 'solid', color: input.color });
-      if (!next) return sendJson(response, 400, { error: 'Pick a valid color.' });
-    } else if (input.kind === 'gradient') {
-      next = publicProfileBackground({ kind: 'gradient', from: input.from, to: input.to, angle: input.angle });
-      if (!next) return sendJson(response, 400, { error: 'Pick two colors and a direction.' });
+    if (String(request.headers['content-type'] || '').startsWith('multipart/form-data')) {
+      const retryAfter = takeRateLimit(request, `profile-background:${user.id}`, 10, 60_000);
+      if (retryAfter) return sendJson(response, 429, { error: 'Too many uploads. Try again shortly.' }, { 'Retry-After': String(retryAfter) });
+      let uploaded;
+      try { uploaded = await readProfileBackgroundImage(request); } catch (error) { return sendJson(response, 400, { error: error.message }); }
+      const storageName = `profile-background-${randomBase32(18)}.jpg`;
+      writeFileSync(join(uploadDirectory, storageName), uploaded.bytes, { mode: 0o600 });
+      next = { kind: 'image', imageUrl: `${apiPrefix}/profile-backgrounds/${storageName}`, ...uploaded.adjustments };
     } else {
-      return sendJson(response, 400, { error: 'Pick a solid color or gradient.' });
+      let input;
+      try { input = await readJson(request, 2048); } catch (error) { return sendJson(response, 400, { error: error.message }); }
+      if (input.kind === 'none') {
+        next = null;
+      } else if (input.kind === 'solid') {
+        next = publicProfileBackground({ kind: 'solid', color: input.color });
+        if (!next) return sendJson(response, 400, { error: 'Pick a valid color.' });
+      } else if (input.kind === 'gradient') {
+        next = publicProfileBackground({ kind: 'gradient', from: input.from, to: input.to, angle: input.angle });
+        if (!next) return sendJson(response, 400, { error: 'Pick two colors and a direction.' });
+      } else if (input.kind === 'image') {
+        const adjustments = profileImageAdjustments(input, true);
+        if (!adjustments) return sendJson(response, 400, { error: 'Contrast and saturation must be 0–200%. Blur must be 0–100px.' });
+        const current = publicProfileBackground(findUserById.get(user.id)?.profile_background_json);
+        if (typeof input.imageUrl !== 'string' || !PROFILE_BACKGROUND_URL.test(input.imageUrl) || input.imageUrl !== current?.imageUrl) return sendJson(response, 400, { error: 'Upload a photo to use as your profile background.' });
+        next = { kind: 'image', imageUrl: input.imageUrl, ...adjustments };
+      } else {
+        return sendJson(response, 400, { error: 'Pick a solid color, gradient, or image.' });
+      }
     }
-    updateProfileBackground.run(next ? JSON.stringify(next) : null, user.id);
-    return sendJson(response, 200, { account: publicAccount({ ...user, profile_background_json: next ? JSON.stringify(next) : null }) });
+    const latestUser = findUserById.get(user.id);
+    const previous = publicProfileBackground(latestUser?.profile_background_json);
+    const oldName = previous?.imageUrl?.match(PROFILE_BACKGROUND_URL)?.[1];
+    const newName = next?.imageUrl?.match(PROFILE_BACKGROUND_URL)?.[1];
+    if (!latestUser) {
+      if (newName) removeStoredUploads([newName]);
+      return sendJson(response, 401, { error: 'Not signed in.' });
+    }
+    try { updateProfileBackground.run(next ? JSON.stringify(next) : null, user.id); } catch (error) {
+      if (newName && newName !== oldName) removeStoredUploads([newName]);
+      throw error;
+    }
+    if (oldName && oldName !== newName) removeStoredUploads([oldName]);
+    return sendJson(response, 200, { account: publicAccount({ ...latestUser, profile_background_json: next ? JSON.stringify(next) : null }) });
+  }
+
+  const backgroundMatch = path.match(/^\/api\/profile-backgrounds\/(profile-background-[a-z2-7]+\.jpg)$/);
+  if (['GET', 'HEAD'].includes(method) && backgroundMatch) {
+    const user = requireSignedInUser(request, response);
+    if (!user) return;
+    const name = backgroundMatch[1];
+    const owner = database.prepare("SELECT id FROM users WHERE json_extract(profile_background_json, '$.imageUrl') = ?").get(`${apiPrefix}/profile-backgrounds/${name}`);
+    const filePath = join(uploadDirectory, name);
+    if (!owner || !existsSync(filePath)) return sendJson(response, 404, { error: 'Profile background not found.' });
+    return sendLocalFile(request, response, filePath, { type: 'image/jpeg', extra: { 'Cache-Control': 'private, max-age=3600', 'X-Content-Type-Options': 'nosniff' } });
   }
 
   if ((method === 'POST' || method === 'PATCH') && path === '/api/account/name-style') {
@@ -4410,7 +4907,7 @@ async function handleApi(request, response) {
     const user = requireSignedInUser(request, response);
     if (!user) return;
     return sendJson(response, 200, {
-      friends: listFriends.all(user.id, user.id, user.id).map((friend) => ({ id: Number(friend.id), username: friend.username, avatarUrl: friend.avatar_url || null, nameStyle: publicNameStyle(friend.name_style_json), presence: publicPresence(friend.id) })),
+      friends: listFriends.all(user.id, user.id, user.id).map((friend) => ({ id: Number(friend.id), username: friend.username, avatarUrl: friend.avatar_url || null, nameStyle: publicNameStyle(friend.name_style_json), isBot: Boolean(Number(friend.is_bot)), presence: Number(friend.is_bot) ? 'online' : publicPresence(friend.id) })),
       requests: listIncomingRequests.all(user.id).map((friendRequest) => ({
         id: Number(friendRequest.id), user: { id: Number(friendRequest.user_id), username: friendRequest.username, avatarUrl: friendRequest.avatar_url || null, nameStyle: publicNameStyle(friendRequest.name_style_json), presence: publicPresence(friendRequest.user_id) }, createdAt: friendRequest.created_at,
       })),
@@ -4473,13 +4970,18 @@ async function handleApi(request, response) {
     const program = rawProgram && PROGRAMS.some((item) => item.id === rawProgram) ? rawProgram : '';
     const rawGrade = String(search.get('grade') || '').trim();
     const grade = rawGrade ? publicGrade(rawGrade) : '';
+    const filter = search.get('filter') || 'all';
+    const attributes = [...new Set(String(search.get('attributes') || '').split(',').filter(Boolean))];
     if (!Number.isSafeInteger(cursor) || cursor < 0) return sendJson(response, 400, { error: 'Invalid people cursor.' });
     if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 500) return sendJson(response, 400, { error: 'People limit must be between 1 and 500.' });
     if (rawSchool && !school) return sendJson(response, 400, { error: 'Unknown school filter.' });
     if (rawProgram && !program) return sendJson(response, 400, { error: 'Unknown program filter.' });
     if (rawGrade && !grade) return sendJson(response, 400, { error: 'Unknown grade filter.' });
-    const count = Number(countDiscoverPeople.get(user.id, query, school || '', program, grade || '')?.total || 0);
-    const rows = listDiscoverPeople.all(user.id, cursor, query, school || '', program, grade || '', requestedLimit + 1);
+    if (!['all', 'add', 'pending', 'friends'].includes(filter)) return sendJson(response, 400, { error: 'Unknown people filter.' });
+    if (attributes.some(attribute => !['magnet', 'laredo-college'].includes(attribute))) return sendJson(response, 400, { error: 'Unknown school or program filter.' });
+    const args = [user.id, query, school || '', program, grade || '', filter, attributes.join(',')];
+    const count = countDiscoverPeople.get(...args);
+    const rows = listDiscoverPeople.all(...args, cursor, requestedLimit + 1);
     const hasMore = rows.length > requestedLimit;
     const page = rows.slice(0, requestedLimit);
     return sendJson(response, 200, {
@@ -4503,7 +5005,9 @@ async function handleApi(request, response) {
           presence: publicPresence(person.id),
         };
       }),
-      total: count,
+      total: Number(count.matched_total || 0),
+      counts: { all: Number(count.total || 0), add: Number(count.to_add || 0), friends: Number(count.friends || 0), pending: Number(count.pending || 0) },
+      attributeCounts: { magnet: Number(count.magnet || 0), 'laredo-college': Number(count.laredo_college || 0) },
       nextCursor: hasMore ? Number(page.at(-1).id) : null,
     });
   }
@@ -4570,6 +5074,14 @@ async function handleApi(request, response) {
     if (!recipient) return sendJson(response, 404, { error: 'That Glean user was not found.' });
     if (recipient.id === user.id) return sendJson(response, 400, { error: 'You cannot add yourself.' });
     if (isBlockedEither(user.id, recipient.id)) return sendJson(response, 403, { error: 'Could not send that request.' });
+    if (Number(recipient.is_bot) === 1) {
+      insertFriendship.run(...friendshipPair(user.id, recipient.id), now);
+      const conversationId = createDirectConversation(user.id, recipient.id, now);
+      emitFriends(user.id, 'accepted');
+      emitFriends(recipient.id, 'accepted');
+      sendEvent(user.id, 'conversations', { conversationId });
+      return sendJson(response, 200, { ok: true, accepted: true, conversationId, username: recipient.username });
+    }
     if (areFriends(user.id, recipient.id)) return sendJson(response, 409, { error: 'You are already friends.' });
     const existing = findExistingRequest.get(user.id, recipient.id, recipient.id, user.id);
     if (existing) return sendJson(response, 409, { error: existing.receiver_id === user.id ? 'They already sent you a request.' : 'Friend request already sent.' });
@@ -4688,8 +5200,9 @@ async function handleApi(request, response) {
         id: Number(conversation.user_id), username: conversation.username, bio: conversation.bio || '', avatarUrl: conversation.avatar_url || null,
         nameStyle: publicNameStyle(conversation.name_style_json),
         customBadges: publicCustomBadges(conversation.custom_badges_json),
+        isBot: Boolean(Number(conversation.is_bot)),
         publicKey: safeJsonParse(conversation.public_key_jwk), keyFingerprint: conversation.key_fingerprint || null,
-        presence: publicPresence(conversation.user_id),
+        presence: Number(conversation.is_bot) ? 'online' : publicPresence(conversation.user_id),
       },
       blocked: Boolean(Number(conversation.blocked)),
       lastMessage: conversation.last_message_ciphertext ? 'Message' : (conversation.last_message_body || null),
@@ -5011,6 +5524,49 @@ async function handleApi(request, response) {
     return sendJson(response, 200, { entries, nextCursor: hasMore ? String(entries.at(-1)?.id || '') : null });
   }
 
+  const serverBotsMatch = path.match(/^\/api\/servers\/(\d+)\/bots$/);
+  const serverBotMatch = path.match(/^\/api\/servers\/(\d+)\/bots\/([a-z0-9-]+)$/i);
+  if (method === 'POST' && serverBotsMatch) {
+    const user = requireSignedInUser(request, response);
+    if (!user) return;
+    const serverId = Number(serverBotsMatch[1]);
+    if (!canOwnServer(user, serverId)) return sendJson(response, 403, { error: 'Only the server owner can add bots.' });
+    let input = {};
+    try { input = await readJson(request); } catch (error) { return sendJson(response, 400, { error: error.message }); }
+    const botKey = String(input.botId || '').trim().toLowerCase();
+    if (botKey !== 'nura') return sendJson(response, 404, { error: 'That bot is not available.' });
+    const defaultRole = findServerDefaultMemberRole.get(serverId);
+    if (!defaultRole) return sendJson(response, 409, { error: 'This server has no member role for bots.' });
+    const installedAt = new Date().toISOString();
+    withTransaction(() => {
+      installServerBot.run(serverId, botKey, NURA_USER_ID, user.id, installedAt);
+      if (!isServerMember.get(serverId, NURA_USER_ID)) {
+        const sortOrder = Number(nextMemberSortOrder.get(NURA_USER_ID)?.next || 0);
+        insertMember.run(serverId, NURA_USER_ID, defaultRole.id, installedAt, sortOrder);
+      }
+    });
+    writeServerAudit(serverId, user, 'bot.added', { targetType: 'bot', targetId: botKey, targetName: 'Nura' });
+    notifyServerMembers(serverId, 'server-updated', { serverId, action: 'bot-added', botId: botKey });
+    return sendJson(response, 200, { bots: listInstalledServerBots.all(serverId).map((bot) => ({ id: bot.id, name: bot.name, avatarUrl: bot.avatar_url || null, installedAt: bot.installed_at })) });
+  }
+  if (method === 'DELETE' && serverBotMatch) {
+    const user = requireSignedInUser(request, response);
+    if (!user) return;
+    const serverId = Number(serverBotMatch[1]);
+    const botKey = String(serverBotMatch[2] || '').toLowerCase();
+    if (!canOwnServer(user, serverId)) return sendJson(response, 403, { error: 'Only the server owner can remove bots.' });
+    if (botKey !== 'nura') return sendJson(response, 404, { error: 'That bot is not installed.' });
+    const installed = serverHasNura.get(serverId);
+    if (!installed) return sendJson(response, 404, { error: 'Nura is not in this server.' });
+    withTransaction(() => {
+      uninstallServerBot.run(serverId, botKey);
+      removeServerBotMember.run(serverId, NURA_USER_ID);
+    });
+    writeServerAudit(serverId, user, 'bot.removed', { targetType: 'bot', targetId: botKey, targetName: 'Nura' });
+    notifyServerMembers(serverId, 'server-updated', { serverId, action: 'bot-removed', botId: botKey });
+    return sendJson(response, 200, { bots: listInstalledServerBots.all(serverId).map((bot) => ({ id: bot.id, name: bot.name, avatarUrl: bot.avatar_url || null, installedAt: bot.installed_at })) });
+  }
+
   const serverMatch = path.match(/^\/api\/servers\/(\d+)$/);
   const serverLeaveMatch = path.match(/^\/api\/servers\/(\d+)\/leave$/);
   if (method === 'POST' && serverLeaveMatch) {
@@ -5090,7 +5646,7 @@ async function handleApi(request, response) {
     const initialMembers = listServerMembersPage.all(serverId, memberLimit, 0).map(publicServerMember);
     const memberTotal = Number(countServerMembers.get(serverId)?.count || 0);
     const memberCounts = Object.fromEntries(countServerMembersByRole.all(serverId).map((row) => [String(row.roleId), Number(row.count)]));
-    return sendJson(response, 200, { server: { ...publicServerSummary(findServerById.get(serverId)), channels: listServerChannels.all(serverId).map((row) => publicChannel(row, unread.get(Number(row.id)))), roles: listServerRoles.all(serverId).map((row) => ({ ...row, permissionFlags: roleFlags(row) })), members: initialMembers, memberTotal, memberCounts, membersPage: { offset: 0, limit: memberLimit, hasMore: initialMembers.length < memberTotal, nextOffset: initialMembers.length }, membership: member ? { roleId: Number(member.role_id), roleName: member.role_name, permissions: member.permissions, permissionFlags: roleFlags(member), timeoutUntil: timeoutUntilFor(serverId, user.id) } : { roleId: null, roleName: 'Platform', permissions: 'observer', permissionFlags: [], inspecting: true, timeoutUntil: null }, inspecting, voiceOccupancy: occupancyForServer(serverId).channels, liveApps: appService.liveSessionsForServer(serverId) } });
+    return sendJson(response, 200, { server: { ...publicServerSummary(findServerById.get(serverId)), categories: serverCategories.list(serverId), channels: listServerChannels.all(serverId).map((row) => publicChannel(row, unread.get(Number(row.id)))), bots: listInstalledServerBots.all(serverId).map((bot) => ({ id: bot.id, name: bot.name, avatarUrl: bot.avatar_url || null, installedAt: bot.installed_at })), roles: listServerRoles.all(serverId).map((row) => ({ ...row, permissionFlags: roleFlags(row) })), members: initialMembers, memberTotal, memberCounts, membersPage: { offset: 0, limit: memberLimit, hasMore: initialMembers.length < memberTotal, nextOffset: initialMembers.length }, membership: member ? { roleId: Number(member.role_id), roleName: member.role_name, permissions: member.permissions, permissionFlags: roleFlags(member), timeoutUntil: timeoutUntilFor(serverId, user.id) } : { roleId: null, roleName: 'Platform', permissions: 'observer', permissionFlags: [], inspecting: true, timeoutUntil: null }, inspecting, voiceOccupancy: occupancyForServer(serverId).channels, liveApps: appService.liveSessionsForServer(serverId) } });
   }
 
   const serverMembersMatch = path.match(/^\/api\/servers\/(\d+)\/members$/);
@@ -5404,15 +5960,20 @@ async function handleApi(request, response) {
     const owner = findServerOwner.get(serverId);
     const actor = findServerMember.get(serverId, user.id);
     if (!canServerPermission(user, serverId, 'manageChannels')) return sendJson(response, 403, { error: 'Manage channels permission required.' });
-    const { name, type = 'text' } = await readJson(request);
+    const { name, type = 'text', categoryId = null } = await readJson(request);
     const cleanName = sanitizeChannelName(name);
     if (!cleanName) return sendJson(response, 400, { error: 'Channel name is required.' });
     if (!CHANNEL_CREATE_TYPES.has(type)) return sendJson(response, 400, { error: 'Channel type must be text, announcement, rules, or voice.' });
+    if (!serverCategories.belongs(serverId, categoryId)) return sendJson(response, 400, { error: 'Category must belong to this server.' });
     const voice = type === 'voice' ? 1 : 0;
     const channelKind = channelKindFrom(type, cleanName, voice);
     const locked = channelKind === 'announcement' || channelKind === 'rules' ? 1 : 0;
     const position = listServerChannels.all(serverId).length;
-    const result = insertCustomChannel.run(serverId, cleanName, voice, channelKind, locked, position);
+    let result;
+    withTransaction(() => {
+      result = insertCustomChannel.run(serverId, cleanName, voice, channelKind, locked, position);
+      updateChannelCategory.run(categoryId, Number(result.lastInsertRowid), serverId);
+    });
     notifyServerMembers(serverId, 'server-updated', { serverId, action: 'channel-created' });
     writeServerAudit(serverId, user, 'channel.created', { targetType: 'channel', targetId: result.lastInsertRowid, targetName: cleanName, details: { kind: channelKind, voice: Boolean(voice) } });
     return sendJson(response, 201, { channel: publicChannel(findChannel.get(Number(result.lastInsertRowid))) });
@@ -5432,8 +5993,9 @@ async function handleApi(request, response) {
     const selected = channelIds.map((id) => rows.find((row) => Number(row.id) === id));
     if (selected.some((row) => !row)) return sendJson(response, 400, { error: 'Every channel must belong to this server.' });
     const voice = Boolean(selected[0]?.voice);
-    if (selected.some((row) => Boolean(row.voice) !== voice)) return sendJson(response, 400, { error: 'Reorder text and voice channels separately.' });
-    const kindIds = rows.filter((row) => Boolean(row.voice) === voice).map((row) => Number(row.id));
+    if (input.scope !== undefined && input.scope !== 'all') return sendJson(response, 400, { error: 'Invalid channel order scope.' });
+    if (input.scope !== 'all' && selected.some((row) => Boolean(row.voice) !== voice)) return sendJson(response, 400, { error: 'Reorder text and voice channels separately.' });
+    const kindIds = rows.filter((row) => input.scope === 'all' || Boolean(row.voice) === voice).map((row) => Number(row.id));
     if (!sameIdSet(kindIds, channelIds)) return sendJson(response, 400, { error: 'Channel order must include every channel of that type.' });
     withTransaction(() => {
       channelIds.forEach((channelId, index) => updateChannelPosition.run(index, channelId, serverId));
@@ -5487,9 +6049,16 @@ async function handleApi(request, response) {
     let input = {};
     try { input = await readJson(request); } catch (error) { return sendJson(response, 400, { error: error.message }); }
     const nextName = input.name !== undefined ? sanitizeChannelName(input.name) : channelRecord.name;
+    const nextCategory = input.categoryId === undefined ? channelRecord.category_id ?? null : input.categoryId;
+    if (!serverCategories.belongs(serverId, nextCategory)) return sendJson(response, 400, { error: 'Category must belong to this server.' });
     if (!nextName) return sendJson(response, 400, { error: 'Channel name is required.' });
+    if (input.type !== undefined && !CHANNEL_CREATE_TYPES.has(input.type)) return sendJson(response, 400, { error: 'Invalid channel type.' });
+    const nextVoice = input.type === undefined ? Number(channelRecord.voice) : Number(input.type === 'voice');
+    if (nextVoice !== Number(channelRecord.voice) && voiceRooms.get(`${serverId}:${channelId}`)?.size) return sendJson(response, 409, { error: 'Wait until the voice channel is empty before changing its type.' });
+    if (officialAnnouncements.isRequiredChannel(channelId) && nextVoice) return sendJson(response, 400, { error: 'The official announcements channel must remain a text channel.' });
     let nextKind = channelRecord.channel_kind === 'announcement' || channelRecord.channel_kind === 'rules' ? channelRecord.channel_kind : 'text';
-    if (channelRecord.voice) nextKind = 'text';
+    if (nextVoice) nextKind = 'text';
+    else if (input.type !== undefined) nextKind = input.type;
     else if (input.channelKind !== undefined) {
       const wanted = String(input.channelKind || '').toLowerCase();
       if (!CHANNEL_KINDS.has(wanted)) return sendJson(response, 400, { error: 'Channel kind must be text, announcement, or rules.' });
@@ -5508,10 +6077,14 @@ async function handleApi(request, response) {
     if (input.slowmode !== undefined) {
       const value = Number(input.slowmode);
       if (!SLOWMODE_SECONDS.has(value)) return sendJson(response, 400, { error: 'Slowmode must be a supported interval.' });
-      nextSlowmode = channelRecord.voice ? 0 : value;
+      nextSlowmode = nextVoice ? 0 : value;
     }
     const nextTopic = input.topic !== undefined ? String(input.topic || '').trim().slice(0, 200) : String(channelRecord.topic || '');
-    updateChannelSettings.run(nextName, nextTopic, nextLocked, nextSlowmode, nextKind, channelId, serverId);
+    if (nextVoice) { nextSlowmode = 0; nextLocked = 0; }
+    withTransaction(() => {
+      updateChannelSettings.run(nextName, nextTopic, nextLocked, nextSlowmode, nextKind, nextVoice, channelId, serverId);
+      updateChannelCategory.run(nextCategory, channelId, serverId);
+    });
     notifyServerMembers(serverId, 'server-updated', { serverId, action: 'channel-updated', channelId });
     writeServerAudit(serverId, user, 'channel.updated', { targetType: 'channel', targetId: channelId, targetName: nextName, details: { nameChanged: nextName !== channelRecord.name, slowmode: nextSlowmode, locked: Boolean(nextLocked), kind: nextKind } });
     return sendJson(response, 200, { channel: publicChannel(findChannel.get(channelId)) });
@@ -5715,7 +6288,7 @@ async function handleApi(request, response) {
     return sendJson(response, 200, { messages, page });
   }
 
-  const moderationMessageMatch = path.match(/^\/api\/channels\/(\d+)\/messages\/(\d+)$/);
+const moderationMessageMatch = path.match(/^\/api\/channels\/(\d+)\/messages\/(\d+)$/);
   if (method === 'PATCH' && moderationMessageMatch) {
     const user = requireSignedInUser(request, response);
     if (!user) return;
@@ -5740,6 +6313,9 @@ async function handleApi(request, response) {
     const moderationResult = Number(channelRecord.moderation_enabled) === 1 && textToModerate
       ? await moderateServerMessage(textToModerate, moderationContext(channelId, messageId))
       : null;
+    if (moderationResult?.fallbackUsed && moderationResult.action !== 'block') {
+      return sendJson(response, 503, { error: 'Automatic moderation is temporarily unavailable. Your edit was not saved. Please try again shortly.' });
+    }
     if (moderationResult?.action === 'block') {
       auditModerationResult(channelRecord, user, 'blocked', moderationResult, messageId, 'channel-message');
       return sendJson(response, 422, { error: 'This message was blocked by server moderation. Please edit it and try again.' });
@@ -5805,14 +6381,40 @@ async function handleApi(request, response) {
     for (const file of files) {
       if (!channelFileMimeType(file)) return rejectUpload(400, 'That file type is not allowed.');
     }
-    const block = postingBlockReason(user, channelRecord);
+    const canRunNuraCommand = files.length === 0 && !pollResult.poll && !input.replyToMessageId;
+    const activateCommand = canRunNuraCommand && /^\/activate\s*$/i.test(cleanBody);
+    const deactivateCommand = canRunNuraCommand && /^\/deactivate\s*$/i.test(cleanBody);
+    const chatCommand = canRunNuraCommand ? cleanBody.match(/^\/chat(?:\s+([\s\S]+))?$/i) : null;
+    const isNuraCommand = Boolean(activateCommand || deactivateCommand || chatCommand);
+    const block = postingBlockReason(user, channelRecord, { skipSlowmode: isNuraCommand });
     if (block) return rejectUpload(block.startsWith('Slowmode') ? 429 : 403, block);
     const reply = requireChannelReply(channelId, input.replyToMessageId);
     if (reply.error) return rejectUpload(400, reply.error);
+    if (activateCommand || deactivateCommand || chatCommand) {
+      if (!serverHasNura.get(Number(channelRecord.server_id))) return rejectUpload(409, 'Nura has not been added to this server. Ask the server owner to add Nura in Server Settings → Bots.');
+      if (chatCommand && !String(chatCommand[1] || '').trim()) return rejectUpload(400, 'Use /chat followed by your message.');
+      if (chatCommand && nuraServerRepliesInFlight.has(channelId)) return rejectUpload(429, 'Nura is already replying in this channel. Try /chat again in a moment.');
+      if (activateCommand || deactivateCommand) {
+        const commandBlock = postingBlockReason(user, channelRecord, { skipSlowmode: true });
+        if (commandBlock) return rejectUpload(commandBlock.startsWith('Slowmode') ? 429 : 403, commandBlock);
+        const active = Boolean(Number(getNuraChannelActivation.get(channelId)?.active));
+        const nextActive = activateCommand;
+        upsertNuraChannelActivation.run(Number(channelRecord.server_id), channelId, Number(nextActive), user.id, new Date().toISOString());
+        writeServerAudit(channelRecord.server_id, user, nextActive ? 'bot.channel-activated' : 'bot.channel-deactivated', { targetType: 'channel', targetId: channelId, targetName: channelRecord.name, details: { botId: 'nura', changed: active !== nextActive } });
+        notifyServerMembers(channelRecord.server_id, 'server-updated', { serverId: Number(channelRecord.server_id), action: 'bot-channel-updated', channelId, botId: 'nura', active: nextActive });
+        const statusText = nextActive
+          ? (active ? 'auto-reply is already active in this channel.' : `auto-reply mode activated. messages in #${channelRecord.name} will be sent to groq so i can reply. use /deactivate to turn it off.`)
+          : (active ? 'auto-reply mode deactivated for this channel.' : 'auto-reply is already off in this channel.');
+        const message = await postNuraServerMessage(channelId, Number(channelRecord.server_id), statusText);
+        const updatedRow = listServerChannels.all(Number(channelRecord.server_id)).find((item) => Number(item.id) === channelId);
+        return sendJson(response, 200, { message, command: activateCommand ? 'activate' : 'deactivate', channel: updatedRow ? publicChannel(updatedRow) : null });
+      }
+    }
     const textToModerate = moderationText(cleanBody, pollResult.poll);
     const moderationResult = Number(channelRecord.moderation_enabled) === 1 && textToModerate
       ? await moderateServerMessage(textToModerate, moderationContext(channelId))
       : null;
+    if (moderationResult?.fallbackUsed && moderationResult.action !== 'block') return rejectUpload(503, 'Automatic moderation is temporarily unavailable. Your message was not sent. Please try again shortly.');
     if (moderationResult?.action === 'block') {
       auditModerationResult(channelRecord, user, 'blocked', moderationResult);
       return rejectUpload(422, 'This message was blocked by server moderation. Please edit it and try again.');
@@ -5843,6 +6445,10 @@ async function handleApi(request, response) {
       serverId: Number(channelRecord.server_id),
       channelId,
     }, user.id);
+    if (chatCommand || (serverHasNura.get(Number(channelRecord.server_id)) && Number(getNuraChannelActivation.get(channelId)?.active))) {
+      const promptText = chatCommand ? String(chatCommand[1] || '').trim() : '';
+      setImmediate(() => { void answerWithNuraInServer({ channelId, serverId: Number(channelRecord.server_id), authorId: Number(user.id), promptText }); });
+    }
     return sendJson(response, 201, { message: payload, moderationAction: moderationResult?.action || 'allow' });
   }
 
@@ -6041,6 +6647,10 @@ async function handleApi(request, response) {
     const { envelope, attachmentMeta = [], files } = input;
     const storedNames = files.map((file) => file.storageName).filter(Boolean);
     const dropUploads = () => removeStoredUploads(storedNames);
+    if (peer.is_bot && envelope) {
+      dropUploads();
+      return sendJson(response, 400, { error: 'Nura chats are processed by Groq and are not end-to-end encrypted. Refresh Glean and try again.' });
+    }
     if (reply.error) {
       dropUploads();
       return sendJson(response, 400, { error: reply.error });
@@ -6054,6 +6664,28 @@ async function handleApi(request, response) {
       if (totalSize > MAX_ATTACHMENT_BYTES || files.some((file) => Number(file.size || 0) > MAX_ATTACHMENT_BYTES)) {
         dropUploads();
         return sendJson(response, 400, { error: 'Each attachment and the total message can be up to 2 GB.' });
+      }
+      let nuraImageFiles = [];
+      if (Number(peer.is_bot)) {
+        if (files.length > NURA_MAX_IMAGES) {
+          dropUploads();
+          return sendJson(response, 400, { error: `Nura supports up to ${NURA_MAX_IMAGES} images per message.` });
+        }
+        try {
+          for (const file of files) {
+            const mimeType = sanitizeMimeType(file.type).toLowerCase();
+            if (!NURA_IMAGE_TYPES.has(mimeType)) throw new Error('Nura can read JPEG, PNG, and WebP images only. Video and other file attachments are not supported.');
+            if (Number(file.size || 0) < 1 || Number(file.size || 0) > NURA_MAX_IMAGE_BYTES) throw new Error('Each image sent to Nura must be 20 MB or smaller.');
+            const bytes = await readFile(join(uploadDirectory, file.storageName));
+            const metadata = await sharp(bytes, { animated: false }).metadata();
+            const expectedFormat = { 'image/jpeg': 'jpeg', 'image/png': 'png', 'image/webp': 'webp' }[mimeType];
+            if (metadata.format !== expectedFormat) throw new Error('One attachment is not a valid JPEG, PNG, or WebP image.');
+            nuraImageFiles.push({ mimeType, bytes });
+          }
+        } catch (error) {
+          dropUploads();
+          return sendJson(response, 400, { error: error.message || 'Nura could not read one of those images.' });
+        }
       }
       const result = insertMessage.run(conversationId, user.id, cleanBody, null, null, null, null, null, null, 0, now, reply.id);
       const messageId = Number(result.lastInsertRowid);
@@ -6078,6 +6710,7 @@ async function handleApi(request, response) {
         tag: `dm:${conversationId}`,
         conversationId,
       }, user.id);
+      if (Number(peer.is_bot)) setImmediate(() => { void answerWithNura(conversationId, Number(user.id), nuraImageFiles); });
       return sendJson(response, 201, { message });
     }
     if (!user.public_key_jwk || !peer.public_key_jwk) { dropUploads(); return sendJson(response, 409, { error: 'Both participants must initialize private-message encryption first.' }); }
@@ -6087,7 +6720,9 @@ async function handleApi(request, response) {
     const existing = findMessageByClientId.get(conversationId, user.id, clientMessageId);
     if (existing) {
       dropUploads();
-      return sendJson(response, 200, { duplicate: true, messageId: Number(existing.id) });
+      const saved = loadDirectMessageRow.get(existing.id);
+      if (!saved || saved.deleted_at) return sendJson(response, 409, { error: 'This message was already deleted.' });
+      return sendJson(response, 200, { duplicate: true, messageId: Number(existing.id), message: directMessagePayload(saved) });
     }
 
     const ciphertext = String(envelope.ciphertext || '');

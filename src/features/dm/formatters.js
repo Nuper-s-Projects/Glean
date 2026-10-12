@@ -6,6 +6,10 @@ export function formatJoinedDate(value) {
   if (!value) return '';
   return dateFormatter.format(new Date(value));
 }
+export function formatReleaseDate(value) {
+  if (!value) return '';
+  return new Intl.DateTimeFormat('en-US', { month: 'long', day: 'numeric', year: 'numeric', timeZone: 'UTC' }).format(new Date(value));
+}
 export function formatEstablished(value) {
   if (!value) return '';
   return new Intl.DateTimeFormat('en-US', { month: 'long', year: 'numeric' }).format(new Date(value));

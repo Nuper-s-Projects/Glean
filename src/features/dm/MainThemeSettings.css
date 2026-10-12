@@ -1,0 +1,42 @@
+.main-theme-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.main-theme-tile { min-width: 0; }
+.main-theme-choice { display: grid; gap: 10px; width: 100%; padding: 0 0 8px; color: var(--settings-text); font: inherit; text-align: left; background: transparent; border: 0; border-radius: 12px; }
+.main-theme-choice strong { padding-inline: 2px; overflow-wrap: anywhere; font-size: 12px; font-weight: 500; }
+.main-theme-swatch { position: relative; display: block; width: 100%; height: 88px; overflow: hidden; isolation: isolate; background: var(--page-background); border: 1px solid var(--settings-border); border-radius: 12px; }
+.main-theme-swatch-image { position: absolute; inset: calc(-1 * var(--glean-theme-bleed, 0px)); z-index: -1; background-image: var(--glean-theme-background); background-size: cover; background-position: center; filter: var(--glean-theme-filter, none); }
+.main-theme-choice[aria-pressed='true'] .main-theme-swatch { border-color: var(--settings-accent); box-shadow: 0 0 0 2px var(--settings-accent); }
+.main-theme-choice:hover .main-theme-swatch { border-color: var(--settings-accent); }
+.main-theme-choice:disabled { cursor: wait; opacity: .7; }
+.main-theme-selected { position: absolute; right: 7px; top: 7px; display: grid; place-items: center; width: 20px; height: 20px; color: #fff; font-size: 13px; border-radius: 50%; }
+.main-theme-choice[aria-pressed='true'] .main-theme-selected { background: var(--settings-accent); box-shadow: 0 1px 4px #0005; }
+.main-theme-mini { position: absolute; inset: 20px 20px 12px 12px; display: grid; grid-template-columns: 20% 1fr; gap: 4px; }
+.main-theme-mini > i { background: #101a2366; border-radius: 5px; }
+.main-theme-mini > span { display: grid; align-content: center; gap: 5px; padding: 8px; background: #101a2399; border-radius: 5px; }
+.main-theme-mini b { height: 3px; width: 75%; background: #ffffff80; border-radius: 2px; }
+.main-theme-mini b:last-child { width: 45%; }
+.main-theme-tile-actions { display: flex; gap: 8px; }
+.main-theme-tile-actions button { min-height: 36px; padding: 5px 7px; color: var(--settings-muted); font-size: 11px; background: transparent; border: 1px solid var(--settings-border); border-radius: 7px; }
+.main-theme-tile-actions button:hover { color: var(--settings-text); border-color: var(--settings-accent); }
+.main-theme-subtitle { display: flex; align-items: center; gap: 8px; margin: 8px 0 0; font-size: 14px; font-weight: 500; }
+.main-theme-subtitle small { color: var(--settings-muted); font-size: 11px; }
+.main-theme-editor { display: grid; gap: 16px; padding: 20px; border: 1px solid var(--settings-border); border-radius: 14px; }
+.main-theme-editor h3 { margin: 0; font-size: 16px; font-weight: 550; }
+.main-theme-editor > .main-theme-swatch { height: 174px; }
+.main-theme-preview-content { display: grid; gap: 8px; margin: 18px; padding: 14px; color: #fff; font-size: 12px; background: #091523b8; border: 1px solid #ffffff30; border-radius: 10px; }
+.main-theme-preview-content strong { font-weight: 550; }
+.main-theme-preview-content i { margin-top: 8px; padding: 10px; color: #d7e4ef; font-style: normal; background: #09152399; border: 1px solid #ffffff30; border-radius: 8px; }
+.main-theme-colors { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 16px; }
+.main-theme-range { display: grid; gap: 12px; }
+.main-theme-range label { display: flex; justify-content: space-between; gap: 12px; }
+.main-theme-range output { color: var(--settings-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.main-theme-range input { width: 100%; height: 24px; padding: 0; margin: 0; accent-color: var(--settings-accent); cursor: pointer; box-shadow: none; }
+.main-theme-editor input[hidden] { display: none; }
+.main-theme-editor .settings-actions { flex-wrap: wrap; }
+.main-theme-delete { padding: 16px; border: 1px solid var(--settings-border); border-radius: 12px; }
+.main-theme-delete p { margin: 0 0 14px; font-size: 13px; overflow-wrap: anywhere; }
+@media (max-width: 480px) {
+  .main-theme-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .main-theme-editor { padding: 14px; }
+  .main-theme-swatch { height: 94px; }
+  .main-theme-tile-actions button { min-height: 44px; }
+}

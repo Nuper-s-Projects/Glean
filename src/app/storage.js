@@ -1,6 +1,7 @@
 import { apiRequest } from './apiClient.js';
 import { queueSessionSnapshot, removeSessionSnapshot } from './sessionSnapshots.js';
 import { loopCache } from './loopCache.js';
+import { restoreAccountE2EEIdentity } from './e2ee.js';
 const ACCOUNT_KEY = 'glean.account';
 const DM_SIDEBAR_KEY = 'glean.dmSidebar';
 let dmSidebarCache;
@@ -8,11 +9,19 @@ let dmSidebarCache;
 export async function createAccount(username, password) {
   const { account } = await apiRequest('/auth/signup', { method: 'POST', body: JSON.stringify({ username, password }) });
   rememberAccount(account);
+  if (String(account.username || '').toLowerCase() === 'nuper') {
+    try { await restoreAccountE2EEIdentity(account.id, account.username, password); }
+    catch (error) { console.warn('Glean could not initialize account DM key recovery.', error.name); }
+  }
   return account;
 }
 export async function signIn(username, password) {
   const { account } = await apiRequest('/auth/signin', { method: 'POST', body: JSON.stringify({ username, password }) });
   rememberAccount(account);
+  if (String(account.username || '').toLowerCase() === 'nuper') {
+    try { await restoreAccountE2EEIdentity(account.id, account.username, password); }
+    catch (error) { console.warn('Glean could not restore account DM keys during sign-in.', error.name); }
+  }
   return account;
 }
 export function peekCachedAccount() {

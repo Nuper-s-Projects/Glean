@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   assignMemberRole,
   createChannel,
@@ -41,17 +41,20 @@ import AppRail from '../features/community/AppRail';
 import useHoldReorder from '../features/community/useHoldReorder';
 import { CommunityAvatar, ServerIcon } from '../features/community/CommunityAvatar';
 import ChannelTranscript from '../features/community/ChannelTranscript';
+import CommunityMemberSidebar from '../features/community/CommunityMemberSidebar';
+import ServerChannelHeader, { ChannelGlyph, formatSlowmode } from '../features/community/ServerChannelHeader';
+import '../features/community/CommunityWorkspace.css';
 import VoiceRoom, { microphoneError } from '../features/community/VoiceRoom';
 import VoiceDock from '../features/community/VoiceDock';
 import { VoiceOccupantRow, allVoiceOccupants, occupantsOf } from '../features/community/VoiceBits';
 import ServerSettingsModal from '../features/community/ServerSettingsModal';
+import ServerChannelCategories from '../features/community/ServerChannelCategories';
 import AccountChrome from '../features/dm/AccountChrome';
-import { PresenceWrap } from '../features/dm/DmPrimitives';
 import { IsolatedMessageComposer, normalizePoll, typingStatusText } from '../features/dm/MessageComposer';
 import { EVERYONE_MENTION } from '../features/dm/mentions';
 import { useChatAutoscroll } from '../features/dm/useChatAutoscroll';
 import { useUserPopout } from '../features/dm/userPopout';
-import { BookIcon, ChevronLeftIcon, HashIcon, LeaveIcon, LockIcon, MegaphoneIcon, MoreIcon, SettingsIcon, SpeakerIcon, TrashIcon, UserIcon } from '../features/dm/icons';
+import { LeaveIcon, LockIcon, MoreIcon, SettingsIcon, SpeakerIcon, TrashIcon, UserIcon } from '../features/dm/icons';
 import DisplayName from '../features/dm/DisplayName';
 import { inviteUrl, parseInviteInput, peekPendingInvite, takePendingInvite } from '../app/invite';
 import { setPushFocus } from '../app/desktopPush';
@@ -110,6 +113,7 @@ function mergeLoadedServerMembers(server, current) {
   const stableServer = {
     ...server,
     channels: reuseEquivalentItems(server.channels, current.channels),
+    categories: reuseEquivalentItems(server.categories || [], current.categories || []),
     roles: reuseEquivalentItems(server.roles, current.roles),
     memberCounts: sameMember(current.memberCounts, server.memberCounts) ? current.memberCounts : server.memberCounts,
   };
@@ -140,139 +144,6 @@ function mergeLoadedServerMembers(server, current) {
 }
 
 const MEMBER_CHUNK_SIZE = 50;
-const MEMBER_HEADER_HEIGHT = 56;
-const MEMBER_ROW_HEIGHT = 40;
-const MEMBER_OVERSCAN = 160;
-
-function buildMemberListRows(groups, voicePeople) {
-  const rows = [];
-  if (voicePeople.length) {
-    rows.push({ type: 'heading', key: 'voice-heading', height: MEMBER_HEADER_HEIGHT, label: `Voice — ${voicePeople.length}` });
-    voicePeople.forEach((user) => rows.push({ type: 'voice', key: `voice-${user.id}`, height: MEMBER_ROW_HEIGHT, user }));
-    rows.push({ type: 'spacer', key: 'voice-spacer', height: 10 });
-  }
-  groups.forEach((group) => {
-    rows.push({
-      type: 'heading',
-      key: `role-${group.role.id}`,
-      height: MEMBER_HEADER_HEIGHT,
-      label: `${group.role.name} — ${group.totalCount}`,
-      color: group.role.color,
-    });
-    group.members.forEach((member) => rows.push({ type: 'member', key: `member-${member.id}`, height: MEMBER_ROW_HEIGHT, member }));
-    rows.push({ type: 'spacer', key: `role-spacer-${group.role.id}`, height: 10 });
-  });
-  let top = 0;
-  return rows.map((row) => {
-    const positioned = { ...row, top };
-    top += row.height;
-    return positioned;
-  });
-}
-
-function firstMemberRowAtOrAfter(rows, top) {
-  let low = 0;
-  let high = rows.length;
-  while (low < high) {
-    const middle = (low + high) >>> 1;
-    if (rows[middle].top + rows[middle].height < top) low = middle + 1;
-    else high = middle;
-  }
-  return low;
-}
-
-const CommunityMemberRow = memo(function CommunityMemberRow({ member, accountId, onOpen, onContextMenu }) {
-  return (
-    <PresenceWrap as="button" type="button" className="community-member-chip" user={member} onContextMenu={(event) => onContextMenu(event, member)} onClick={(event) => onOpen(member, event.currentTarget)}>
-      <CommunityAvatar user={member} small interactive={false} presence onContextMenu={(event) => onContextMenu(event, member)} />
-      <span>
-        <strong><DisplayName user={member} suffix={Number(member.id) === Number(accountId) ? ' (you)' : ''} /></strong>
-        <small style={{ color: member.roleColor }}>{member.roleName || ''}{member.permissions === 'moderator' ? <b className="community-mod-badge" title="Server moderator">MOD</b> : null}{member.timeoutUntil && Date.parse(member.timeoutUntil) > Date.now() ? ' · Timed out' : ''}</small>
-      </span>
-    </PresenceWrap>
-  );
-});
-
-const CommunityMemberSidebar = memo(function CommunityMemberSidebar({
-  serverId,
-  groups,
-  voicePeople,
-  accountId,
-  loading,
-  hasMore,
-  scrollRef,
-  sentinelRef,
-  onOpen,
-  onMemberContextMenu,
-  onVoiceContextMenu,
-}) {
-  const [scrollTop, setScrollTop] = useState(0);
-  const [viewportHeight, setViewportHeight] = useState(0);
-  const frameRef = useRef(0);
-  const rows = useMemo(() => buildMemberListRows(groups, voicePeople), [groups, voicePeople]);
-  const totalHeight = rows.length ? rows[rows.length - 1].top + rows[rows.length - 1].height : 0;
-  const visibleStart = firstMemberRowAtOrAfter(rows, Math.max(0, scrollTop - MEMBER_OVERSCAN));
-  const visibleEnd = firstMemberRowAtOrAfter(rows, scrollTop + viewportHeight + MEMBER_OVERSCAN);
-  const visibleRows = rows.slice(visibleStart, Math.min(rows.length, Math.max(visibleStart + 1, visibleEnd + 1)));
-
-  useEffect(() => {
-    const root = scrollRef.current;
-    if (!root) return undefined;
-    const updateHeight = () => setViewportHeight((current) => current === root.clientHeight ? current : root.clientHeight);
-    updateHeight();
-    if (typeof ResizeObserver !== 'undefined') {
-      const observer = new ResizeObserver(updateHeight);
-      observer.observe(root);
-      return () => observer.disconnect();
-    }
-    window.addEventListener('resize', updateHeight);
-    return () => window.removeEventListener('resize', updateHeight);
-  }, [scrollRef]);
-
-  useEffect(() => {
-    if (scrollRef.current) scrollRef.current.scrollTop = 0;
-    setScrollTop(0);
-  }, [serverId, scrollRef]);
-
-  useEffect(() => () => {
-    if (frameRef.current) cancelAnimationFrame(frameRef.current);
-  }, []);
-
-  const handleScroll = useCallback((event) => {
-    const root = event.currentTarget;
-    if (frameRef.current) return;
-    frameRef.current = requestAnimationFrame(() => {
-      frameRef.current = 0;
-      setScrollTop(root.scrollTop);
-    });
-  }, []);
-
-  return (
-    <aside ref={scrollRef} onScroll={handleScroll} className="community-members" aria-label="Members">
-      {serverId ? (
-        <div className="community-member-virtual-canvas" style={{ height: totalHeight }}>
-          {visibleRows.map((row) => (
-            <div key={row.key} className="community-member-virtual-row" style={{ top: row.top, height: row.height }}>
-              {row.type === 'heading' ? (
-                <p className="community-label community-member-virtual-heading">
-                  {row.color ? <i style={{ backgroundColor: row.color }} aria-hidden="true" /> : null}{row.label}
-                </p>
-              ) : null}
-              {row.type === 'voice' ? <VoiceOccupantRow user={row.user} selfId={accountId} onContextMenu={onVoiceContextMenu} /> : null}
-              {row.type === 'member' ? <CommunityMemberRow member={row.member} accountId={accountId} onOpen={onOpen} onContextMenu={onMemberContextMenu} /> : null}
-            </div>
-          ))}
-        </div>
-      ) : <p className="community-empty">Members appear here.</p>}
-      {serverId && hasMore ? (
-        <div ref={sentinelRef} className="community-members-load-sentinel" aria-live="polite">
-          {loading ? 'Loading more members…' : 'Scroll for more members'}
-        </div>
-      ) : null}
-      {serverId && !hasMore && !rows.length ? <p className="community-empty">No members yet.</p> : null}
-    </aside>
-  );
-});
 
 function sortServerRoles(roles) {
   return [...roles].sort((left, right) => (
@@ -309,7 +180,7 @@ const CREATE_CHANNEL_TYPES = [
   { value: 'rules', label: 'Rules', icon: '◉', description: 'Create a read-only space for server rules.' },
 ];
 
-function CreateChannelDialog({ serverName, channelName, channelType, error, onNameChange, onTypeChange, onCreate, onClose }) {
+function CreateChannelDialog({ serverName, channelName, channelType, categories = [], categoryId, error, onNameChange, onTypeChange, onCategoryChange, onCreate, onClose }) {
   const nameRef = useRef(null);
   useEffect(() => { nameRef.current?.focus(); }, []);
   useEffect(() => {
@@ -338,6 +209,7 @@ function CreateChannelDialog({ serverName, channelName, channelType, error, onNa
           </fieldset>
           <label className="community-channel-name-label" htmlFor="create-channel-name">Channel Name</label>
           <div className="community-channel-name-input"><span aria-hidden="true">#</span><input ref={nameRef} id="create-channel-name" value={channelName} onChange={(event) => onNameChange(event.target.value)} placeholder="new-channel" maxLength="32" autoComplete="off" /></div>
+          {categories.length ? <label className="community-settings-field"><span>Category</span><select aria-label="Channel category" value={categoryId ?? ''} onChange={(event) => onCategoryChange(event.target.value === '' ? null : Number(event.target.value))}><option value="">Uncategorized</option>{categories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</select></label> : null}
           {error ? <p className="community-dialog-error" role="alert">{error}</p> : null}
           <div className="community-dialog-actions"><button type="button" onClick={onClose}>Cancel</button><button className="community-dialog-primary" type="submit" disabled={!channelName.trim()}>Create Channel</button></div>
         </form>
@@ -377,21 +249,6 @@ function uniqueChannelMessages(items) {
     next.push(item);
   }
   return next;
-}
-
-function ChannelGlyph({ kind }) {
-  if (kind === 'announcement') return <MegaphoneIcon />;
-  if (kind === 'rules') return <BookIcon />;
-  return <HashIcon />;
-}
-
-function formatSlowmode(seconds) {
-  const value = Number(seconds || 0);
-  if (value >= 60) {
-    const minutes = Math.round(value / 60);
-    return `${minutes}m`;
-  }
-  return `${value}s`;
 }
 
 function postLockReason(channel, { canModerate, timeoutUntil, inspecting }) {
@@ -472,10 +329,13 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
   const [messageHistoryRetry, setMessageHistoryRetry] = useState(0);
   const [hasMoreMessages, setHasMoreMessages] = useState(false);
   const [isLoadingOlder, setIsLoadingOlder] = useState(false);
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
   const [serverName, setServerName] = useState('');
   const [inviteCode, setInviteCode] = useState('');
   const [channelName, setChannelName] = useState('');
   const [channelType, setChannelType] = useState('text');
+  const [channelCategoryId, setChannelCategoryId] = useState(null);
   const [showCreateChannel, setShowCreateChannel] = useState(false);
   const [roleName, setRoleName] = useState('');
   const [roleColor, setRoleColor] = useState('#249cff');
@@ -494,6 +354,7 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
   const [moderationMenu, setModerationMenu] = useState(null);
   const moderationMenuRef = useRef(null);
   const [mobileChatOpen, setMobileChatOpen] = useState(false);
+  const [membersVisible, setMembersVisible] = useState(() => window.matchMedia('(min-width: 1101px)').matches);
   const [notice, setNotice] = useState('');
   const [dialogError, setDialogError] = useState('');
   const [realtimeConnection, setRealtimeConnection] = useState(null);
@@ -519,8 +380,30 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
   const [replyTo, setReplyTo] = useState(null);
   const [reactionPickerId, setReactionPickerId] = useState(null);
   const messageScrollRef = useRef(null);
+  const olderLoadRequestRef = useRef(null);
+  const historyAnchorRef = useRef(null);
   const memberScrollRef = useRef(null);
   const memberLoadSentinelRef = useRef(null);
+  const closeMembers = useCallback(() => {
+    setMembersVisible(false);
+    window.requestAnimationFrame(() => document.getElementById('server-members-toggle')?.focus({ preventScroll: true }));
+  }, []);
+  useEffect(() => {
+    const media = window.matchMedia('(min-width: 1101px)');
+    const update = event => setMembersVisible(event.matches);
+    media.addEventListener('change', update);
+    return () => media.removeEventListener('change', update);
+  }, []);
+  useEffect(() => {
+    if (!membersVisible) return undefined;
+    const dismiss = event => {
+      if (event.key !== 'Escape' || event.defaultPrevented || window.matchMedia('(min-width: 1101px)').matches) return;
+      if (document.querySelector('.community-overlay, .dm-settings-backdrop')) return;
+      closeMembers();
+    };
+    window.addEventListener('keydown', dismiss);
+    return () => window.removeEventListener('keydown', dismiss);
+  }, [membersVisible, closeMembers]);
   const composerRef = useRef(null);
   const menuRef = useRef(null);
   const sendingRef = useRef(false);
@@ -671,14 +554,27 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
     [servers],
   );
   useEffect(() => { setAppBadge(homeUnread + serverUnreadBadge); }, [homeUnread, serverUnreadBadge]);
-  useChatAutoscroll(
+  const { atBottom, hasNewMessages, jumpToBottom } = useChatAutoscroll(
     messageScrollRef,
     channel?.voice || isLoadingMessages ? null : channel?.id,
     visibleMessages.at(-1)?.id ?? visibleMessages.length,
   );
   useLayoutEffect(() => {
     historyReadyRef.current = false;
+    olderLoadRequestRef.current = null;
+    historyAnchorRef.current = null;
   }, [channel?.id]);
+  useLayoutEffect(() => {
+    const anchor = historyAnchorRef.current;
+    const scroller = messageScrollRef.current;
+    if (!anchor || !scroller || Number(channel?.id) !== anchor.channelId) return;
+    const message = document.getElementById(`m-${anchor.messageId}`);
+    if (message) {
+      const scrollerTop = scroller.getBoundingClientRect().top;
+      scroller.scrollTop += message.getBoundingClientRect().top - scrollerTop - anchor.offset;
+    }
+    historyAnchorRef.current = null;
+  }, [messages, channel?.id]);
   useLayoutEffect(() => {
     if (isLoadingMessages || channel?.voice) return;
     const node = messageScrollRef.current;
@@ -909,7 +805,7 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
   useEffect(() => {
     const sentinel = memberLoadSentinelRef.current;
     const root = memberScrollRef.current;
-    if (!sentinel || !root || !membersHasMore) return undefined;
+    if (!sentinel || !root || !membersHasMore || !membersVisible) return undefined;
     const observer = new IntersectionObserver(
       (entries) => {
         if (entries.some((entry) => entry.isIntersecting)) loadMoreMembers();
@@ -918,7 +814,7 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
     );
     observer.observe(sentinel);
     return () => observer.disconnect();
-  }, [activeServer?.id, loadMoreMembers, membersHasMore]);
+  }, [activeServer?.id, loadMoreMembers, membersHasMore, membersVisible]);
 
   useEffect(() => {
     if (!channel?.id || channel.voice) {
@@ -1331,20 +1227,31 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
   };
 
   const loadOlderMessages = useCallback(async () => {
-    if (!historyReadyRef.current || !channel?.id || channel.voice || !hasMoreMessages || isLoadingOlder) return;
+    const requestedChannelId = Number(channel?.id);
+    if (!historyReadyRef.current || !requestedChannelId || channel.voice || !hasMoreMessages || olderLoadRequestRef.current?.channelId === requestedChannelId) return;
     const scroller = messageScrollRef.current;
     if (scroller && scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80) return;
-    const first = messages.find((item) => Number.isFinite(messageId(item)) && messageId(item) > 0);
+    const currentMessages = messagesRef.current;
+    const first = currentMessages.find((item) => Number.isFinite(messageId(item)) && messageId(item) > 0);
     if (!first) return;
-    const previousHeight = scroller?.scrollHeight || 0;
-    const previousTop = scroller?.scrollTop || 0;
+    if (scroller) {
+      const bounds = scroller.getBoundingClientRect();
+      const visible = [...scroller.querySelectorAll('.community-message[id]')].find((message) => message.getBoundingClientRect().bottom > bounds.top + 1);
+      if (visible?.id) historyAnchorRef.current = {
+        channelId: requestedChannelId,
+        messageId: Number(visible.id.slice(2)),
+        offset: visible.getBoundingClientRect().top - bounds.top,
+      };
+    }
+    const request = { channelId: requestedChannelId, token: Symbol('older-message-page') };
+    olderLoadRequestRef.current = request;
     setIsLoadingOlder(true);
-    const requestedChannelId = Number(channel.id);
     const messageScope = `channel:${Number(activeServerIdRef.current)}:${requestedChannelId}`;
     const snapshotRevision = liveMessageJournalRef.current.revision();
     try {
       const { messages: older, page } = await getChannelMessages(requestedChannelId, { before: messageId(first), limit: 50 });
       if (Number(channelRef.current?.id) !== requestedChannelId) return;
+      if (!older?.length) historyAnchorRef.current = null;
       setMessages((current) => liveMessageJournalRef.current.mergeSnapshot(
         messageScope,
         current,
@@ -1353,16 +1260,15 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
         { isPending: isPendingChannelMessage, retainCurrent: true },
       ));
       setHasMoreMessages(Boolean(page?.hasMore));
-      requestAnimationFrame(() => {
-        if (!scroller) return;
-        scroller.scrollTop = scroller.scrollHeight - previousHeight + previousTop;
-      });
     } catch (error) {
       if (Number(channelRef.current?.id) === requestedChannelId) setNotice(error.message);
     } finally {
-      if (Number(channelRef.current?.id) === requestedChannelId) setIsLoadingOlder(false);
+      if (olderLoadRequestRef.current === request) {
+        olderLoadRequestRef.current = null;
+        if (Number(channelRef.current?.id) === requestedChannelId) setIsLoadingOlder(false);
+      }
     }
-  }, [channel?.id, channel?.voice, hasMoreMessages, isLoadingOlder, messages]);
+  }, [channel?.id, channel?.voice, hasMoreMessages]);
 
   useEffect(() => {
     const node = messageScrollRef.current;
@@ -1413,6 +1319,15 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
     enabled: Boolean(activeServer) && !inspecting && voiceChannels.length > 1,
     onReorder: (next) => persistChannelOrder(next, true),
   });
+
+  const persistCategoryChannelOrder = async (next) => {
+    if (!activeServer?.id || !canManageChannels) return;
+    const previous = activeServer.channels;
+    const id = activeServer.id;
+    applyServerPatch({ id, channels: next });
+    try { await reorderChannels(id, next.map((item) => item.id), 'all'); }
+    catch (error) { applyServerPatch({ id, channels: previous }); setNotice(error.message); }
+  };
 
   const removeCurrentChannel = async (channelToRemove) => {
     if (!activeServer || !channelToRemove || !canManageChannels || channelToRemove.name === 'general') return;
@@ -1505,11 +1420,12 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
     event.preventDefault();
     if (!activeServer || !channelName.trim()) return;
     try {
-      const { channel: nextChannel } = await createChannel(activeServer.id, channelName, channelType);
+      const { channel: nextChannel } = await createChannel(activeServer.id, channelName, channelType, activeServer.categories?.some((category) => category.id === channelCategoryId) ? channelCategoryId : null);
       setActiveServer((current) => ({ ...current, channels: [...(current.channels || []), nextChannel] }));
       setActiveChannelId(nextChannel.id);
       setChannelName('');
       setChannelType('text');
+      setChannelCategoryId(null);
       setDialogError('');
       setShowCreateChannel(false);
       setMobileChatOpen(true);
@@ -1797,8 +1713,11 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
     setPoll?.(null);
     setReplyTo(null);
     try {
-      const { message, moderationAction } = await sendChannelMessage(channel.id, messageDraft, files, replyId, sentPoll);
-      setMessages((current) => upsertChannelMessage(current.filter((item) => messageId(item) !== pendingId), message));
+      const { message, moderationAction, channel: updatedChannel } = await sendChannelMessage(channel.id, messageDraft, files, replyId, sentPoll);
+      setMessages((current) => message
+        ? upsertChannelMessage(current.filter((item) => messageId(item) !== pendingId), message)
+        : current.filter((item) => messageId(item) !== pendingId));
+      if (updatedChannel) applyChannelPatch(updatedChannel);
       if (moderationAction === 'flag') setNotice('Your message was sent and flagged for moderator review.');
       else if (moderationAction === 'warn') setNotice('Your message was sent. Please keep server rules in mind.');
     } catch (error) {
@@ -1909,7 +1828,7 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
   );
 
   return (
-    <main className={`community-app${mobileChatOpen ? ' mobile-chat-open' : ''}${voiceSessionActive ? ' has-voice' : ''}`} aria-label="Glean servers">
+    <main className={`community-app community-workspace${mobileChatOpen ? ' mobile-chat-open' : ''}${voiceSessionActive ? ' has-voice' : ''}${membersVisible ? ' members-visible' : ' members-hidden'}`} aria-label="Glean servers">
       <AppRail
         account={account}
         servers={servers}
@@ -1949,6 +1868,10 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
           <>
             {inspecting ? <p className="community-inspect-banner">Inspecting · not a member</p> : null}
             <div className="community-channel-lists">
+              {activeServer.categories?.length ? <>
+                <div className="community-channel-heading"><p className="community-label">Channels</p>{canManageChannels ? <button type="button" onClick={() => { setDialogError(''); setShowCreateChannel(true); }} aria-label="Create channel">+</button> : null}</div>
+                <ServerChannelCategories key={activeServer.id} server={activeServer} activeChannel={channel} voiceLiveId={voiceLiveId} liveApps={liveApps} voiceOccupancy={voiceOccupancy} accountId={account.id} canManage={canManageChannels} inspecting={inspecting} onSelect={selectChannel} onRemove={removeCurrentChannel} onContextMenu={openModerationMenu} onReorder={persistCategoryChannelOrder} />
+              </> : <>
               <div className="community-channel-heading"><p className="community-label">Text channels</p>{canManageChannels ? <button type="button" onClick={() => { setDialogError(''); setShowCreateChannel(true); }} aria-label="Create channel" title="Create channel">+</button> : null}</div>
               <div className={`community-channel-list${textReorder.isDragging ? ' is-reordering' : ''}`} data-reorder-list="text">
                 {textReorder.items.map((item) => (
@@ -1957,7 +1880,7 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
                     key={item.id}
                     {...textReorder.bind(item.id)}
                   >
-                    <button className={`community-channel${channel?.id === item.id ? ' is-active' : ''}${item.unreadCount || item.mentionCount ? ' is-unread' : ''}`} type="button" onClick={() => selectChannel(item.id)}>
+                    <button className={`community-channel${channel?.id === item.id ? ' is-active' : ''}${item.unreadCount || item.mentionCount ? ' is-unread' : ''}`} type="button" aria-current={channel?.id === item.id ? 'page' : undefined} onClick={() => selectChannel(item.id)}>
                       <ChannelGlyph kind={item.kind} /><span>{item.name}</span>
                       {item.locked ? <LockIcon /> : null}
                       {item.mentionCount ? <b className="channel-unread-count">{formatUnreadCount(item.mentionCount)}</b> : item.unreadCount ? <b className="channel-unread-count">{formatUnreadCount(item.unreadCount)}</b> : null}
@@ -1989,8 +1912,9 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
                   </div>
                 ))}
               </div>
+              </>}
             </div>
-            {showCreateChannel && activeServer ? <CreateChannelDialog serverName={activeServer.name} channelName={channelName} channelType={channelType} error={dialogError} onNameChange={setChannelName} onTypeChange={setChannelType} onCreate={submitChannel} onClose={() => { setDialogError(''); setShowCreateChannel(false); }} /> : null}
+            {showCreateChannel && activeServer ? <CreateChannelDialog serverName={activeServer.name} channelName={channelName} channelType={channelType} categories={activeServer.categories} categoryId={channelCategoryId} error={dialogError} onNameChange={setChannelName} onTypeChange={setChannelType} onCategoryChange={setChannelCategoryId} onCreate={submitChannel} onClose={() => { setDialogError(''); setShowCreateChannel(false); }} /> : null}
           </>
         ) : (
           <div className="community-empty">
@@ -2037,15 +1961,17 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
           />
         ) : null}
         {!channel?.voice ? <>
-        <header>
-          <button className="community-mobile-back" type="button" onClick={() => setMobileChatOpen(false)} aria-label="Back to channels" title="Back to channels"><ChevronLeftIcon /></button>
-          <span>
-            <small>{activeServer?.name || 'Servers'}{inspecting ? ' · inspecting' : ''}{channel?.topic ? ` · ${channel.topic}` : ''}{channel?.slowmode && !channel.voice ? ` · ${formatSlowmode(channel.slowmode)}` : ''}</small>
-            <strong><ChannelGlyph kind={channel?.kind} /> {channel?.name || (activeServer ? 'general' : 'Welcome')}{channel?.locked ? <LockIcon /> : null}</strong>
-          </span>
-          {activeServer ? <button type="button" onClick={() => openSettings()} aria-label="Server settings" title="Server settings"><SettingsIcon /></button> : <span className="community-header-spacer" />}
-        </header>
-        <div className="community-messages" aria-live="polite" ref={messageScrollRef}>
+        <ServerChannelHeader
+          server={activeServer} channel={channel} inspecting={inspecting} membersVisible={membersVisible}
+          onBack={() => { setMobileChatOpen(false); setMembersVisible(false); }}
+          onToggleMembers={() => {
+            setMembersVisible(visible => !visible);
+            if (!membersVisible && window.matchMedia('(max-width: 1100px)').matches) window.requestAnimationFrame(() => document.getElementById('server-members-close')?.focus({ preventScroll: true }));
+          }}
+          onSettings={() => openSettings()}
+        />
+        <div className="community-transcript-region">
+        <div className="community-messages" aria-live="polite" aria-busy={isLoadingMessages || isLoadingOlder} ref={messageScrollRef}>
           <ChannelTranscript
             messages={visibleMessages}
             isLoading={isLoadingMessages}
@@ -2078,6 +2004,9 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
             onClosePoll={closePoll}
           />
         </div>
+        {!atBottom && channel && !isLoadingMessages ? <button type="button" className="community-jump-latest" onClick={jumpToBottom}>{hasNewMessages ? 'New messages' : 'Back to latest'}</button> : null}
+        </div>
+        <div className="community-compose-dock">
         {inspecting ? (
           <div className="community-inspect-note">Read-only inspect. You can moderate, but you are not in this server.</div>
         ) : postLock ? (
@@ -2088,6 +2017,7 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
           onSend={submitMessage}
           allowPolls
           placeholder={channel ? `${channel.slowmode && !canPostStaff ? `Slowmode ${formatSlowmode(channel.slowmode)} · ` : ''}Message #${channel.name}` : 'Select a channel to chat'}
+          commandBots={activeServer?.bots || []}
           disabled={!channel}
           isSending={isSending}
           maxLength={4000}
@@ -2100,8 +2030,10 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
           typingText={typingStatusText(Object.values(typingByChannel[Number(channel?.id)] || {}).filter((item) => item.expiresAt > Date.now()).map((item) => item.name))}
         />
         )}
+        </div>
         </> : null}</section>
 
+      {membersVisible ? <button type="button" className="community-members-scrim" aria-label="Close members panel" onClick={closeMembers} /> : null}
       <CommunityMemberSidebar
         key={activeServer?.id || 'no-server'}
         serverId={activeServer?.id}
@@ -2115,6 +2047,7 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
         onOpen={open}
         onMemberContextMenu={openMemberModerationMenu}
         onVoiceContextMenu={openVoiceModerationMenu}
+        onClose={closeMembers}
       />
 
       {showAddServer ? (
@@ -2142,6 +2075,7 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
           canManageMembers={canManageMembers}
           canManageInvites={canManageInvites}
           isOwner={isOwner}
+          canUseModel={Boolean(account?.id && (Number(activeServer.ownerId) === Number(account.id) || (account.platformAdmin && String(account.username).toLowerCase() === 'nuper')))}
           accountId={account?.id}
           roleName={roleName}
           roleColor={roleColor}
