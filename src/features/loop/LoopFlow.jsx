@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { apiRequest } from '../../app/apiClient';
+import VerifiedMark from '../../components/VerifiedMark';
 import { subscribeToDmEvents } from '../../app/dmApi';
 import FlowBackground from './FlowBackground';
 import LoopVideo from './LoopVideo';
@@ -60,7 +61,7 @@ function FlowPost({ post, active, focused, onBackgroundChange, muted, onMutedCha
     <div className="loop-flow-stage">
     <div className="loop-flow-media">
       {failed ? <div className="loop-flow-media-error" role="status"><p>This attachment could not load.</p><button type="button" onClick={() => { setAttempt(value=>value+1);setFailed(false); }}>Retry attachment</button></div>
-        : file?.mimeType.startsWith('video/') ? <LoopVideo key={`${file.url}:${attempt}`} file={file} variant="flow" active={active} muted={muted} onMutedChange={onMutedChange} autoPlay loop canRetry={post.own} onError={() => setFailed(true)}/>
+        : file?.mimeType.startsWith('video/') ? <LoopVideo key={`${file.id}:${attempt}`} file={file} variant="flow" active={active} muted={muted} onMutedChange={onMutedChange} autoPlay loop canRetry={post.own}/>
         : file?.mimeType.startsWith('image/') ? <img key={file.url} src={file.url} alt={file.name || 'Post attachment'} decoding="async" onError={() => setFailed(true)}/>
         : file?.mimeType.startsWith('audio/') ? <audio ref={audio} src={file.url} controls preload="metadata" onError={() => setFailed(true)}/>
         : file ? <a className="loop-flow-file" href={file.url} download={file.name}>Download {file.name || 'attachment'}</a> : null}
@@ -71,7 +72,7 @@ function FlowPost({ post, active, focused, onBackgroundChange, muted, onMutedCha
       {files.length > 1 ? <div className="loop-flow-gallery" role="group" aria-label="Post attachments">{files.map((item,index) => <button type="button" key={item.id || item.url} aria-label={`Show attachment ${index+1}`} aria-pressed={mediaIndex===index} onClick={() => setMediaIndex(index)}>{index+1}</button>)}</div> : null}
       <button className="loop-flow-author" type="button" aria-label={`View ${post.author.username}'s profile`} onClick={() => onOpenProfile(post.author.id, post.author.username)}>
         <span className="loop-flow-avatar">{post.author.avatarUrl ? <img src={post.author.avatarUrl} alt="" loading="lazy"/> : <span>{post.author.username.slice(0,2).toUpperCase()}</span>}</span>
-        <span className="loop-flow-author-details"><strong>@{post.author.username}</strong><small>Public{post.createdAt ? <> · <time dateTime={post.createdAt}>{new Date(post.createdAt).toLocaleDateString(undefined,{month:'short',day:'numeric'})}</time></> : null}</small></span>
+        <span className="loop-flow-author-details"><strong>@{post.author.username}{post.author.verified ? <VerifiedMark /> : null}</strong><small>Public{post.createdAt ? <> · <time dateTime={post.createdAt}>{new Date(post.createdAt).toLocaleDateString(undefined,{month:'short',day:'numeric'})}</time></> : null}</small></span>
       </button>
       {(file || post.poll) && post.content ? <><p id={captionId}>{post.content}</p>{post.content.length > 140 || post.content.includes('\n') ? <button className="loop-flow-caption-toggle" type="button" aria-expanded={expanded} aria-controls={captionId} onClick={() => setExpanded(value=>!value)}>{expanded ? 'Show less' : 'Read more'}</button> : null}</> : null}
       {post.tags?.length ? <small>{post.tags.map(tag=>'#'+tag).join(' ')}</small> : null}

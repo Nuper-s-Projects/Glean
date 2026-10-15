@@ -1,0 +1,34 @@
+/* This is an app visual-effects fallback, not a browser GPU configuration switch. */
+html[data-glean-gpu-effects='off'] *,
+html[data-glean-gpu-effects='off'] *::before,
+html[data-glean-gpu-effects='off'] *::after {
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+  will-change: auto !important;
+}
+html[data-glean-gpu-effects='off'] [data-glean-flat-surface] {
+  background: var(--dm-panel, var(--card-background));
+}
+html[data-glean-gpu-effects='off'] .community-app .dm-composer { transform: none; }
+html[data-glean-gpu-effects='off'] .glean-theme-backdrop::before {
+  filter: contrast(var(--glean-theme-contrast, 100%)) saturate(var(--glean-theme-saturation, 100%));
+  inset: 0;
+}
+html[data-glean-gpu-effects='off'] .dm-contact-profile.has-profile-background::before {
+  filter: contrast(var(--dm-profile-contrast, 100%)) saturate(var(--dm-profile-saturation, 100%));
+  inset: 0;
+}
+html[data-glean-gpu-effects='off'] .loop-post-attachment-background img { filter: brightness(.42); }
+html[data-glean-gpu-effects='off'] .loop-flow-background-layer > .loop-post-attachment-background img { filter: brightness(.55); }
+html[data-glean-gpu-effects='off'] .loop-post-attachment-border::before { filter: brightness(.85); }
+.settings-renderer-restart {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  background: color-mix(in srgb, var(--settings-accent) 8%, transparent);
+  border: 1px solid var(--settings-border);
+  border-radius: 9px;
+}
+.settings-renderer-restart p { flex: 1 1 230px; margin: 0; font-size: 13px; line-height: 1.5; }

@@ -11,11 +11,9 @@ function urlBase64ToUint8Array(value) {
 }
 
 function matchesFocus(payload) {
-  if (payload?.serverId) {
-    try { if (window.localStorage.getItem(`glean.mutedServer.${Number(payload.serverId)}`) === '1') return true; } catch { /* ignore storage failures */ }
-  }
   if (document.visibilityState !== 'visible' || !document.hasFocus()) return false;
   const path = window.location.pathname;
+  if (payload?.kind === 'loop') return path === '/loop';
   if (payload?.kind === 'dm') return path === '/dms' && Number(window.__gleanPushFocus?.id) === Number(payload.conversationId);
   if (payload?.kind === 'channel') return path === '/servers' && Number(window.__gleanPushFocus?.id) === Number(payload.channelId);
   if (payload?.kind === 'friends') return path === '/dms';
@@ -65,7 +63,7 @@ export function setPushFocus(next) {
 }
 
 export async function startDesktopPush() {
-  if (!('serviceWorker' in navigator) || !window.isSecureContext) return;
+  if (!('serviceWorker' in navigator) || !('Notification' in window) || !window.isSecureContext) return;
   if (!started) {
     started = true;
     navigator.serviceWorker.addEventListener('message', (event) => {
@@ -82,10 +80,10 @@ export async function startDesktopPush() {
 
 export async function enableDesktopPush() {
   if (!('Notification' in window) || !window.isSecureContext) throw new Error('This browser cannot show desktop notifications.');
-  await registration();
   const permission = await Notification.requestPermission();
   if (permission !== 'granted') throw new Error(permission === 'denied' ? 'Notifications are blocked for Glean in this browser.' : 'Notifications were not allowed.');
-  await persistSubscription();
+  await registration();
+  if (!(await persistSubscription())) throw new Error('This browser cannot receive push notifications.');
   return true;
 }
 

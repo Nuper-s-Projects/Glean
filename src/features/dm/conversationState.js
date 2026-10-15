@@ -1,9 +1,11 @@
+import { retainLocalImagePreviews } from '../../app/attachmentPreviews.js';
+
 export function selectConversations(conversations, query = '', filter = 'all') {
   const needle = query.trim().toLocaleLowerCase();
   return conversations.filter((conversation) => {
-    if (filter === 'unread' && !conversation.unreadCount) return false;
+    if (filter === 'unread' && (!conversation.unreadCount || conversation.muted)) return false;
     if (filter === 'pinned' && !conversation.pinned) return false;
-    return !needle || `${conversation.user?.username || ''}\n${conversation.lastMessage || ''}`.toLocaleLowerCase().includes(needle);
+    return !needle || `${conversation.name || conversation.user?.username || ''}\n${(conversation.members || []).map(member => member.username).join(' ')}\n${conversation.lastMessage || ''}`.toLocaleLowerCase().includes(needle);
   }).sort((left, right) => Number(Boolean(right.pinned)) - Number(Boolean(left.pinned))
     || (Date.parse(right.lastMessageAt) || 0) - (Date.parse(left.lastMessageAt) || 0)
     || Number(right.id) - Number(left.id));
@@ -11,7 +13,7 @@ export function selectConversations(conversations, query = '', filter = 'all') {
 
 export function selectUnstartedFriends(friends, conversations, query = '', filter = 'all') {
   if (filter !== 'all') return [];
-  const represented = new Set(conversations.map(conversation => Number(conversation.user?.id)));
+  const represented = new Set(conversations.filter(conversation => conversation.kind !== 'group').map(conversation => Number(conversation.user?.id)));
   const needle = query.trim().toLocaleLowerCase();
   return friends.filter(friend => {
     const id = Number(friend.id);
@@ -22,6 +24,7 @@ export function selectUnstartedFriends(friends, conversations, query = '', filte
 }
 
 export function reconcileSentMessage(messages, optimisticId, message) {
+  message = retainLocalImagePreviews(message, messages.find(item => Number(item.id) === Number(message.id)));
   const remaining = messages.filter((item) => item.id !== optimisticId
     && Number(item.id) !== Number(message.id)
     && !(message.clientMessageId && item.clientMessageId === message.clientMessageId));
@@ -41,4 +44,12 @@ export function recentHistorySnapshot(current, incoming, hasMore) {
   if (!hasMore || !incoming.length) return incoming;
   const oldestId = Math.min(...incoming.map(message => Number(message.id)).filter(Number.isSafeInteger));
   return [...current.filter(message => Number.isSafeInteger(Number(message.id)) && Number(message.id) < oldestId), ...incoming];
+}
+
+export function trimInactiveTranscripts(cache, selectedId) {
+  for (const [id, transcript] of cache) {
+    if (Number(id) === Number(selectedId)) continue;
+    if (transcript.messages.some(message => message.status && message.status !== 'sent')) continue;
+    cache.delete(id);
+  }
 }

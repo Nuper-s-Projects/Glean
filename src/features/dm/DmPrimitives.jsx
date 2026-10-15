@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import { decryptAttachment } from '../../app/e2ee';
 import { usePresence } from '../../app/presence';
 import { AttachIcon, UserIcon } from './icons';
@@ -12,7 +12,7 @@ export function PresenceWrap({ user, className = '', as: Tag = 'div', children, 
   return <Tag className={`${className}${status === 'offline' ? ' is-offline' : ''}`} {...props}>{children}</Tag>;
 }
 
-export function Avatar({ user, username, avatarUrl, large = false, interactive = true, presence: showPresence = false }) {
+export const Avatar = memo(function Avatar({ user, username, avatarUrl, large = false, interactive = true, presence: showPresence = false }) {
   const { open } = useUserPopout();
   const profile = user || ((username || avatarUrl) ? { username, avatarUrl } : null);
   const status = usePresence(profile?.id, showPresence ? (profile?.presence || 'offline') : '');
@@ -33,7 +33,7 @@ export function Avatar({ user, username, avatarUrl, large = false, interactive =
       {node}
     </button>
   );
-}
+});
 
 export function MessageAttachment({ attachment, message, accountId }) {
   const { open } = useImagePreview();
@@ -52,7 +52,7 @@ export function MessageAttachment({ attachment, message, accountId }) {
   const kind = classifyFileKind(attachment.type, attachment.name);
 
   const load = useCallback(async () => {
-    if (!attachment.encrypted || sourceRef.current || loadLockRef.current) return;
+    if (attachment.localFile || !attachment.encrypted || sourceRef.current || loadLockRef.current) return;
     loadLockRef.current = true;
     const generation = generationRef.current;
     setState('loading');
@@ -69,7 +69,7 @@ export function MessageAttachment({ attachment, message, accountId }) {
     } finally {
       if (generation === generationRef.current) loadLockRef.current = false;
     }
-  }, [accountId, attachment.id, attachment.encrypted]);
+  }, [accountId, attachment.id, attachment.encrypted, attachment.localFile]);
 
   useEffect(() => {
     generationRef.current += 1;
@@ -80,6 +80,14 @@ export function MessageAttachment({ attachment, message, accountId }) {
       sourceRef.current = null;
       loadLockRef.current = false;
     };
+    if (attachment.localFile) {
+      const url = URL.createObjectURL(attachment.localFile);
+      objectUrlRef.current = url;
+      sourceRef.current = url;
+      setSource(url);
+      setState('ready');
+      return release;
+    }
     if (!attachment.encrypted) {
       setSource(attachment.url);
       return release;
@@ -103,7 +111,7 @@ export function MessageAttachment({ attachment, message, accountId }) {
     }, { rootMargin: '320px 0px' });
     observer.observe(target);
     return () => { observer.disconnect(); release(); };
-  }, [attachment.id, attachment.encrypted, attachment.size, attachment.url, load, kind]);
+  }, [attachment.id, attachment.encrypted, attachment.size, attachment.url, attachment.localFile, load, kind]);
 
   if (state === 'error') return <button type="button" className="dm-file-attachment dm-attachment-error" onClick={load}><AttachIcon /><span><strong>{attachment.name}</strong><small>Decryption failed · Retry</small></span></button>;
   if (!source && attachment.encrypted) return <button ref={previewRef} type="button" className="dm-file-attachment dm-attachment-loading" onClick={load} disabled={state === 'loading'}><AttachIcon /><span><strong>{attachment.name}</strong><small>{state === 'loading' ? 'Decrypting…' : `Encrypted · ${formatFileSize(attachment.size)}`}</small></span></button>;
@@ -116,7 +124,7 @@ export function MessageAttachment({ attachment, message, accountId }) {
         open({ src: source, alt: attachment.name, name: attachment.name });
       }}
     >
-      <img src={source} alt={attachment.name} loading="lazy" decoding="async" />
+      {source ? <img src={source} alt={attachment.name} loading={attachment.localFile || attachment.encrypted ? 'eager' : 'lazy'} decoding="async" /> : <span role="status">Preparing preview…</span>}
     </button>
   );
   if (kind === 'video') return <VideoAttachment src={source} name={attachment.name} />;

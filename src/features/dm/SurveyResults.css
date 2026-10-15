@@ -1,0 +1,24 @@
+.survey-results { display: grid; gap: 24px; min-width: 0; color: var(--text); }
+.survey-results-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.survey-results-toolbar > div { display: grid; gap: 4px; }
+.survey-results-toolbar strong { font-size: 32px; }
+.survey-results-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; }
+.survey-results-breakdown, .survey-results-answers article { background: var(--card-background); border: 1px solid var(--input-border); border-radius: 16px; padding: 20px; min-width: 0; }
+.survey-results h2 { font-size: 18px; margin: 0 0 16px; }
+.survey-results-breakdown ul { list-style: none; padding: 0; margin: 0; display: grid; gap: 16px; }
+.survey-results-breakdown li > div:first-child { display: flex; justify-content: space-between; gap: 12px; font-size: 14px; }
+.survey-results-breakdown strong { white-space: nowrap; }
+.survey-results-breakdown small { font-weight: 400; opacity: .75; }
+.survey-results-track { height: 5px; margin-top: 8px; background: var(--input-border); border-radius: 5px; overflow: hidden; }
+.survey-results-track span { display: block; height: 100%; background: var(--accent, #00afff); border-radius: inherit; }
+.survey-results-answers { display: grid; gap: 16px; }
+.survey-results-answers > h2, .survey-results-answers > p { margin: 0; }
+.survey-results-answers > p { font-size: 14px; opacity: .75; }
+.survey-results-answers header { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+.survey-results-answers time { font-size: 12px; opacity: .75; }
+.survey-results-answers dl { margin: 16px 0 0; display: grid; gap: 12px; }
+.survey-results-answers dt { font-size: 12px; opacity: .75; margin-bottom: 4px; }
+.survey-results-answers dd { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; }
+.survey-results-answers header strong { overflow-wrap: anywhere; }
+.survey-results-skeleton { padding: 32px; border-radius: 16px; background: var(--card-background); }
+@media (max-width: 900px) { .survey-results-grid { grid-template-columns: minmax(0, 1fr); } }

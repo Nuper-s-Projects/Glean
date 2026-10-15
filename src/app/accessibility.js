@@ -1,4 +1,4 @@
-export const DEFAULT_ACCESSIBILITY = Object.freeze({ theme: 'system', contrast: 100, saturation: 100, glassFrost: 50, glassDepth: 20, glassRefraction: 100 });
+export const DEFAULT_ACCESSIBILITY = Object.freeze({ theme: 'system', contrast: 100, saturation: 100, glassFrost: 50, glassDepth: 20, glassRefraction: 100, showLoopStreakReminder: true });
 
 export function normalizeAccessibility(value = {}) {
   const theme = ['system', 'light', 'dark'].includes(value.theme) ? value.theme : DEFAULT_ACCESSIBILITY.theme;
@@ -14,6 +14,7 @@ export function normalizeAccessibility(value = {}) {
     glassFrost: Number.isFinite(glassFrost) ? Math.min(100, Math.max(0, Math.round(glassFrost))) : DEFAULT_ACCESSIBILITY.glassFrost,
     glassDepth: Number.isFinite(glassDepth) ? Math.min(100, Math.max(0, Math.round(glassDepth))) : DEFAULT_ACCESSIBILITY.glassDepth,
     glassRefraction: Number.isFinite(glassRefraction) ? Math.min(100, Math.max(0, Math.round(glassRefraction))) : DEFAULT_ACCESSIBILITY.glassRefraction,
+    showLoopStreakReminder: value.showLoopStreakReminder !== false,
     reduceMotion: value.reduceMotion === true || value.accessibilityReduceMotion === true,
   };
 }
@@ -32,9 +33,6 @@ export function applyAccessibilitySettings(value) {
   if (!screen) return;
   screen.style.setProperty('--glean-accessibility-contrast', `${settings.contrast}%`);
   screen.style.setProperty('--glean-accessibility-saturation', `${settings.saturation}%`);
-  document.documentElement.style.setProperty('--glean-liquid-glass-frost', String(settings.glassFrost / 100));
-  document.documentElement.style.setProperty('--glean-liquid-glass-depth', String(settings.glassDepth / 100));
-  document.documentElement.style.setProperty('--glean-liquid-glass-refraction', String(settings.glassRefraction / 100));
   screen.classList.toggle('has-accessibility-adjustments', settings.contrast !== 100 || settings.saturation !== 100);
   screen.classList.toggle('is-reduced-motion', reduceMotion);
 }

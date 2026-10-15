@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useId, memo } from 'react';
-import { Liquid } from 'liquid-gooey';
-import { Glass } from '@samasante/liquid-glass';
+import { createPortal } from 'react-dom';
+import { prepareUploadFiles } from '../../app/imageUpload';
+import { Liquid } from './VisualEffects';
+import { startVisualLoop } from '../../app/pageActivity';
 import { AttachIcon, CloseIcon, MegaphoneIcon, MicIcon, PlusIcon, PollIcon, SendIcon } from './icons';
 import { classifyFileKind, formatMediaTime } from './formatters';
 import { insertMention, isEveryoneMention, mentionQueryAt } from './mentions';
@@ -9,33 +11,72 @@ import { Avatar } from './DmPrimitives';
 import { useImagePreview } from './ImagePreview';
 import { canRecordVoice, pickRecorderType, voiceFileFromBlob, VOICE_MAX_MS } from './voiceNote';
 import { apiRequest } from '../../app/apiClient';
-import { normalizeAccessibility } from '../../app/accessibility';
 import { matchingBotCommands } from './botCommands';
+import EmojiPicker from './EmojiPicker';
 
 const MAX_ATTACHMENTS = 10;
 const MAX_ATTACHMENT_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_MESSAGE_BYTES = 2 * 1024 * 1024 * 1024;
-export function glassOptics(frostSetting, depthSetting = 20, refractionSetting = 100) {
-  const frost = Math.min(1, Math.max(0, frostSetting / 100));
-  const depth = Math.min(1, Math.max(0, depthSetting / 100));
-  const refractionStrength = Math.min(1, Math.max(0, refractionSetting / 100));
-  const frostAmount = 0.15 + (frost ** 2) * 8;
-  const refraction = 1 - frost * 0.82;
-  return {
-    mapSize: Math.round(154 * (1 - frost * 0.5)),
-    frost: frostAmount,
-    strength: 0.1 * refractionStrength * refraction,
-    dispersion: 0,
-    brightness: 0,
-    specular: 0,
-    sheen: 0,
-    sheenAngle: 315,
-    sheenWidth: 4,
-    glow: 0,
-    curvature: 1,
-    depth,
-    bend: 0,
-  };
+const EMOJI_THEME_VARIABLES = ['--card-background', '--page-background', '--text', '--muted-text', '--dm-border', '--input-background', '--input-border', '--accent', '--accent-soft'];
+
+function ComposerEmojiPopover({ anchorRef, onPick, onClose }) {
+  const overlayRef = useRef(null);
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+
+  useLayoutEffect(() => {
+    const overlay = overlayRef.current;
+    const anchor = anchorRef.current;
+    if (!overlay || !anchor) return undefined;
+    const palette = getComputedStyle(anchor);
+    for (const variable of EMOJI_THEME_VARIABLES) overlay.style.setProperty(variable, palette.getPropertyValue(variable));
+
+    const position = () => {
+      const viewport = window.visualViewport;
+      const x = viewport?.offsetLeft || 0;
+      const y = viewport?.offsetTop || 0;
+      const width = viewport?.width || window.innerWidth;
+      const height = viewport?.height || window.innerHeight;
+      const bounds = anchor.getBoundingClientRect();
+      const pickerWidth = Math.min(340, Math.max(1, width - 24));
+      const pickerHeight = Math.min(380, Math.max(1, height - 24));
+      const below = bounds.bottom + 8;
+      const above = bounds.top - pickerHeight - 8;
+      const top = below + pickerHeight <= y + height - 12 ? below : above;
+      overlay.style.width = `${pickerWidth}px`;
+      overlay.style.setProperty('--composer-emoji-picker-height', `${pickerHeight}px`);
+      overlay.style.left = `${Math.max(x + 12, Math.min(bounds.right - pickerWidth, x + width - pickerWidth - 12))}px`;
+      overlay.style.top = `${Math.max(y + 12, Math.min(top, y + height - pickerHeight - 12))}px`;
+    };
+    const onScroll = event => {
+      if (!overlay.contains(event.target)) position();
+    };
+    const onPointerDown = event => {
+      if (!overlay.contains(event.target) && !anchor.contains(event.target)) closeRef.current();
+    };
+    position();
+    window.addEventListener('resize', position);
+    document.addEventListener('scroll', onScroll, true);
+    document.addEventListener('pointerdown', onPointerDown, true);
+    window.visualViewport?.addEventListener('resize', position);
+    window.visualViewport?.addEventListener('scroll', position);
+    return () => {
+      window.removeEventListener('resize', position);
+      document.removeEventListener('scroll', onScroll, true);
+      document.removeEventListener('pointerdown', onPointerDown, true);
+      window.visualViewport?.removeEventListener('resize', position);
+      window.visualViewport?.removeEventListener('scroll', position);
+    };
+  }, [anchorRef]);
+
+  return createPortal(
+    <div ref={overlayRef} className="dm-composer-emoji-popover" onPointerDown={event => event.stopPropagation()} onKeyDown={event => {
+      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); onClose(); }
+    }}>
+      <EmojiPicker onPick={onPick} />
+    </div>,
+    document.body,
+  );
 }
 
 export function typingStatusText(names = []) {
@@ -202,7 +243,6 @@ function VoiceLive({ analyser, elapsed }) {
     const canvas = canvasRef.current;
     if (!canvas) return undefined;
     const data = new Uint8Array(analyser.fftSize);
-    let frame = 0;
     const draw = () => {
       analyser.getByteTimeDomainData(data);
       const ratio = window.devicePixelRatio || 1;
@@ -230,10 +270,8 @@ function VoiceLive({ analyser, elapsed }) {
           ctx.fill();
         } else ctx.fillRect(x, y, barWidth, barHeight);
       }
-      frame = requestAnimationFrame(draw);
     };
-    frame = requestAnimationFrame(draw);
-    return () => cancelAnimationFrame(frame);
+    return startVisualLoop(draw);
   }, [analyser]);
 
   return (
@@ -354,10 +392,11 @@ export default function MessageComposer({
   typingText = '',
   poll = null,
   onPollChange,
-  accessibility = null,
 }) {
   const fileInputRef = useRef(null);
   const menuTriggerRef = useRef(null);
+  const emojiTriggerRef = useRef(null);
+  const emojiSelectionRef = useRef({ start: draft.length, end: draft.length });
   const menuRef = useRef(null);
   const localComposerRef = useRef(null);
   const textareaRef = composerRef || localComposerRef;
@@ -386,13 +425,8 @@ export default function MessageComposer({
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuMounted, setMenuMounted] = useState(false);
   const [gifOpen, setGifOpen] = useState(false);
+  const [emojiOpen, setEmojiOpen] = useState(false);
   const [pollError, setPollError] = useState('');
-  const glassSettings = normalizeAccessibility(accessibility);
-  const glassFrost = glassSettings.glassFrost;
-  const composerGlassOptics = useMemo(
-    () => glassOptics(glassFrost, glassSettings.glassDepth, glassSettings.glassRefraction),
-    [glassFrost, glassSettings.glassDepth, glassSettings.glassRefraction],
-  );
   const sessionRef = useRef(null);
   const menuCloseTimer = useRef(null);
   const menuOpenFrame = useRef(0);
@@ -745,11 +779,8 @@ export default function MessageComposer({
   };
 
   return (
-    <Glass
+    <div
       className={`dm-composer${recording ? ' is-recording' : ''}`}
-      style={{ display: 'flex', '--dm-composer-opacity': `${24 + glassFrost * 0.52}%` }}
-      radius={26}
-      optics={composerGlassOptics}
     >
     <form className={`dm-composer-form${recording ? ' is-recording' : ''}`} onSubmit={handleSubmit} onBlur={onBlur} onDragOver={onDragOver} onDrop={onDrop}>
       {replyTo ? (
@@ -866,6 +897,44 @@ export default function MessageComposer({
             disabled={disabled}
           />
         )}
+        <button
+          ref={emojiTriggerRef}
+          className={`dm-composer-emoji-button${emojiOpen ? ' is-open' : ''}`}
+          type="button"
+          onMouseDown={() => {
+            const input = textareaRef.current;
+            emojiSelectionRef.current = input
+              ? { start: input.selectionStart, end: input.selectionEnd }
+              : { start: draft.length, end: draft.length };
+          }}
+          onClick={() => setEmojiOpen(open => !open)}
+          disabled={disabled || recording}
+          aria-label="Open emoji picker"
+          aria-haspopup="dialog"
+          aria-expanded={emojiOpen}
+          title="Emoji"
+        >
+          <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8.5 14.2s1.2 2 3.5 2 3.5-2 3.5-2M9 9.5h.01M15 9.5h.01"/></svg>
+        </button>
+        {emojiOpen ? <ComposerEmojiPopover
+          anchorRef={emojiTriggerRef}
+          onClose={() => setEmojiOpen(false)}
+          onPick={emoji => {
+            const input = textareaRef.current;
+            const selection = emojiSelectionRef.current;
+            const start = Math.max(0, Math.min(selection.start, draft.length));
+            const end = Math.max(start, Math.min(selection.end, draft.length));
+            const next = `${draft.slice(0, start)}${emoji}${draft.slice(end)}`;
+            onDraftChange(next);
+            const caret = start + emoji.length;
+            emojiSelectionRef.current = { start: caret, end: caret };
+            requestAnimationFrame(() => {
+              if (!input) return;
+              fitTextarea(input);
+              input.setSelectionRange(caret, caret);
+            });
+          }}
+        /> : null}
         {canRecord ? (
           <button
             className={`dm-mic-button${recording ? ' is-recording' : ''}`}
@@ -917,7 +986,7 @@ export default function MessageComposer({
         </div>
       ) : null}
     </form>
-    </Glass>
+    </div>
   );
 }
 
@@ -941,6 +1010,7 @@ export const IsolatedMessageComposer = memo(function IsolatedMessageComposer({ r
   }, [rememberDraft]);
   const setAttachments = useCallback(value => {
     const next = typeof value === 'function' ? value(attachmentsRef.current) : value;
+    void prepareUploadFiles(next);
     attachmentsRef.current = next;
     setAttachmentsState(next);
     rememberDraft();

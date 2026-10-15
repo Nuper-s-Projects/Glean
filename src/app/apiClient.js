@@ -5,6 +5,28 @@ import { invalidateLoopMutation, loopCache } from './loopCache.js';
 
 export const API_PREFIX = '/api/v1';
 
+function uploadRequest(url, options, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const abort = () => xhr.abort();
+    const cleanup = () => options.signal?.removeEventListener('abort', abort);
+    xhr.open(options.method || 'POST', url);
+    xhr.withCredentials = true;
+    Object.entries(options.headers || {}).forEach(([key, value]) => xhr.setRequestHeader(key, value));
+    xhr.upload.onprogress = event => onProgress(event.lengthComputable ? Math.min(100, Math.round(event.loaded / event.total * 100)) : null);
+    xhr.upload.onload = () => onProgress(100);
+    xhr.onload = () => {
+      cleanup();
+      resolve({ ok: xhr.status >= 200 && xhr.status < 300, status: xhr.status, text: async () => xhr.responseText, headers: { get: name => xhr.getResponseHeader(name) } });
+    };
+    xhr.onerror = () => { cleanup(); reject(new TypeError('Upload network error')); };
+    xhr.onabort = () => { cleanup(); reject(new DOMException('Upload aborted', 'AbortError')); };
+    if (options.signal?.aborted) { reject(options.signal.reason || new DOMException('Upload aborted', 'AbortError')); return; }
+    options.signal?.addEventListener('abort', abort, { once: true });
+    xhr.send(options.body);
+  });
+}
+
 export class ApiError extends Error {
   constructor(message, { status = null, requestId = null, cause = null } = {}) {
     super(message, cause ? { cause } : undefined);
@@ -34,7 +56,7 @@ export async function apiRequest(path, options = {}) {
     throw new TypeError('API paths must be relative to the Glean API.');
   }
 
-  const { timeoutMs, retries, signal, ...fetchOptions } = options;
+  const { timeoutMs, retries, signal, onUploadProgress, ...fetchOptions } = options;
   const isFormData = typeof FormData !== 'undefined' && fetchOptions.body instanceof FormData;
   const method = String(fetchOptions.method || 'GET').toUpperCase();
   if (method !== 'GET') invalidateLoopMutation(path);
@@ -55,7 +77,8 @@ export async function apiRequest(path, options = {}) {
     try {
       const uploadBytes = isDeveloperModeEnabled() ? estimateBodyBytes(fetchOptions.body) : 0;
       const installId = getInstallId();
-      const response = await fetch(`${API_PREFIX}${path}`, {
+      const transport = isFormData && onUploadProgress ? (url, init) => uploadRequest(url, init, onUploadProgress) : fetch;
+      const response = await transport(`${API_PREFIX}${path}`, {
         credentials: 'same-origin',
         ...fetchOptions,
         cache: method === 'GET' ? 'no-store' : fetchOptions.cache,

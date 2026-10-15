@@ -1,6 +1,7 @@
 data/
 dist/
 node_modules/
+/public/emoji-data/
 
 # Local secrets and environment overrides
 .env

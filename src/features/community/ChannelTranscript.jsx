@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useMemo, useRef, useState } from 'react';
 import { CommunityAvatar } from './CommunityAvatar';
 import { MessageAttachment } from '../dm/DmPrimitives';
 import { formatDateDivider, formatMessageTime, isGroupedMessage, shouldShowDivider } from '../dm/formatters';
@@ -8,8 +8,10 @@ import { MessageHoverActions, ReplyQuote } from '../dm/MessageActions';
 import DisplayName from '../dm/DisplayName';
 import CustomBadges from '../dm/CustomBadges';
 import ChannelPoll from './ChannelPoll';
-import EmojiPicker from '../dm/EmojiPicker';
+import ReactionPicker from './ReactionPicker';
 import { MoreIcon } from '../dm/icons';
+import MessageEditor from '../dm/MessageEditor';
+import { useMessageReport } from '../dm/MessageReports';
 
 function messageId(value) {
   return Number(value?.id ?? value);
@@ -19,6 +21,7 @@ const MESSAGE_CALLBACKS = ['onOpenAuthor', 'onModerationContextMenu', 'onReply',
 
 const ChannelMessageRow = memo(function ChannelMessageRow({
   message,
+  channelId,
   previous,
   accountId,
   accountUsername,
@@ -43,38 +46,22 @@ const ChannelMessageRow = memo(function ChannelMessageRow({
   onClosePoll,
 }) {
   const isAuthor = Number(message.author?.id) === Number(accountId);
+  const reporting = useMessageReport(message, 'channel', isAuthor || inspecting);
   const canEdit = isAuthor;
   const canDelete = isAuthor || canModerate;
   const grouped = isGroupedMessage(previous, message);
   const id = messageId(message);
   const saved = Number.isFinite(id) && id > 0;
-  const hasActions = saved && ((!inspecting && canPost) || (canEdit && canPost) || canDelete);
+  const hasActions = saved && ((!inspecting && canPost) || (canEdit && canPost) || canDelete || reporting.canReport);
   const [actionsOpen, setActionsOpen] = useState(false);
   const actionsButton = useRef(null);
   const act = (callback) => { setActionsOpen(false); callback(); };
-  const pickerRef = useRef(null);
-  const [pickerPlacement, setPickerPlacement] = useState('below');
+  const messageRef = useRef(null);
   const pickerOpen = Number(reactionPickerId) === id;
-
-  useEffect(() => {
-    if (!pickerOpen) return undefined;
-    const updatePickerPlacement = () => {
-      const picker = pickerRef.current?.querySelector('.dm-emoji-picker');
-      if (!picker) return;
-      const bounds = picker.getBoundingClientRect();
-      const shouldOpenAbove = bounds.bottom > window.innerHeight - 12 && bounds.top > 12;
-      setPickerPlacement(shouldOpenAbove ? 'above' : 'below');
-    };
-    updatePickerPlacement();
-    window.addEventListener('resize', updatePickerPlacement);
-    return () => {
-      window.removeEventListener('resize', updatePickerPlacement);
-    };
-  }, [pickerOpen]);
   return (
     <div className="community-message-row">
       {shouldShowDivider(previous, message) ? <div className="community-date-divider"><span>{formatDateDivider(message.createdAt)}</span></div> : null}
-      <article className={`community-message${grouped ? ' is-grouped' : ''}${actionsOpen ? ' has-open-actions' : ''}${messageMentionsUser(message.body, accountUsername) ? ' is-mentioned' : ''}`} id={Number.isFinite(id) ? `m-${id}` : undefined} onKeyDown={(event) => {
+      <article onContextMenu={reporting.onContextMenu} ref={messageRef} className={`community-message${grouped ? ' is-grouped' : ''}${actionsOpen ? ' has-open-actions' : ''}${messageMentionsUser(message.body, accountUsername) ? ' is-mentioned' : ''}`} id={Number.isFinite(id) ? `m-${id}` : undefined} onKeyDown={(event) => {
         if (event.key === 'Escape' && actionsOpen) { event.stopPropagation(); setActionsOpen(false); actionsButton.current?.focus(); }
       }}>
         {grouped ? <span className="community-avatar-spacer"><time dateTime={message.createdAt}>{formatMessageTime(message.createdAt)}</time></span> : <CommunityAvatar user={message.author} onContextMenu={(event) => onModerationContextMenu?.(event, message.author)} />}
@@ -91,18 +78,16 @@ const ChannelMessageRow = memo(function ChannelMessageRow({
               {message.editedAt ? <small className="community-edited-label">edited</small> : null}
             </div>
           )}
+          <ReplyQuote reply={message.replyTo} />
           {isEditing ? (
-            <form className="community-edit-form" onSubmit={(event) => onSubmitEdit(event, message)}>
-              <textarea value={editDraft} onChange={(event) => onEditDraft(event.target.value)} maxLength="4000" autoFocus aria-label="Edit message" />
-              <div><button type="submit" disabled={!editDraft.trim() && !message.attachments?.length}>Save</button><button type="button" onClick={onCancelEdit}>Cancel</button></div>
-            </form>
+            <MessageEditor key={message.id} message={message} draft={editDraft} onDraft={onEditDraft} onSubmit={onSubmitEdit} onCancel={onCancelEdit} />
           ) : (
             <>
-              <ReplyQuote reply={message.replyTo} />
               {message.body ? <MessageBody className="community-message-text" body={message.body} users={mentionUsers} currentUsername={accountUsername} /> : null}
               {message.poll ? (
                 <ChannelPoll
                   poll={message.poll}
+                  votersEndpoint={`/channels/${channelId || message.channelId}/messages/${message.id}/poll/voters`}
                   canClose={(isAuthor || canModerate) && !inspecting}
                   disabled={inspecting}
                   onVote={(optionIndex) => onVotePoll?.(message, optionIndex)}
@@ -112,16 +97,18 @@ const ChannelMessageRow = memo(function ChannelMessageRow({
               {grouped && message.editedAt ? <small className="community-edited-label">edited</small> : null}
             </>
           )}
-          {isEditing ? null : message.attachments?.length ? <div className="dm-message-attachments">{message.attachments.map((attachment) => <MessageAttachment key={attachment.id} attachment={attachment} message={message} accountId={accountId} />)}</div> : null}
+          {message.attachments?.length ? <div className="dm-message-attachments">{message.attachments.map((attachment) => <MessageAttachment key={attachment.id} attachment={attachment} message={message} accountId={accountId} />)}</div> : null}
           {isEditing ? null : (
             <div className="community-reactions" aria-label="Message reactions" onPointerDown={(event) => event.stopPropagation()}>
               {(message.reactions || []).map((reaction) => <button className={`community-reaction${reaction.reacted ? ' is-reacted' : ''}`} type="button" key={reaction.emoji} onClick={() => onToggleReaction(message, reaction.emoji)} aria-label={`${reaction.emoji} reaction, ${reaction.count}`} title={`${reaction.count} reaction${reaction.count === 1 ? '' : 's'}`}>{reaction.emoji} <span>{reaction.count}</span></button>)}
-              {pickerOpen ? <span ref={pickerRef} className={`community-reaction-picker${pickerPlacement === 'above' ? ' is-above' : ''}`}><EmojiPicker onPick={(emoji) => { onToggleReaction(message, emoji); onOpenReactions(null); }} /></span> : null}
+              {pickerOpen ? <ReactionPicker anchorRef={messageRef} onClose={() => onOpenReactions(null)} onPick={(emoji) => { onToggleReaction(message, emoji); onOpenReactions(null); }} /> : null}
             </div>
           )}
-          {message.status === 'sending' ? <small className="community-message-pending" role="status">Sending…</small> : null}
+          {message.status === 'sending' ? <small className="community-message-pending" role="status">{message.sendLabel || 'Sending…'}</small> : message.status === 'failed' ? <div role="status">Not sent <button type="button" onClick={message.retrySend}>Retry</button></div> : null}
           <div id={`server-message-actions-${id}`} className="community-message-tools">
             <MessageHoverActions
+              canReport={reporting.canReport}
+              onReport={() => act(reporting.report)}
               canReply={!inspecting && canPost && saved}
               canReact={!inspecting && canPost && saved}
               canEdit={canEdit && canPost && saved}
@@ -134,6 +121,7 @@ const ChannelMessageRow = memo(function ChannelMessageRow({
           </div>
         </div>
       </article>
+      {reporting.menu}
     </div>
   );
 });
@@ -202,6 +190,7 @@ function ChannelTranscript({
         <ChannelMessageRow
           key={message.id}
           message={message}
+          channelId={channel?.id}
           previous={messages[index - 1]}
           accountId={account?.id}
           accountUsername={account?.username}

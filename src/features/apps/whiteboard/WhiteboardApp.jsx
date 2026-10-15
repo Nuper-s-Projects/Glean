@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { uploadWhiteboardImage } from '../../../app/dmApi';
+import { startVisualLoop } from '../../../app/pageActivity';
 import { CursorIcon, DownloadIcon, EraserIcon, HandIcon, ImagePlusIcon, PencilIcon, ShapeIcon, StickyIcon, TextIcon, TrashIcon } from '../../dm/icons';
 import { boardBounds, drawBoard, exportBoardPng, hitTest, makeUid, objectBounds } from './board';
 
@@ -102,15 +103,7 @@ export default function WhiteboardApp({ scopeKey, snapshot, sendOp, subscribeOps
     drawBoard(canvas, list, viewRef.current, { imageFor, selectedUid, ratio });
   });
 
-  useEffect(() => {
-    let frame = 0;
-    const loop = () => {
-      redraw();
-      frame = requestAnimationFrame(loop);
-    };
-    frame = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(frame);
-  }, [redraw]);
+  useEffect(() => startVisualLoop(redraw), [redraw]);
 
   const toBoard = (event) => {
     const rect = canvasRef.current.getBoundingClientRect();

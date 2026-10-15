@@ -276,13 +276,15 @@ try {
   if (badgeSave.account?.customBadges?.[0]?.label !== 'OM' || badgeSave.account.customBadges[0].color !== '#C65A13') throw new Error('Custom badge save failed.');
   const invalidBadge = await alice.raw('/account/custom-badges', { method: 'POST', body: JSON.stringify({ customBadges: [{ label: 'Bad', color: 'orange' }] }) });
   if (invalidBadge.status !== 400) throw new Error('Invalid custom badge color should fail.');
-  if (aliceSignup.account?.accessibility?.theme !== 'system' || aliceSignup.account?.accessibility?.contrast !== 100 || aliceSignup.account?.accessibility?.saturation !== 100 || aliceSignup.account?.accessibility?.glassDepth !== 20 || aliceSignup.account?.accessibility?.glassRefraction !== 100) throw new Error('Accessibility defaults missing from account.');
-  const savedAccessibility = await alice('/account/accessibility', { method: 'POST', body: JSON.stringify({ contrast: 125, saturation: 65, reduceMotion: true, glassFrost: 60, glassDepth: 35, glassRefraction: 72, theme: 'dark' }) });
-  if (savedAccessibility.account?.accessibility?.theme !== 'dark' || savedAccessibility.account?.accessibility?.contrast !== 125 || savedAccessibility.account?.accessibility?.saturation !== 65 || savedAccessibility.account?.accessibility?.reduceMotion !== true || savedAccessibility.account?.accessibility?.glassDepth !== 35 || savedAccessibility.account?.accessibility?.glassRefraction !== 72) throw new Error('Accessibility preferences did not save.');
+  if (aliceSignup.account?.accessibility?.theme !== 'system' || aliceSignup.account?.accessibility?.contrast !== 100 || aliceSignup.account?.accessibility?.saturation !== 100 || aliceSignup.account?.accessibility?.glassDepth !== 20 || aliceSignup.account?.accessibility?.glassRefraction !== 100 || aliceSignup.account?.accessibility?.showLoopStreakReminder !== true) throw new Error('Accessibility defaults missing from account.');
+  const savedAccessibility = await alice('/account/accessibility', { method: 'POST', body: JSON.stringify({ contrast: 125, saturation: 65, reduceMotion: true, glassFrost: 60, glassDepth: 35, glassRefraction: 72, theme: 'dark', showLoopStreakReminder: false }) });
+  if (savedAccessibility.account?.accessibility?.theme !== 'dark' || savedAccessibility.account?.accessibility?.contrast !== 125 || savedAccessibility.account?.accessibility?.saturation !== 65 || savedAccessibility.account?.accessibility?.reduceMotion !== true || savedAccessibility.account?.accessibility?.glassDepth !== 35 || savedAccessibility.account?.accessibility?.glassRefraction !== 72 || savedAccessibility.account?.accessibility?.showLoopStreakReminder !== false) throw new Error('Accessibility preferences did not save.');
   const reloadedAlice = await makeClient();
   await reloadedAlice('/auth/signin', { method: 'POST', body: JSON.stringify({ username: 'alice_test', password: 'correct-horse-123' }) });
   const reloadedPreferences = await reloadedAlice('/auth/me');
-  if (reloadedPreferences.account?.accessibility?.theme !== 'dark' || reloadedPreferences.account?.accessibility?.contrast !== 125 || reloadedPreferences.account?.accessibility?.saturation !== 65 || reloadedPreferences.account?.accessibility?.reduceMotion !== true || reloadedPreferences.account?.accessibility?.glassDepth !== 35 || reloadedPreferences.account?.accessibility?.glassRefraction !== 72) throw new Error('Accessibility preferences did not persist through sign-in.');
+  if (reloadedPreferences.account?.accessibility?.theme !== 'dark' || reloadedPreferences.account?.accessibility?.contrast !== 125 || reloadedPreferences.account?.accessibility?.saturation !== 65 || reloadedPreferences.account?.accessibility?.reduceMotion !== true || reloadedPreferences.account?.accessibility?.glassDepth !== 35 || reloadedPreferences.account?.accessibility?.glassRefraction !== 72 || reloadedPreferences.account?.accessibility?.showLoopStreakReminder !== false) throw new Error('Accessibility preferences did not persist through sign-in.');
+  const reminderReenabled = await alice('/account/accessibility', { method: 'POST', body: JSON.stringify({ contrast: 125, saturation: 65, reduceMotion: true, glassFrost: 60, glassDepth: 35, glassRefraction: 72, theme: 'dark', showLoopStreakReminder: true }) });
+  if (reminderReenabled.account?.accessibility?.showLoopStreakReminder !== true) throw new Error('Loop streak reminder could not be re-enabled.');
   const invalidAccessibility = await alice.raw('/account/accessibility', { method: 'POST', body: JSON.stringify({ contrast: 151, saturation: 65, reduceMotion: true }) });
   if (invalidAccessibility.status !== 400) throw new Error('Out-of-range accessibility settings should be rejected.');
   const invalidGlassOptics = await alice.raw('/account/accessibility', { method: 'POST', body: JSON.stringify({ contrast: 100, saturation: 100, reduceMotion: false, glassDepth: 101, glassRefraction: 50 }) });
@@ -1006,28 +1008,6 @@ try {
     const existingServers = await existingUser('/servers');
     if (existingServers.servers?.some((item) => item.name === 'Glean (BETA)')) throw new Error('Existing accounts should not be added to a default Glean (BETA) server.');
   }
-  try {
-    await alice('/push/test', { method: 'POST', body: '{}' });
-    throw new Error('Non-admin test push should fail.');
-  } catch (error) {
-    if (!String(error.message).startsWith('403 ')) throw error;
-  }
-  const testPush = await nuper('/push/test', { method: 'POST', body: '{}' });
-  if (!testPush.ok || typeof testPush.sent !== 'number') throw new Error('Admin test push failed.');
-  try {
-    await alice('/push/announcement', { method: 'POST', body: JSON.stringify({ message: 'Unauthorized announcement' }) });
-    throw new Error('Non-Nuper custom announcement should fail.');
-  } catch (error) {
-    if (!String(error.message).startsWith('403 ')) throw error;
-  }
-  try {
-    await nuper('/push/announcement', { method: 'POST', body: JSON.stringify({ message: '   ' }) });
-    throw new Error('Empty custom announcement should fail.');
-  } catch (error) {
-    if (!String(error.message).startsWith('400 ')) throw error;
-  }
-  const announcement = await nuper('/push/announcement', { method: 'POST', body: JSON.stringify({ message: 'Have a great day!' }) });
-  if (!announcement.ok || typeof announcement.sent !== 'number') throw new Error('Nuper custom announcement failed.');
   const nuperServers = await nuper('/servers');
   const inspected = nuperServers.servers?.find((item) => item.id === server.id);
   if (!inspected?.inspecting) throw new Error('Nuper cannot inspect other servers.');
@@ -1489,6 +1469,10 @@ try {
   if (!pollVote.message?.poll?.options?.[1]?.voted || pollVote.message.poll.voterCount !== 1) throw new Error('Poll vote failed.');
   const pollSwitch = await bob(`/channels/${textChannel.id}/messages/${pollCreate.message.id}/poll/vote`, { method: 'POST', body: JSON.stringify({ optionIndex: 0 }) });
   if (!pollSwitch.message.poll.options[0].voted || pollSwitch.message.poll.options[1].voted || pollSwitch.message.poll.voterCount !== 1) throw new Error('Single-choice poll should replace the vote.');
+  const pollVoters = await alice(`/channels/${textChannel.id}/messages/${pollCreate.message.id}/poll/voters?option=0`);
+  if (Number(pollCreate.message.channelId) !== Number(textChannel.id)) throw new Error('Poll payload must include its channel ID for voter URLs.');
+  if (pollVoters.voters.length !== 1 || Number(pollVoters.voters[0].id) !== Number(bobID)) throw new Error('Poll voters missing the voting account.');
+  if ((await alice(`/channels/${textChannel.id}/messages/${pollCreate.message.id}/poll/voters?option=1`)).voters.length) throw new Error('Changed vote should not appear under the old option.');
   const multiPoll = await alice(`/channels/${textChannel.id}/messages`, { method: 'POST', body: JSON.stringify({ body: 'pick any', poll: { question: 'Pick any', options: ['A', 'B', 'C'], allowMultiple: true } }) });
   await bob(`/channels/${textChannel.id}/messages/${multiPoll.message.id}/poll/vote`, { method: 'POST', body: JSON.stringify({ optionIndex: 0 }) });
   const multiSecond = await bob(`/channels/${textChannel.id}/messages/${multiPoll.message.id}/poll/vote`, { method: 'POST', body: JSON.stringify({ optionIndex: 2 }) });
@@ -1518,14 +1502,6 @@ try {
   const newMemberServers = await newMember('/servers');
   if (!newMemberServers.servers.some((item) => item.id === official.id)) throw new Error('New account not enrolled in official Glean.');
   if (newMemberServers.servers?.some((item) => item.name === 'Glean (BETA)')) throw new Error('A new account should not receive a default Glean (BETA) server.');
-
-  const hiddenOfficial = await nuper('/admin/official-server', { method: 'PATCH', body: JSON.stringify({ hidden: true }) });
-  if (!hiddenOfficial.hidden) throw new Error('Official server hide setting was not enabled.');
-  if ((await nuper('/servers')).servers.some((item) => Number(item.id) === Number(official.id))) throw new Error('Hidden official server remained in the server list.');
-  if ((await nuper.raw(`/servers/${official.id}`)).status !== 404) throw new Error('Hidden official server remained directly accessible.');
-  if ((await alice.raw('/admin/official-server')).status !== 403) throw new Error('Non-admin could change official server visibility.');
-  const shownOfficial = await nuper('/admin/official-server', { method: 'PATCH', body: JSON.stringify({ hidden: false }) });
-  if (shownOfficial.hidden || !(await nuper('/servers')).servers.some((item) => Number(item.id) === Number(official.id))) throw new Error('Official server did not return after being shown.');
 
   const unauthorizedOfficialKick = await alice.raw(`/servers/${official.id}/members/${bobID}/kick`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
@@ -1570,8 +1546,6 @@ try {
   if (kickAlice.action !== 'kick' || (await alice('/servers')).servers.some((item) => Number(item.id) === Number(official.id))) {
     throw new Error('The official server owner could not kick a member.');
   }
-  await nuper('/admin/official-server', { method: 'PATCH', body: JSON.stringify({ hidden: true }) });
-  await nuper('/admin/official-server', { method: 'PATCH', body: JSON.stringify({ hidden: false }) });
   if ((await alice('/servers')).servers.some((item) => Number(item.id) === Number(official.id))) {
     throw new Error('A kicked member was automatically re-enrolled into the official server.');
   }
@@ -1593,8 +1567,6 @@ try {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
   });
   if (bannedJoin.status !== 403) throw new Error('A banned member could rejoin the official server.');
-  await nuper('/admin/official-server', { method: 'PATCH', body: JSON.stringify({ hidden: true }) });
-  await nuper('/admin/official-server', { method: 'PATCH', body: JSON.stringify({ hidden: false }) });
   if ((await alice('/servers')).servers.some((item) => Number(item.id) === Number(official.id))) {
     throw new Error('A banned member was automatically re-enrolled into the official server.');
   }

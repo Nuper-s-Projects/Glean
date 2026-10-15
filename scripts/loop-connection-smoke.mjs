@@ -18,6 +18,8 @@ async function req(path,method='GET',body={},userId=1){const response={};await s
 try{
  assert.equal((await req('/api/loop/connection','GET',{},999)).status,401);
  assert.equal((await req('/api/loop/connection')).body.connected,false);
+ assert.equal((await req('/api/loop/connection?includePosts=1')).body.feed,undefined,'unconnected accounts cannot bootstrap posts');
+ assert.equal((await req('/api/loop/connection?includePosts=1','GET',{},999)).status,401);
  assert.equal((await req('/api/loop/posts')).body.loopConnectionRequired,true);
  assert.equal((await req('/api/loop/posts','POST',{content:'Cannot bypass'})).status,403);
  for(const body of [{},{confirmed:false,consentVersion:1},{confirmed:'true',consentVersion:1},{confirmed:true,consentVersion:999}])assert.equal((await req('/api/loop/connection','POST',body)).status,400);
@@ -27,6 +29,13 @@ try{
  assert.equal((await req('/api/loop/connection','POST',{confirmed:true,consentVersion:1})).status,200);
  assert.equal(database.prepare('SELECT COUNT(*) n FROM loop_accounts').get().n,1);
  assert.equal((await req('/api/loop/posts')).body.posts[0].content,'Existing post');
+ const bootstrapped=await req('/api/loop/connection?includePosts=1');
+ assert.deepEqual(bootstrapped.body.feed,(await req('/api/loop/posts?limit=12&feed=everyone&type=all')).body,'bootstrap and normal Home use the same authorized page');
+ assert.equal((await req('/api/loop/connection')).body.feed,undefined,'existing callers retain the lightweight response');
+ assert.equal((await req('/api/loop/connection?includePosts=1','GET',{},2)).body.feed,undefined,'another account must consent independently');
+ database.exec("INSERT INTO loop_posts(id,user_id,body,media_type,created_at) VALUES(2,2,'Hidden post','none','2026-10-09'); INSERT INTO loop_blocks VALUES(1,2,'now')");
+ assert.deepEqual((await req('/api/loop/connection?includePosts=1')).body.feed.posts.map(post=>post.id),[1],'bootstrap obeys visibility filters');
+ database.exec('DELETE FROM loop_blocks; DELETE FROM loop_posts WHERE id=2');
  service=createLoopService(options);
  assert.equal((await req('/api/loop/connection')).body.connected,true);
  assert.equal(database.prepare('SELECT COUNT(*) n FROM users').get().n,2);

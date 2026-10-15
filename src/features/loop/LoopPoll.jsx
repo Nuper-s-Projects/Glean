@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { apiRequest } from '../../app/apiClient';
 import { subscribeToDmEvents } from '../../app/dmApi';
+import PollVoters from '../../components/PollVoters';
 
 export default function LoopPoll({ postId, poll }) {
   const [current, setCurrent] = useState(poll);
@@ -41,5 +42,6 @@ export default function LoopPoll({ postId, poll }) {
     })}</div>
     <p className="loop-muted" aria-live="polite">{current.voterCount} {current.voterCount === 1 ? 'vote' : 'votes'} · {busy ? 'Saving vote…' : voted ? 'You can change your vote.' : 'Choose an option to see results.'}</p>
     {error ? <p className="loop-inline-error" role="alert">{error}</p> : null}
+    <PollVoters endpoint={`/loop/posts/${postId}/poll/voters`} options={current.options} />
   </div>;
 }

@@ -1,14 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
 import { apiRequest } from '../../app/apiClient';
 import { ROUTES } from '../../app/routes';
+import LoopAuraController from './LoopAuraController';
 
-export default function LoopConnection({ account, goTo, onSignedOut, children }) {
+export default function LoopConnection({ account, goTo, onSignedOut, onAccountUpdated, children }) {
   const [state,setState] = useState({loading:true,connected:false,account:null,error:''});
   const [confirmed,setConfirmed] = useState(false);
   const [busy,setBusy] = useState(false);
   const [retry,setRetry] = useState(0);
   const lock = useRef(false);
   const alive = useRef(true);
+  const connectionPath = new URLSearchParams(window.location.search).has('post') ? '/loop/connection' : '/loop/connection?includePosts=1';
   const signIn = () => {
     onSignedOut?.();
     window.location.replace('/signin?next=%2Floop');
@@ -18,7 +20,11 @@ export default function LoopConnection({ account, goTo, onSignedOut, children })
     const controller=new AbortController();
     setState({loading:true,connected:false,account:null,error:''});setConfirmed(false);
     if(!account?.id){signIn();return ()=>{alive.current=false;};}
-    apiRequest('/loop/connection',{signal:controller.signal}).then(data=>{if(!controller.signal.aborted)setState({loading:false,...data,error:''});}).catch(failure=>{
+    apiRequest(connectionPath,{signal:controller.signal}).then(data=>{
+      if(controller.signal.aborted)return;
+      if(data.account?.id!==account.id){signIn();return;}
+      setState({loading:false,...data,error:''});
+    }).catch(failure=>{
       if(controller.signal.aborted)return;
       if(failure.status===401){signIn();return;}
       setState({loading:false,connected:false,account:null,error:failure.message});
@@ -29,13 +35,13 @@ export default function LoopConnection({ account, goTo, onSignedOut, children })
     event.preventDefault();if(!confirmed || lock.current)return;
     lock.current=true;setBusy(true);setState(current=>({...current,error:''}));
     try{
-      const data=await apiRequest('/loop/connection',{method:'POST',body:JSON.stringify({confirmed:true,consentVersion:1})});
+      const data=await apiRequest(connectionPath,{method:'POST',body:JSON.stringify({confirmed:true,consentVersion:1})});
       if(!data.connected || data.account?.id!==account.id)throw new Error('The connection could not be confirmed. Please try again.');
       if(alive.current)setState({loading:false,...data,error:''});
     }catch(failure){if(alive.current){if(failure.status===401)signIn();else setState(current=>({...current,error:failure.message}));}}
     finally{lock.current=false;if(alive.current)setBusy(false);}
   };
-  if(state.connected)return children;
+  if(state.connected)return <>{typeof children === 'function' ? children(state.feed || null) : children}<LoopAuraController account={account} onAccountUpdated={onAccountUpdated}/></>;
   return <main className="loop-app loop-connection-page">
     <section className="loop-connection-card" aria-labelledby="loop-connect-title" aria-busy={state.loading||busy}>
       <div className="loop-connection-brand" aria-hidden="true"><span className="loop-brand-mark">G</span><span>↔</span><span className="loop-brand-mark">G<small>LOOP</small></span></div>

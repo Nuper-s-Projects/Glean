@@ -33,12 +33,14 @@ try {
     assert.equal(screen.classList.contains('is-reduced-motion'), false);
   }
   assert.equal(normalizeAccessibility({ reduceMotion: true }).reduceMotion, true);
+  assert.equal(normalizeAccessibility({}).showLoopStreakReminder, true, 'existing accounts keep the Loop streak reminder enabled');
+  assert.equal(normalizeAccessibility({ showLoopStreakReminder: false }).showLoopStreakReminder, false, 'the Loop reminder preference survives client normalization');
   applyAccessibilitySettings({ theme: 'dark', contrast: 120, saturation: 80, glassFrost: 65, glassDepth: 30, glassRefraction: 75, reduceMotion: true });
   assert.equal(root.attributes.get('data-theme'), 'dark');
   assert.equal(screen.properties.get('--glean-accessibility-contrast'), '120%');
   assert.equal(screen.properties.get('--glean-accessibility-saturation'), '80%');
-  assert.equal(root.properties.get('--glean-liquid-glass-depth'), '0.3');
-  assert.equal(root.properties.get('--glean-liquid-glass-refraction'), '0.75');
+  assert.equal(root.properties.has('--glean-liquid-glass-depth'), false);
+  assert.equal(root.properties.has('--glean-liquid-glass-refraction'), false);
   assert.equal(screen.classList.contains('has-accessibility-adjustments'), true);
   deviceReducedMotion = true;
   applyAccessibilitySettings({ reduceMotion: false });

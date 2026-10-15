@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import { apiRequest } from '../../app/apiClient';
 import { subscribeToDmEvents } from '../../app/dmApi';
+import VerifiedMark from '../../components/VerifiedMark';
 
 function LoopOnlinePeople({ accountId, onOpenProfile }) {
   const [data, setData] = useState(null);
@@ -62,7 +63,7 @@ function LoopOnlinePeople({ accountId, onOpenProfile }) {
       : !data ? <div className="loop-online-skeleton" role="status" aria-label="Loading online people">{[0,1,2].map(id => <div key={id}><span/><span/></div>)}</div>
       : data.users.length ? <ul className="loop-online-list">{data.users.map(user => <li key={user.id}><button type="button" onClick={() => onOpenProfile(user.id)} aria-label={`View ${user.username}'s profile`}>
         <span className="loop-online-avatar">{user.avatarUrl ? <img src={user.avatarUrl} alt="" loading="lazy" decoding="async" onError={event => { event.currentTarget.hidden = true; }}/> : null}<span aria-hidden="true">{user.username?.slice(0,1).toUpperCase()}</span><i className={`is-${user.presence}`}/></span>
-        <span className="loop-online-name"><strong>{user.username}{Number(user.id) === Number(accountId) ? ' (you)' : ''}</strong><small>{user.presence === 'idle' ? 'Away' : user.presence === 'dnd' ? 'Do not disturb' : 'Online'}</small></span><span aria-hidden="true">›</span>
+        <span className="loop-online-name"><strong>{user.username}{user.verified ? <VerifiedMark /> : null}{Number(user.id) === Number(accountId) ? ' (you)' : ''}</strong><small>{user.presence === 'idle' ? 'Away' : user.presence === 'dnd' ? 'Do not disturb' : 'Online'}</small></span><span aria-hidden="true">›</span>
       </button></li>)}</ul> : <div className="loop-online-empty">No one is visible online right now.</div>}
     {(cursors.length > 1 || data?.page?.hasMore) ? <footer><button type="button" disabled={loading || cursors.length === 1} onClick={() => setCursors(value => value.slice(0,-1))}>Previous</button><span>Page {cursors.length}</span><button type="button" disabled={loading || !data?.page?.hasMore} onClick={() => setCursors(value => [...value,data.page.nextAfter])}>Next</button></footer> : null}
     <small className="loop-online-note">Invisible users are not shown.</small>

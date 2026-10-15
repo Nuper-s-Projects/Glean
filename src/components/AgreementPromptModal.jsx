@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { apiRequest } from '../app/apiClient';
-import { AGREEMENT_WAIT_SECONDS, CONDUCT_VERSION, TERMS_SECTIONS, TERMS_VERSION } from '../app/agreements';
+import { AGREEMENT_WAIT_SECONDS, CONDUCT_VERSION, TERMS_LABEL, TERMS_SECTIONS, TERMS_VERSION } from '../app/agreements';
 
 const CONDUCT_PDF = '/documents/uisd-student-code-of-conduct-2026-27.pdf#page=13&view=FitH';
 
@@ -141,7 +141,7 @@ export default function AgreementPromptModal({ account, onAccepted, onSignOut })
 
         {activeDocument === 'terms' ? (
           <div className="agreement-document" id="agreement-panel-terms" role="tabpanel" aria-labelledby="agreement-tab-terms" tabIndex={0}>
-            <p className="agreement-document-title">Glean Terms of Service <span>v2</span></p>
+            <p className="agreement-document-title">Glean Terms of Service <span>{TERMS_LABEL}</span></p>
             {TERMS_SECTIONS.map((section) => (
               <section className="agreement-term-section" key={section.title}>
                 <h2>{section.title}</h2>

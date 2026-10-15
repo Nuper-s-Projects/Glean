@@ -152,7 +152,7 @@ function notificationPresentation(payload, previous) {
   const count = grouped ? Math.min(999, (Number(previous?.data?.notificationCount) || 0) + 1) : 1;
   const line = kind === 'channel' ? `${channelParts?.[1] || sender}: ${preview}` : preview;
   const recent = grouped ? [...(Array.isArray(previous?.data?.notificationLines) ? previous.data.notificationLines.slice(-2).map(value => clean(value, 280)) : []), line] : [line];
-  const title = kind === 'dm' ? `${sender} · Direct message` : kind === 'channel' ? `${channelParts?.[2] || sender} · Glean` : kind === 'friends' ? `${sender} · Friend request` : kind === 'announcement' ? 'Glean announcement' : kind === 'test' ? 'Glean · Test notification' : sender;
+  const title = kind === 'loop' ? 'Loop' : kind === 'dm' ? `${sender} · Direct message` : kind === 'channel' ? `${channelParts?.[2] || sender} · Glean` : kind === 'friends' ? `${sender} · Friend request` : kind === 'announcement' ? 'Glean announcement' : kind === 'test' ? 'Glean · Test notification' : sender;
   return {
     title,
     options: {
@@ -162,7 +162,7 @@ function notificationPresentation(payload, previous) {
       tag: String(payload.tag || `glean:${kind || 'activity'}`),
       renotify: !previous,
       timestamp: Date.now(),
-      actions: [{ action: 'open', title: kind === 'friends' ? 'View request' : grouped || kind === 'dm-call' ? 'Open chat' : 'Open Glean' }, { action: 'dismiss', title: 'Dismiss' }],
+      actions: [{ action: 'open', title: kind === 'loop' ? 'Open Loop' : kind === 'friends' ? 'View request' : grouped || kind === 'dm-call' ? 'Open chat' : 'Open Glean' }, { action: 'dismiss', title: 'Dismiss' }],
       data: { ...payload, notificationCount: count, notificationLines: recent },
     },
   };

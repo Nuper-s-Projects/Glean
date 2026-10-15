@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import { AttachIcon, FullscreenIcon, MuteIcon, PauseIcon, PlayIcon, SpeakerIcon, VolumeIcon } from './icons';
 import { formatFileSize, formatMediaTime } from './formatters';
 import { audioPeaks, VOICE_SPEEDS } from './voiceNote';
+import useMemorySaver from '../../app/useMemorySaver';
+import useMediaMemory from '../../app/useMediaMemory';
 
 function MediaSlider({ value, max, disabled, onChange, onPointerDown, onPointerUp, ariaLabel }) {
   const railRef = useRef(null);
@@ -84,6 +86,8 @@ function useMediaVolume(mediaRef, { volume, muted, src }) {
 
 export function AudioAttachment({ src, name }) {
   const audioRef = useRef(null);
+  const memorySaver = useMemorySaver();
+  useMediaMemory(audioRef, src);
   const waveRef = useRef(null);
   const [playing, setPlaying] = useState(false);
   const [current, setCurrent] = useState(0);
@@ -94,9 +98,10 @@ export function AudioAttachment({ src, name }) {
 
   useEffect(() => {
     let cancelled = false;
+    if (memorySaver) { setPeaks(Array(40).fill(0.22)); return; }
     audioPeaks(src, 40).then((next) => { if (!cancelled) setPeaks(next); });
     return () => { cancelled = true; };
-  }, [src]);
+  }, [src, memorySaver]);
 
   useEffect(() => {
     const audio = audioRef.current;
@@ -177,6 +182,7 @@ export function AudioAttachment({ src, name }) {
 export function VideoAttachment({ src, name, mutedPreview = false }) {
   const wrapRef = useRef(null);
   const videoRef = useRef(null);
+  useMediaMemory(videoRef, src);
   const draggingRef = useRef(false);
   const [playing, setPlaying] = useState(false);
   const [current, setCurrent] = useState(0);

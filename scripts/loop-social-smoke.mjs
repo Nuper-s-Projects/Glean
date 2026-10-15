@@ -13,7 +13,7 @@ database.exec(`PRAGMA foreign_keys=ON;
  INSERT INTO loop_post_comments VALUES(1,1,2,'Legacy comment','2026-10-09');
 `);
 const events=[];
-const options={ database,uploadDirectory:'/tmp',parseMultipart:async()=>({files:[],fields:{}}),nameFile:()=>'',sendLocalFile:()=>{},sendJson:(response,status,body)=>Object.assign(response,{status,body}),readJson:async request=>request.body,currentUser:request=>database.prepare('SELECT * FROM users WHERE id=?').get(request.userId),realtimeHub:{broadcastAll:(...event)=>events.push(event),send:(user,...event)=>events.push([user,...event])},isAdmin:()=>false };
+const options={ database,uploadDirectory:'/tmp',videoOptions:{autoStart:false,ffmpeg:'',ffprobe:''},captionOptions:{apiKey:''},parseMultipart:async()=>({files:[],fields:{}}),nameFile:()=>'',sendLocalFile:()=>{},sendJson:(response,status,body)=>Object.assign(response,{status,body}),readJson:async request=>request.body,currentUser:request=>database.prepare('SELECT * FROM users WHERE id=?').get(request.userId),realtimeHub:{broadcastAll:(...event)=>events.push(event),send:(user,...event)=>events.push([user,...event])},isAdmin:()=>false };
 let service=createLoopService(options);
 async function req(path,method='GET',body={},userId=1){const response={};await service.route({url:path,method,body,userId,headers:{host:'localhost'}},response,path.split('?')[0],new Date().toISOString());return response;}
 const ok=async(...args)=>{const result=await req(...args);assert.ok(result.status>=200&&result.status<300,JSON.stringify(result));return result.body;};
@@ -107,5 +107,59 @@ try{
  const disposable=(await ok('/api/loop/posts','POST',{content:'Delete batch fixture'})).post;
  await ok(`/api/loop/posts/${disposable.id}`,'DELETE');
  assert.equal((await ok(`/api/loop/posts?ids=${disposable.id}`)).posts.length,0,'batch refresh omits deleted posts');
+ // Existing repost rows have no uploads. Resolve their original media without copying files.
+ database.exec('DELETE FROM loop_blocks; DELETE FROM loop_mutes;');
+ const insertMedia=database.prepare('INSERT INTO loop_post_media(post_id,storage_name,original_name,mime_type,size_bytes,position) VALUES(?,?,?,?,?,?)');
+ for(const [type,mime] of [['photo','image/png'],['gif','image/gif'],['video','video/quicktime'],['audio','audio/mpeg']]) {
+   const source=(await ok('/api/loop/posts','POST',{content:`${type} source`},2)).post;
+   const mediaId=Number(insertMedia.run(source.id,`repost-${type}`,`${type} fixture`,mime,42,0).lastInsertRowid);
+   if(type==='video') {
+     database.prepare("INSERT INTO loop_media_playback(media_id,status,created_at,updated_at) VALUES(?,'ready',?,?)").run(mediaId,'2026-10-13','2026-10-13');
+     database.prepare("INSERT INTO loop_media_captions(media_id,status,created_at,updated_at) VALUES(?,'ready',?,?)").run(mediaId,'2026-10-13','2026-10-13');
+   }
+   const original=(await ok(`/api/loop/posts/${source.id}`)).post;
+   const repost=(await ok(`/api/loop/posts/${source.id}/repost`,'POST')).post;
+   const nested=(await ok(`/api/loop/posts/${repost.id}/repost`,'POST',{},3)).post;
+   assert.deepEqual(repost.media,original.media,`${type} repost retains original media and playback/captions metadata`);
+   assert.deepEqual(repost.originalPost,{id:source.id,author:{id:2,username:'Bob',verified:false}},'attribution identifies the original author and verification state');
+   assert.equal(nested.originalPost.author.username,'Alice','nested attribution links to the referenced post');
+   assert.deepEqual(nested.media,original.media,'nested repost retains media');
+   assert.equal((await ok(`/api/loop/posts/${source.id}/repost`,'POST')).post.id,repost.id,'reposting twice remains idempotent');
+   assert.deepEqual((await ok(`/api/loop/posts?ids=${repost.id},${nested.id}`)).posts.map(post=>post.media),[original.media,original.media],'batch refresh retains media');
+   const filtered=(await ok(`/api/loop/posts?type=${type}&author=1`)).posts;
+   assert.ok(filtered.some(post=>post.id===repost.id),`${type} filter includes reposts`);
+   assert.equal((await ok('/api/loop/posts?type=text&author=1')).posts.some(post=>post.id===repost.id),false,'media repost is not a text-only post');
+   await ok('/api/loop/users/1/follow','POST',{},3);
+   assert.ok((await ok(`/api/loop/posts?type=${type}&feed=following`,'GET',{},3)).posts.some(post=>post.id===repost.id),'Following media filter includes reposts');
+   await ok('/api/loop/users/1/follow','POST',{},3);
+   assert.equal(database.prepare('SELECT COUNT(*) n FROM loop_post_media WHERE post_id IN (?,?)').get(repost.id,nested.id).n,0,'reposts do not duplicate uploads');
+   await ok('/api/loop/users/2/block','POST');
+   assert.deepEqual((await ok(`/api/loop/posts/${repost.id}`)).post.media,[],'blocked original media is not exposed');
+   assert.equal((await ok(`/api/loop/posts/${repost.id}`)).post.originalPost,null,'blocked original attribution is not exposed');
+   assert.equal((await req(`/api/loop/posts/${source.id}/repost`,'POST')).status,404,'blocked post cannot be reposted');
+   assert.equal((await req('/api/loop/posts','POST',{originalPostId:source.id})).status,404,'quote creation also respects blocks');
+   await ok('/api/loop/users/2/block','POST');
+   await ok('/api/loop/users/2/mute','POST');
+   assert.deepEqual((await ok(`/api/loop/posts/${repost.id}`)).post.media,[],'muted original media is not exposed');
+   assert.equal((await ok(`/api/loop/posts/${repost.id}`)).post.originalPost,null,'muted original attribution is not exposed');
+   await ok('/api/loop/users/2/mute','POST');
+   database.prepare('UPDATE loop_posts SET deleted_at=? WHERE id=?').run('2026-10-13',source.id);
+   assert.equal((await ok(`/api/loop/posts/${repost.id}`)).post.originalPost,null,'deleted original attribution is unavailable');
+   assert.deepEqual((await ok(`/api/loop/posts/${nested.id}`,'GET',{},3)).post.media,[],'deleted source disappears from nested repost');
+ }
+ const gallery=(await ok('/api/loop/posts','POST',{content:'Gallery'},2)).post;
+ insertMedia.run(gallery.id,'repost-second','Second','image/png',42,1);
+ insertMedia.run(gallery.id,'repost-first','First','image/png',42,0);
+ const legacy=Number(database.prepare("INSERT INTO loop_posts(user_id,body,media_type,created_at,original_post_id,tags_json) VALUES(1,'','none','2026-10-13',?,'[]')").run(gallery.id).lastInsertRowid);
+ assert.deepEqual((await ok(`/api/loop/posts/${legacy}`)).post.media.map(file=>file.name),['First','Second'],'legacy galleries retain ordering');
+ insertMedia.run(legacy,'repost-own','Own quote media','image/gif',42,0);
+ assert.deepEqual((await ok(`/api/loop/posts/${legacy}`)).post.media.map(file=>file.name),['Own quote media'],'own quote media takes precedence');
+ assert.equal((await ok('/api/loop/posts?type=photo&author=1')).posts.some(post=>post.id===legacy),false,'filter uses the visible media, not a hidden ancestor attachment');
+ const cycleA=(await ok('/api/loop/posts','POST',{content:'Cycle A'})).post;
+ const cycleB=(await ok('/api/loop/posts','POST',{content:'Cycle B'})).post;
+ database.prepare('UPDATE loop_posts SET original_post_id=? WHERE id=?').run(cycleB.id,cycleA.id);
+ database.prepare('UPDATE loop_posts SET original_post_id=? WHERE id=?').run(cycleA.id,cycleB.id);
+ assert.deepEqual((await ok(`/api/loop/posts/${cycleA.id}`)).post.media,[],'corrupt reference cycles terminate');
+ console.log('PASS: existing/new/nested reposts, gallery ordering, image/GIF/video/audio filters, Following/batch refresh, captions/playback metadata, no duplicate uploads, deletion/block/mute checks and cyclic references.');
  console.log('PASS: migration preservation/idempotence, Following filters, threads/pagination/deletion, mentions/replies, notification preferences/deduplication/read isolation/pagination/muting, blocked access and realtime events.');
 }finally{database.close();}

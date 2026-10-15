@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { getBrowserDiagnostics, getDeveloperTraffic, setDeveloperModeEnabled } from '../../app/developerMode';
 import { CloseIcon } from './icons';
+import { startVisualLoop, subscribePageActivity } from '../../app/pageActivity';
 
 function formatBytes(bytes) {
   const value = Math.max(0, Number(bytes) || 0);
@@ -20,7 +21,6 @@ export default function DeveloperModeWindow({ onClose }) {
   useEffect(() => {
     let frames = 0;
     let lastSample = performance.now();
-    let animationFrame = 0;
     const sample = (now) => {
       frames += 1;
       if (now - lastSample >= 1000) {
@@ -28,12 +28,15 @@ export default function DeveloperModeWindow({ onClose }) {
         frames = 0;
         lastSample = now;
       }
-      animationFrame = requestAnimationFrame(sample);
     };
-    animationFrame = requestAnimationFrame(sample);
-    const timer = window.setInterval(() => setDiagnostics(getBrowserDiagnostics()), 1000);
+    const stop = startVisualLoop(sample);
+    const unsubscribe = subscribePageActivity(() => { frames = 0; lastSample = performance.now(); setFps(null); });
+    const timer = window.setInterval(() => {
+      if (document.visibilityState !== 'hidden') setDiagnostics(getBrowserDiagnostics());
+    }, 1000);
     return () => {
-      cancelAnimationFrame(animationFrame);
+      stop();
+      unsubscribe();
       window.clearInterval(timer);
     };
   }, []);

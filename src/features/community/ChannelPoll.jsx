@@ -1,11 +1,12 @@
 import { memo } from 'react';
+import PollVoters from '../../components/PollVoters';
 
 function optionPercent(votes, total) {
   if (!total) return 0;
   return Math.round((votes / total) * 100);
 }
 
-function ChannelPoll({ poll, canClose = false, disabled = false, onVote, onClose }) {
+function ChannelPoll({ poll, votersEndpoint, canClose = false, disabled = false, onVote, onClose }) {
   if (!poll?.options?.length) return null;
   const total = Number(poll.voterCount || 0);
   const showCounts = poll.closed || poll.options.some((option) => option.voted);
@@ -35,6 +36,7 @@ function ChannelPoll({ poll, canClose = false, disabled = false, onVote, onClose
         <small>{total} vote{total === 1 ? '' : 's'}{poll.allowMultiple ? ' · Multiple' : ''}{poll.closed ? ' · Closed' : ''}</small>
         {canClose && !poll.closed ? <button type="button" className="community-poll-close" onClick={onClose}>Close poll</button> : null}
       </div>
+      <PollVoters endpoint={votersEndpoint} options={poll.options} />
     </div>
   );
 }

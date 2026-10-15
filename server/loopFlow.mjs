@@ -1,10 +1,11 @@
-export function createLoopFlow(database, visibility) {
+export function createLoopFlow(database, visibility, { random = Math.random, now = Date.now } = {}) {
   // Stable random ranks make continuation indexed instead of sorting the entire feed on every swipe.
   try { database.exec('ALTER TABLE loop_posts ADD COLUMN flow_rank INTEGER NOT NULL DEFAULT 0'); }
   catch (error) { if (!String(error.message).includes('duplicate column')) throw error; }
   database.exec(`
     UPDATE loop_posts SET flow_rank=(random() & 2147483647)+1 WHERE flow_rank=0;
     CREATE INDEX IF NOT EXISTS loop_flow_rank_idx ON loop_posts(flow_rank,id) WHERE deleted_at IS NULL;
+    CREATE INDEX IF NOT EXISTS loop_flow_recent_idx ON loop_posts(created_at DESC,id DESC) WHERE deleted_at IS NULL;
     CREATE TRIGGER IF NOT EXISTS loop_flow_rank_insert AFTER INSERT ON loop_posts WHEN NEW.flow_rank=0
       BEGIN UPDATE loop_posts SET flow_rank=(random() & 2147483647)+1 WHERE id=NEW.id; END;
   `);
@@ -33,8 +34,18 @@ export function createLoopFlow(database, visibility) {
       if (pastPivot === state.wrapped) throw invalid();
     } else {
       const max = Number(database.prepare('SELECT MAX(id) id FROM loop_posts').get().id || 0);
-      // Random selection happens once per round and only scans IDs, not media or post bodies.
-      const pick = excluded => database.prepare(`SELECT p.id,p.flow_rank FROM loop_posts p WHERE ${eligible} AND p.id<=? AND p.id!=? ORDER BY random() LIMIT 1`).get(...bindings,max,excluded);
+      // About one third of new rounds start with a recent post. Sample a small
+      // indexed pool so it is not always the newest post or a full-feed sort.
+      const pick = excluded => {
+        if (random() < 0.3) {
+          const cutoff = new Date(now() - 7 * 86400000).toISOString();
+          const recent = database.prepare(`SELECT p.id,p.flow_rank FROM loop_posts p WHERE ${eligible} AND p.id<=? AND p.id!=? AND p.created_at>=? ORDER BY p.created_at DESC,p.id DESC LIMIT 24`).all(...bindings,max,excluded,cutoff);
+          if (recent.length) return recent[Math.floor(random() * recent.length)];
+        }
+        const pivotRank = Math.floor(random() * 2147483648) + 1;
+        const seek = (operator) => database.prepare(`SELECT p.id,p.flow_rank FROM loop_posts p WHERE ${eligible} AND p.id<=? AND p.id!=? AND p.flow_rank${operator}? ORDER BY p.flow_rank,p.id LIMIT 1`).get(...bindings,max,excluded,pivotRank);
+        return seek('>=') || seek('<');
+      };
       const pivot = pick(avoid) || (avoid ? pick(0) : null);
       if (!pivot) return { ids: [], page: { hasMore: false, nextCursor: null } };
       state = { v:1, viewer, feed, max, pivotRank:Number(pivot.flow_rank), pivotId:Number(pivot.id), lastRank:null, lastId:null, wrapped:false };

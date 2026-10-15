@@ -36,12 +36,15 @@ export function createVideoDownloadService({dataDirectory,sendJson,readJson,requ
   const visible=job=>({id:job.id,status:job.status,title:job.title,uploader:job.uploader,duration:job.duration,progress:job.progress,error:job.error,size:job.size,expiresAt:job.expiresAt,
     ...(job.status==='ready'?{downloadUrl:`/api/v1/video-downloads/${job.id}/file`,previewUrl:`/api/v1/video-downloads/${job.id}/file?preview=1`}:{})});
   const removeFiles=job=>rm(join(directory,job.id),{recursive:true,force:true});
+  const readyCount=()=>[...jobs.values()].filter(job=>job.status==='ready').length;
   const fail=async(job,error)=>{job.status='failed';job.error=error;job.controller?.abort();await removeFiles(job);};
   const prune=async()=>{
     const cutoff=Date.now()-60*60_000;
     while(globalStarts.length&&globalStarts[0]<cutoff)globalStarts.shift();
     for(const [id,entry]of accountStarts)if(entry.resetAt<Date.now())accountStarts.delete(id);
-    for(const [id,job]of jobs)if(!running.has(job.status)&&job.expiresAt<Date.now()){jobs.delete(id);await removeFiles(job);}
+    let freedReadySlot=false;
+    for(const [id,job]of jobs)if(!running.has(job.status)&&job.expiresAt<Date.now()){if(job.status==='ready')freedReadySlot=true;jobs.delete(id);await removeFiles(job);}
+    if(freedReadySlot)void pump().catch(()=>{});
   };
   const interval=setInterval(()=>prune().catch(error=>console.error('Video download cleanup failed:',error.code||'filesystem error')),60_000);interval.unref();
 
@@ -102,7 +105,7 @@ export function createVideoDownloadService({dataDirectory,sendJson,readJson,requ
   async function pump(){
     if(active)return;
     const job=[...jobs.values()].find(item=>item.status==='queued');
-    if(!job)return;
+    if(!job||readyCount()>=3)return;
     active=true;
     try {await prepare(job);}catch(error){if(job.status!=='cancelled')await fail(job,clean(error.message,300));}
     finally {if(job.status==='cancelled')await removeFiles(job);active=false;void pump().catch(()=>{});}
@@ -144,7 +147,7 @@ export function createVideoDownloadService({dataDirectory,sendJson,readJson,requ
       let url;
       try {url=validateVideoUrl((await readJson(request,4096))?.url);}catch(error){sendJson(response,400,{error:error.message});return true;}
       if([...jobs.values()].some(job=>job.userId===Number(user.id)&&running.has(job.status))){sendJson(response,409,{error:'You already have a video being prepared.'});return true;}
-      if([...jobs.values()].filter(job=>running.has(job.status)||job.status==='ready').length>=3){sendJson(response,503,{error:'Downloads are busy. Please try again in a few minutes.'});return true;}
+      if([...jobs.values()].filter(job=>running.has(job.status)).length>=20){sendJson(response,503,{error:"Glean's video download queue is full. Please try again shortly."});return true;}
       const starts=accountStarts.get(Number(user.id)) || {count:0,resetAt:Date.now()+60*60_000};
       const retry=starts.count>=6?Math.max(1,Math.ceil((starts.resetAt-Date.now())/1000))
         :globalStarts.length>=20?Math.max(1,Math.ceil((globalStarts[0]+60*60_000-Date.now())/1000))
@@ -152,7 +155,7 @@ export function createVideoDownloadService({dataDirectory,sendJson,readJson,requ
       if(retry){sendJson(response,429,{error:'Download limit reached. Please try again later.'},{'Retry-After':String(retry)});return true;}
       starts.count++;accountStarts.set(Number(user.id),starts);globalStarts.push(Date.now());
       const job={id:randomUUID(),userId:Number(user.id),url,status:'queued',title:'Video',uploader:'',progress:null,expiresAt:Date.now()+TTL};jobs.set(job.id,job);
-      // Bounded terminal history; file storage has a separate three-video cap.
+      // Keep queued work bounded; completed files have their own three-video cap.
       for(const [id,item]of jobs)if(jobs.size>64&&!running.has(item.status)&&item.status!=='ready')jobs.delete(id);
       sendJson(response,202,{job:visible(job)});void pump().catch(error=>console.error('Video worker failed:',error.code||'worker error'));return true;
     }
@@ -170,6 +173,7 @@ export function createVideoDownloadService({dataDirectory,sendJson,readJson,requ
     if(!match[2]&&method==='DELETE'){
       const wasRunning=running.has(job.status);job.status='cancelled';job.controller?.abort();
       if(!wasRunning||!job.controller)await removeFiles(job);
+      void pump().catch(()=>{});
       sendJson(response,200,{job:visible(job)});return true;
     }
     sendJson(response,405,{error:'Method not allowed.'});return true;

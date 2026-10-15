@@ -87,9 +87,14 @@ export function createLoopCaptions({ database, uploadDirectory, realtimeHub, api
   const available = () => Boolean(apiKey.trim() && existsSync(ffmpeg) && existsSync(ffprobe));
   const transcriptionModel = ['whisper-large-v3', 'whisper-large-v3-turbo'].includes(model) ? model : 'whisper-large-v3';
   const get = id => database.prepare('SELECT * FROM loop_media_captions WHERE media_id=?').get(id);
-  const publicStatus = id => {
-    const row = get(id);
+  const statusFor = (id, row) => {
     return row ? { status: row.status, language: row.language || 'und', error: row.error || null, url: row.status === 'ready' ? `/api/v1/loop/media/${id}/captions.vtt` : null } : null;
+  };
+  const publicStatus = id => statusFor(id, get(id));
+  const publicStatuses = ids => {
+    if (!ids.length) return new Map();
+    return new Map(database.prepare(`SELECT media_id,status,language,error FROM loop_media_captions WHERE media_id IN (${ids.map(() => '?').join(',')})`).all(...ids)
+      .map(row => [Number(row.media_id), statusFor(Number(row.media_id), row)]));
   };
   const canQueue = userId => {
     if (!available()) return { status: 503, error: 'Auto captions are temporarily unavailable. Turn off auto captions to publish.' };
@@ -144,5 +149,5 @@ export function createLoopCaptions({ database, uploadDirectory, realtimeHub, api
     } finally { busy = false; }
   }
   if (autoStart) { const timer = setInterval(() => { drain().catch(() => console.error('Loop caption queue failed.')); },15000); timer.unref(); }
-  return { available, publicStatus, canQueue, queue, get, drain, kick: () => { if (autoStart) setImmediate(() => drain().catch(() => console.error('Loop caption queue failed.'))); } };
+  return { available, publicStatus, publicStatuses, canQueue, queue, get, drain, kick: () => { if (autoStart) setImmediate(() => drain().catch(() => console.error('Loop caption queue failed.'))); } };
 }

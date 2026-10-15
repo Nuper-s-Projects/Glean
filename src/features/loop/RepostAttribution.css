@@ -1,0 +1,3 @@
+.loop-repost-label[href] { width: fit-content; max-width: 100%; overflow-wrap: anywhere; text-decoration: none; }
+.loop-repost-label[href]:hover { color: var(--loop-blue); text-decoration: underline; }
+.loop-repost-label[href]:focus-visible { outline: 2px solid var(--loop-blue); outline-offset: 4px; border-radius: 3px; }

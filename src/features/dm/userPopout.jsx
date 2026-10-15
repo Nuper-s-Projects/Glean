@@ -75,6 +75,9 @@ export function UserPopoutProvider({ account, children, inlineUser = null, onMes
   const [busy, setBusy] = useState('');
   const [notice, setNotice] = useState('');
   const directoryRef = useRef([]);
+  const profileCacheRef = useRef(new Map());
+  const profileRequestsRef = useRef(new Map());
+  const profileRequestVersionsRef = useRef(new Map());
   const cardRef = useRef(null);
   const popoutRef = useRef(null);
   const [coords, setCoords] = useState({ top: 0, left: 0 });
@@ -99,6 +102,24 @@ export function UserPopoutProvider({ account, children, inlineUser = null, onMes
       return { ...current, user: { ...current.user, ...next } };
     });
   }, []);
+  const loadProfile = useCallback((username, { force = false } = {}) => {
+    const cacheKey = `${Number(account?.id) || 0}:${String(username || '').toLowerCase()}`;
+    const cached = profileCacheRef.current.get(cacheKey);
+    if (!force && cached && Date.now() - cached.updatedAt < 30_000) return Promise.resolve(cached.user);
+    if (!force && profileRequestsRef.current.has(cacheKey)) return profileRequestsRef.current.get(cacheKey);
+    const version = (profileRequestVersionsRef.current.get(cacheKey) || 0) + 1;
+    profileRequestVersionsRef.current.set(cacheKey, version);
+    const pending = getUserProfile(username).then(({ user: profile }) => {
+      if (profileRequestVersionsRef.current.get(cacheKey) !== version) return null;
+      profileCacheRef.current.set(cacheKey, { user: profile, updatedAt: Date.now() });
+      while (profileCacheRef.current.size > 128) profileCacheRef.current.delete(profileCacheRef.current.keys().next().value);
+      return profile;
+    }).finally(() => {
+      if (profileRequestsRef.current.get(cacheKey) === pending) profileRequestsRef.current.delete(cacheKey);
+    });
+    profileRequestsRef.current.set(cacheKey, pending);
+    return pending;
+  }, [account?.id]);
   const open = useCallback((user, anchor) => {
     if (!user || !anchor) return;
     const merged = mergeUser(user, directoryRef.current, account);
@@ -113,10 +134,10 @@ export function UserPopoutProvider({ account, children, inlineUser = null, onMes
     setCoords(placeCard(anchor, cardRef.current));
     setPopout({ user: merged, anchor });
     if (!username) return;
-    getUserProfile(username)
-      .then(({ user: profile }) => patchUser(username, profile))
+    loadProfile(username)
+      .then((profile) => { if (profile) patchUser(username, profile); })
       .catch(() => {});
-  }, [account, close, patchUser]);
+  }, [account, close, loadProfile, patchUser]);
 
   const api = useMemo(() => ({ open, close, setDirectory }), [open, close, setDirectory]);
 
@@ -220,8 +241,8 @@ export function UserPopoutProvider({ account, children, inlineUser = null, onMes
     setNotice('');
     try {
       await acceptFriendRequest(user.requestId);
-      const { user: profile } = await getUserProfile(user.username);
-      patchUser(user.username, profile);
+      const profile = await loadProfile(user.username, { force: true });
+      if (profile) patchUser(user.username, profile);
     } catch (error) {
       setNotice(error.message);
     } finally {
@@ -235,8 +256,8 @@ export function UserPopoutProvider({ account, children, inlineUser = null, onMes
     setNotice('');
     try {
       await cancelFriendRequest(user.requestId);
-      const { user: profile } = await getUserProfile(user.username);
-      patchUser(user.username, profile);
+      const profile = await loadProfile(user.username, { force: true });
+      if (profile) patchUser(user.username, profile);
     } catch (error) {
       setNotice(error.message);
     } finally {
@@ -250,8 +271,8 @@ export function UserPopoutProvider({ account, children, inlineUser = null, onMes
     setNotice('');
     try {
       await declineFriendRequest(user.requestId);
-      const { user: profile } = await getUserProfile(user.username);
-      patchUser(user.username, profile);
+      const profile = await loadProfile(user.username, { force: true });
+      if (profile) patchUser(user.username, profile);
     } catch (error) {
       setNotice(error.message);
     } finally {
@@ -260,8 +281,8 @@ export function UserPopoutProvider({ account, children, inlineUser = null, onMes
   };
 
   const refreshProfile = async (username) => {
-    const { user: profile } = await getUserProfile(username);
-    patchUser(username, profile);
+    const profile = await loadProfile(username, { force: true });
+    if (profile) patchUser(username, profile);
   };
 
   const unfriend = async () => {

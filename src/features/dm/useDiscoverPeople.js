@@ -5,7 +5,7 @@ import { mergePeoplePages } from './discoverPeopleState';
 const PAGE_SIZE = 50;
 const EMPTY_COUNTS = { all: 0, add: 0, pending: 0, friends: 0 };
 
-export function useDiscoverPeople({ enabled, query, filter, attributeFilters, revision }) {
+export function useDiscoverPeople({ enabled, query, filter, attributeFilters, revision, accountId }) {
   const [people, setPeople] = useState([]);
   const [total, setTotal] = useState(0);
   const [counts, setCounts] = useState(EMPTY_COUNTS);
@@ -16,8 +16,11 @@ export function useDiscoverPeople({ enabled, query, filter, attributeFilters, re
   const [error, setError] = useState('');
   const [reload, setReload] = useState(0);
   const scopeRef = useRef(null);
-  const snapshotRef = useRef({ key: null, people: [] });
+  const pageCacheRef = useRef(new Map());
+  const cacheRevisionRef = useRef(revision);
+  const reloadRef = useRef(reload);
   const key = JSON.stringify({ query: query.trim().slice(0, 80), filter, attributes: [...attributeFilters].sort() });
+  const cacheKey = `${Number(accountId) || 0}:${key}`;
   const applyMetadata = useCallback(result => {
     setTotal(Number(result.total || 0));
     setCounts(result.counts || EMPTY_COUNTS);
@@ -27,30 +30,51 @@ export function useDiscoverPeople({ enabled, query, filter, attributeFilters, re
 
   useEffect(() => {
     if (!enabled) return undefined;
+    if (cacheRevisionRef.current !== revision) {
+      pageCacheRef.current.clear();
+      cacheRevisionRef.current = revision;
+    }
     const controller = new AbortController();
     const options = JSON.parse(key);
-    const scope = { key, options, controller, cursor: null, loading: true };
+    const scope = { key: cacheKey, options, controller, cursor: null, loading: true };
     scopeRef.current = scope;
-    const previous = snapshotRef.current;
-    const target = previous.key === key ? Math.max(PAGE_SIZE, previous.people.length) : PAGE_SIZE;
-    const refreshing = previous.key === key && previous.people.length > 0;
+    const forceReload = reloadRef.current !== reload;
+    reloadRef.current = reload;
+    const cached = forceReload ? null : pageCacheRef.current.get(cacheKey);
+    const refreshing = Boolean(cached && Date.now() - cached.updatedAt < 30_000);
+    if (refreshing) {
+      scope.cursor = cached.cursor;
+      scope.loading = false;
+      setPeople(cached.people);
+      setTotal(cached.total);
+      setCounts(cached.counts);
+      setAttributeCounts(cached.attributeCounts);
+      setHasMore(cached.cursor !== null);
+    }
     const active = () => scopeRef.current === scope && !controller.signal.aborted;
     setIsLoading(!refreshing);
-    setIsLoadingMore(refreshing);
+    setIsLoadingMore(false);
     setError('');
-    if (previous.key !== key) { setPeople([]); setTotal(0); setHasMore(false); }
+    if (!refreshing) { setPeople([]); setTotal(0); setHasMore(false); }
     const timer = window.setTimeout(async () => {
+      if (refreshing) return;
       let rows = [], cursor = 0, result;
       try {
-        do {
-          result = await getPeople({ ...options, cursor, limit: PAGE_SIZE, signal: controller.signal });
-          if (!active()) return;
-          rows = mergePeoplePages(rows, result.people || []);
-          if (result.nextCursor != null && Number(result.nextCursor) <= cursor) throw new Error('The people directory returned an invalid page. Try again.');
-          cursor = result.nextCursor ?? null;
-        } while (cursor !== null && rows.length < target);
+        result = await getPeople({ ...options, cursor, limit: PAGE_SIZE, signal: controller.signal });
+        if (!active()) return;
+        rows = mergePeoplePages(rows, result.people || []);
+        if (result.nextCursor != null && Number(result.nextCursor) <= cursor) throw new Error('The people directory returned an invalid page. Try again.');
+        cursor = result.nextCursor ?? null;
         scope.cursor = cursor;
-        snapshotRef.current = { key, people: rows };
+        pageCacheRef.current.set(cacheKey, {
+          people: rows,
+          total: Number(result.total || 0),
+          counts: result.counts || EMPTY_COUNTS,
+          attributeCounts: result.attributeCounts || { magnet: 0, 'laredo-college': 0 },
+          cursor,
+          updatedAt: Date.now(),
+        });
+        while (pageCacheRef.current.size > 12) pageCacheRef.current.delete(pageCacheRef.current.keys().next().value);
         setPeople(rows);
         applyMetadata(result);
       } catch (failure) {
@@ -64,7 +88,7 @@ export function useDiscoverPeople({ enabled, query, filter, attributeFilters, re
       controller.abort();
       if (scopeRef.current === scope) scopeRef.current = null;
     };
-  }, [enabled, key, revision, reload, applyMetadata]);
+  }, [enabled, key, cacheKey, revision, reload, applyMetadata]);
 
   const loadMore = useCallback(async () => {
     const scope = scopeRef.current;
@@ -78,8 +102,16 @@ export function useDiscoverPeople({ enabled, query, filter, attributeFilters, re
       if (!active()) return;
       if (result.nextCursor != null && Number(result.nextCursor) <= scope.cursor) throw new Error('The people directory returned an invalid page. Try again.');
       scope.cursor = result.nextCursor ?? null;
-      const rows = mergePeoplePages(snapshotRef.current.people, result.people || []);
-      snapshotRef.current = { key: scope.key, people: rows };
+      const cached = pageCacheRef.current.get(scope.key);
+      const rows = mergePeoplePages(cached?.people || [], result.people || []);
+      pageCacheRef.current.set(scope.key, {
+        people: rows,
+        total: Number(result.total || 0),
+        counts: result.counts || EMPTY_COUNTS,
+        attributeCounts: result.attributeCounts || { magnet: 0, 'laredo-college': 0 },
+        cursor: scope.cursor,
+        updatedAt: Date.now(),
+      });
       setPeople(rows);
       applyMetadata(result);
     } catch (failure) {
@@ -89,5 +121,9 @@ export function useDiscoverPeople({ enabled, query, filter, attributeFilters, re
     }
   }, [applyMetadata]);
 
-  return { people, total, counts, attributeCounts, hasMore, isLoading, isLoadingMore, error, loadMore, retry: () => setReload(current => current + 1) };
+  const retry = useCallback(() => {
+    pageCacheRef.current.delete(cacheKey);
+    setReload(current => current + 1);
+  }, [cacheKey]);
+  return { people, total, counts, attributeCounts, hasMore, isLoading, isLoadingMore, error, loadMore, retry };
 }

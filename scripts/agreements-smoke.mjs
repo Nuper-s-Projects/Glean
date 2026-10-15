@@ -3,11 +3,15 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as delay } from 'node:timers/promises';
-import { AGREEMENT_WAIT_SECONDS, CONDUCT_VERSION, TERMS_VERSION } from '../src/app/agreements.js';
+import { AGREEMENT_WAIT_SECONDS, CONDUCT_VERSION, TERMS_VERSION, TERMS_SECTIONS } from '../src/app/agreements.js';
 
 const port = 6100 + Math.floor(Math.random() * 500);
 const dataDir = mkdtempSync(join(tmpdir(), 'glean-agreements-test-'));
+const seed = new DatabaseSync(join(dataDir, 'glean-auth.sqlite'));
+seed.exec("CREATE TABLE platform_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL) STRICT; INSERT INTO platform_settings VALUES('allow_school_hours','1')");
+seed.close();
 const base = `http://127.0.0.1:${port}/api/v1`;
 const server = spawn(process.execPath, ['server.mjs'], {
   cwd: new URL('..', import.meta.url),
@@ -61,6 +65,14 @@ try {
   });
   assert.equal(account.response.status, 201);
   assert.equal(account.body.account.agreementsAccepted, false);
+  const db = new DatabaseSync(join(dataDir, 'glean-auth.sqlite'));
+  db.prepare('INSERT INTO user_agreement_acceptances(user_id,terms_version,conduct_version,accepted_at) VALUES(?,?,?,?)').run(account.body.account.id, 'glean-terms-draft-2026-09-24-v2', CONDUCT_VERSION, new Date().toISOString());
+  assert.equal((await request('/auth/me')).body.account.agreementsAccepted, false, 'old acceptance does not accept new terms');
+  const text = TERMS_SECTIONS.flatMap(section => section.paragraphs).join('\n');
+  assert.match(text, /responsible for your own actions/);
+  assert.match(text, /including Nuper/);
+  assert.match(text, /disallows platform moderation/);
+  assert.match(text, /do not give ordinary users moderation authority/);
 
   const blocked = await request('/servers');
   assert.equal(blocked.response.status, 403);
@@ -76,6 +88,8 @@ try {
   const tooSoon = await request('/account/agreements', { method: 'POST', body: input });
   assert.equal(tooSoon.response.status, 425, 'acceptance before the five-second wait must be rejected server-side');
   await delay(AGREEMENT_WAIT_SECONDS * 1000 + 100);
+  const stale = await request('/account/agreements', { method: 'POST', body: JSON.stringify({ termsVersion: 'glean-terms-draft-2026-09-24-v2', conductVersion: CONDUCT_VERSION, termsAccepted: true, conductAccepted: true }) });
+  assert.equal(stale.response.status, 409, 'stale clients must review new terms');
 
   const accepted = await request('/account/agreements', { method: 'POST', body: input });
   assert.equal(accepted.response.status, 200);
@@ -85,6 +99,8 @@ try {
 
   const allowed = await request('/servers');
   assert.equal(allowed.response.status, 200);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM user_agreement_acceptances WHERE user_id=?').get(account.body.account.id).n, 2, 'preserves prior acceptance record');
+  db.close();
 
   console.log('Agreement acceptance smoke test passed.');
 } finally {

@@ -2,10 +2,12 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { subscribeToDmEvents } from '../../app/dmApi';
 import { loopRequest } from './loopRequest';
 
-export default function useLoopFeed({ enabled, feed, type, search, shape, onError }) {
-  const [posts, setPosts] = useState([]);
-  const [nextBefore, setNextBefore] = useState(null);
-  const [loading, setLoading] = useState(true);
+export default function useLoopFeed({ enabled, feed, type, search, shape, onError, initialFeed = null }) {
+  const bootstrap = useRef(feed === 'everyone' && type === 'all' && !search.trim() ? initialFeed : null);
+  const initialized = useRef(false);
+  const [posts, setPosts] = useState(() => (bootstrap.current?.posts || []).map(shape));
+  const [nextBefore, setNextBefore] = useState(() => bootstrap.current?.page?.hasMore ? bootstrap.current.page.nextBefore : null);
+  const [loading, setLoading] = useState(!bootstrap.current);
   const [error, setError] = useState('');
   const [query, setQuery] = useState(search.trim());
   const version = useRef(0), paging = useRef(null), alive = useRef(false), items = useRef(posts), dirty = useRef(new Set());
@@ -25,13 +27,16 @@ export default function useLoopFeed({ enabled, feed, type, search, shape, onErro
     else setLoading(true);
     try {
       const params = new URLSearchParams({ limit: '12', feed, type, ...(query ? { q: query } : {}), ...(before ? { before: String(before) } : {}) });
-      const data = await loopRequest(`/loop/posts?${params}`, { force });
+      const ready = !before && !force && feed === 'everyone' && type === 'all' && !query ? bootstrap.current : null;
+      if (!before) bootstrap.current = null;
+      const data = ready || await loopRequest(`/loop/posts?${params}`, { force });
       if (!alive.current || requested !== version.current) return;
       const mapped = (data.posts || []).map(shape);
       setPosts(current => {
         if (replace) return mapped;
         const ids = new Set(mapped.map(post => post.id));
-        return before ? [...current, ...mapped.filter(post => !current.some(item => item.id === post.id))]
+        const existing = new Set(current.map(post => post.id));
+        return before ? [...current, ...mapped.filter(post => !existing.has(post.id))]
           : [...mapped, ...current.filter(post => !ids.has(post.id))];
       });
       // Refreshing page one must not reset the reader's pagination cursor.
@@ -69,7 +74,9 @@ export default function useLoopFeed({ enabled, feed, type, search, shape, onErro
     return () => { alive.current = false; version.current++; };
   }, []);
   useEffect(() => {
-    version.current++; replaceNext.current = true; paging.current = null; syncing.current = null; dirty.current.clear(); setPosts([]); setNextBefore(null);
+    version.current++; replaceNext.current = true; paging.current = null; syncing.current = null; dirty.current.clear();
+    if (initialized.current || !bootstrap.current) { bootstrap.current = null; setPosts([]); setNextBefore(null); }
+    initialized.current = true;
   }, [load]);
   useEffect(() => {
     if (!enabled) return;
@@ -93,7 +100,10 @@ export default function useLoopFeed({ enabled, feed, type, search, shape, onErro
     }
   }, [load, shape, onError]);
   useEffect(() => {
-    const sub = subscribeToDmEvents((event, data) => {
+    const sub = subscribeToDmEvents((event, data, metadata) => {
+      // A newly mounted subscriber is told about an already-open socket. That
+      // is not a reconnect and must not repeat its freshly loaded feed request.
+      if (event === 'connected' && metadata?.replayed) return;
       const id = Number(data?.postId);
       if (event === 'connected') { needsResync.current = true; if (enabled) reconcile(); }
       if (event === 'loop-follow-updated' && feed === 'following') {

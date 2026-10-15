@@ -1,6 +1,6 @@
+import { createMemoryCache } from '../../app/memoryCache.js';
 const RECORDER_TYPES = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus', 'audio/ogg'];
-const PEAKS_CACHE = new Map();
-const PEAKS_LIMIT = 48;
+const PEAKS_CACHE = createMemoryCache({ maxEntries: 48 });
 export const VOICE_MAX_MS = 5 * 60 * 1000;
 export const VOICE_SPEEDS = [1, 1.5, 2];
 
@@ -50,11 +50,11 @@ export async function audioPeaks(src, buckets = 40) {
     const buffer = await response.arrayBuffer();
     const Context = window.AudioContext || window.webkitAudioContext;
     const context = new Context();
-    const decoded = await context.decodeAudioData(buffer.slice(0));
-    await context.close().catch(() => {});
-    return slicePeaks(decoded.getChannelData(0), buckets);
+    try {
+      const decoded = await context.decodeAudioData(buffer);
+      return slicePeaks(decoded.getChannelData(0), buckets);
+    } finally { await context.close().catch(() => {}); }
   })().catch(() => Array(buckets).fill(0.22));
   PEAKS_CACHE.set(key, pending);
-  if (PEAKS_CACHE.size > PEAKS_LIMIT) PEAKS_CACHE.delete(PEAKS_CACHE.keys().next().value);
   return pending;
 }

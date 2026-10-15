@@ -612,6 +612,7 @@ function aadCandidates(conversationId, clientMessageId) {
 
 export async function prepareEncryptedMessage(identity, conversation, text, files = []) {
   if (identity?.serverKeyMismatch) throw new Error('This browser is missing your existing message key. Restore it from a device that can still read your DMs before sending.');
+  if (conversation?.kind === 'group') return prepareGroupMessage(identity, conversation, text, files);
   const peerPublicKey = conversation?.user?.publicKey;
   if (!peerPublicKey) throw new Error(`${conversation?.user?.username || 'This friend'} must open the updated Glean app once before encrypted DMs can be sent.`);
   const uploadFiles = await prepareUploadFiles(files);
@@ -661,7 +662,60 @@ function decodePayload(decoded) {
   return privatePayload;
 }
 
+function groupAad(conversationId, clientMessageId, suffix = '') {
+  return encoder.encode(`glean-group-v2:${conversationId}:${clientMessageId}${suffix}`);
+}
+
+async function prepareGroupMessage(identity, conversation, text, files) {
+  const members = conversation.members || [];
+  if (members.length < 1 || members.length > 20 || !members.some(m => Number(m.id) === Number(identity.accountId))) throw new Error('Refresh the group before sending.');
+  const unready = members.find(m => !m.publicKey);
+  if (unready) throw new Error(`${unready.username} needs to sign in to Glean to set up their DM key first.`);
+  const uploadFiles = await prepareUploadFiles(files);
+  const clientMessageId = randomToken(24);
+  const rawKey = crypto.getRandomValues(new Uint8Array(32));
+  const key = await crypto.subtle.importKey('raw', rawKey, 'AES-GCM', false, ['encrypt']);
+  const salt = crypto.getRandomValues(new Uint8Array(32));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const recipientKeys = await Promise.all(members.map(async member => {
+    const wrappingKey = await deriveAesKey(identity, member.publicKey, salt, 'glean-group-key-v2');
+    const wrapIv = crypto.getRandomValues(new Uint8Array(12));
+    const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: wrapIv, additionalData: groupAad(conversation.id, clientMessageId, `:key:${member.id}`) }, wrappingKey, rawKey);
+    return { userId: Number(member.id), publicKey: member.publicKey, iv: bytesToBase64Url(wrapIv), ciphertext: bytesToBase64Url(ciphertext) };
+  }));
+  const privatePayload = JSON.stringify({ text: String(text || ''), attachments: uploadFiles.map(file => ({ name: file.name, type: file.type || 'application/octet-stream', size: file.size })) });
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: groupAad(conversation.id, clientMessageId) }, key, encoder.encode(privatePayload));
+  const encryptedFiles = [], attachmentMeta = [];
+  for (const [index, file] of uploadFiles.entries()) {
+    const fileIv = crypto.getRandomValues(new Uint8Array(12));
+    const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: fileIv, additionalData: groupAad(conversation.id, clientMessageId, `:file:${index}`) }, key, await file.arrayBuffer());
+    encryptedFiles.push(new File([encrypted], 'encrypted.glean', { type: 'application/octet-stream' }));
+    attachmentMeta.push({ size: file.size, iv: bytesToBase64Url(fileIv), salt: bytesToBase64Url(salt) });
+  }
+  rawKey.fill(0);
+  return { envelope: { version: 2, membershipRevision: conversation.revision, clientMessageId, ciphertext: bytesToBase64Url(ciphertext), iv: bytesToBase64Url(iv), salt: bytesToBase64Url(salt), senderPublicKey: identity.publicKey, recipientKeys }, encryptedFiles, attachmentMeta };
+}
+
+async function unwrapGroupKey(identity, message, conversationId) {
+  const envelope = message.crypto;
+  const entry = envelope.recipientKeys?.find(item => Number(item.userId) === Number(identity.accountId) && samePublicKey(item.publicKey, identity.publicKey));
+  if (!entry) throw new Error('No group message key for this identity.');
+  const key = await deriveAesKey(identity, envelope.senderPublicKey, base64UrlToBytes(envelope.salt), 'glean-group-key-v2');
+  const raw = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: base64UrlToBytes(entry.iv), additionalData: groupAad(conversationId, message.clientMessageId, `:key:${entry.userId}`) }, key, base64UrlToBytes(entry.ciphertext));
+  return crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['decrypt']);
+}
+
 async function tryDecryptWith(identity, message, conversationId) {
+  if (message.crypto.version === 2) {
+    const key = await unwrapGroupKey(identity, message, conversationId);
+    const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: base64UrlToBytes(message.crypto.iv), additionalData: groupAad(conversationId, message.clientMessageId) }, key, base64UrlToBytes(message.crypto.ciphertext));
+    const payload = decodePayload(decoder.decode(plaintext));
+    return { ...message, body: payload.text, decryptionFailed: false, conversationId: Number(conversationId), attachments: (message.attachments || []).map((attachment, index) => ({
+      ...attachment, name: payload.attachments?.[index]?.name || attachment.name,
+      type: payload.attachments?.[index]?.type || attachment.type,
+      size: Number(payload.attachments?.[index]?.size ?? attachment.size),
+    })) };
+  }
   const peerPublicKey = peerPublicKeyForIdentity(identity, message.crypto)
     || counterpartPublicKey(identity.accountId, message.sender.id, message.crypto);
   const salt = base64UrlToBytes(message.crypto.salt);
@@ -696,7 +750,7 @@ export async function decryptMessage(identity, message, conversationId) {
   }
   if (!message?.encrypted || !message.crypto) return message;
   if (!identity?.privateKey) return { ...message, body: 'Sign in again with your Glean password to restore this account’s DM key.', decryptionFailed: true };
-  const stored = await listStoredIdentities();
+  const stored = (await listStoredIdentities()).filter(record => message.crypto.version !== 2 || Number(record.accountId) === Number(identity.accountId));
   const matching = stored.filter((record) => peerPublicKeyForIdentity(record, message.crypto));
   const seen = new Set();
   const candidates = [identity, ...matching, ...stored].filter((record) => {
@@ -720,9 +774,16 @@ export async function decryptAttachment(accountId, attachment, message) {
   const encryptedBytes = await response.arrayBuffer();
   const envelope = attachment.crypto || message.crypto;
   const stored = await listStoredIdentities();
-  const candidates = [identity, ...stored];
+  const candidates = [identity, ...stored.filter(record => message.crypto?.version !== 2 || Number(record.accountId) === Number(accountId))];
   for (const candidate of candidates) {
     try {
+      if (message.crypto?.version === 2) {
+        const index = message.attachments.findIndex(item => Number(item.id) === Number(attachment.id));
+        if (index < 0) throw new Error('Attachment does not belong to this message.');
+        const key = await unwrapGroupKey(candidate, message, message.conversationId);
+        const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: base64UrlToBytes(envelope.iv), additionalData: groupAad(message.conversationId, message.clientMessageId, `:file:${index}`) }, key, encryptedBytes);
+        return new Blob([plaintext], { type: attachment.type || 'application/octet-stream' });
+      }
       const peerPublicKey = peerPublicKeyForIdentity(candidate, envelope) || counterpartPublicKey(accountId, message.sender.id, envelope);
       const key = await deriveAesKey(candidate, peerPublicKey, base64UrlToBytes(envelope.salt), 'glean-attachment-v1');
       const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: base64UrlToBytes(envelope.iv) }, key, encryptedBytes);

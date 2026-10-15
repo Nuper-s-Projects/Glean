@@ -1,0 +1,92 @@
+.community-voice-room.community-voice-room { display: flex; flex-direction: column; min-width: 0; isolation: isolate; }
+.community-voice-room.community-voice-room > header { flex: 0 0 auto; min-height: 76px; padding: 14px 24px; }
+.voice-room-heading { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.voice-room-heading > div { min-width: 0; }
+.voice-room-heading.voice-room-heading h1 { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 18px; }
+.voice-room-heading p { margin: 4px 0 0; color: var(--muted-text); font-size: 12px; }
+.voice-room-icon, .voice-lobby-icon { display: grid; flex-shrink: 0; place-items: center; color: var(--accent); background: var(--accent-soft); border: 1px solid var(--dm-border); border-radius: 14px; width: 42px; height: 42px; }
+.voice-room-icon svg { width: 22px; height: 22px; }
+.voice-room-status { display: flex; flex-shrink: 0; align-items: center; gap: 7px; font-size: 12px; color: var(--muted-text); }
+.voice-status-dot { width: 6px; height: 6px; flex-shrink: 0; border-radius: 50%; background: currentColor; }
+.voice-room-status.is-connected { color: var(--dm-online); }
+.voice-room-body { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 20px; }
+.voice-room-body .community-voice-lobby { min-height: 100%; padding: 28px 16px; gap: 16px; }
+.voice-lobby-icon { width: 80px; height: 80px; border-radius: 24px; margin-bottom: 8px; }
+.community-voice-lobby .voice-lobby-icon svg { width: 34px; height: 34px; }
+.community-voice-room.community-voice-room .community-voice-lobby h2 { margin: 0; font-size: clamp(23px, 3vw, 30px); letter-spacing: -.025em; }
+.community-voice-room.community-voice-room .community-voice-lobby p { max-width: 38ch; line-height: 1.65; }
+.community-voice-room.community-voice-room .community-voice-lobby > button { display: flex; align-items: center; justify-content: center; gap: 10px; min-height: 48px; margin-top: 6px; padding: 0 26px; box-shadow: none; cursor: pointer; }
+.community-voice-lobby > button svg { width: 20px; height: 20px; }
+.community-voice-lobby > small { max-width: 36ch; color: var(--muted-text); font-size: 11px; line-height: 1.5; }
+.voice-lobby-roster { display: grid; gap: 10px; justify-items: center; margin: 5px 0; }
+.voice-lobby-roster > div { display: flex; padding-left: 8px; }
+.voice-lobby-roster .community-avatar { width: 38px; height: 38px; margin-left: -8px; border: 3px solid var(--page-background); font-size: 14px; }
+.voice-lobby-roster > span { color: var(--muted-text); font-size: 12px; overflow-wrap: anywhere; }
+.voice-room-body .community-voice-grid { padding: 0; gap: 14px; overflow: visible; min-height: 100%; grid-auto-rows: auto; align-content: center; }
+.voice-room-body .community-voice-grid.count-1 { grid-template-columns: minmax(0, 760px); }
+.voice-room-body .community-voice-tile { min-height: 210px; aspect-ratio: 16 / 11; border-radius: 18px; background: color-mix(in srgb, var(--card-background) 90%, var(--page-background)); transition: border-color 160ms ease; }
+.voice-room-body .community-voice-grid.count-1 .community-voice-tile { min-height: min(48vh, 430px); aspect-ratio: 16 / 10; }
+.voice-room-body .community-voice-tile.is-sharing { aspect-ratio: 16 / 9; min-height: 220px; }
+.voice-room-body .community-voice-tile > .dm-user-avatar { display: grid; place-items: center; align-self: center; margin-top: -20px; }
+.voice-room-body .community-voice-tile .community-avatar { width: 84px; height: 84px; font-size: 30px; }
+.voice-room-body .community-voice-tile.is-speaking .community-avatar { box-shadow: 0 0 0 4px color-mix(in srgb, var(--dm-online) 25%, transparent); }
+.voice-participant-caption { position: absolute; left: 16px; bottom: 14px; z-index: 2; display: grid; gap: 4px; max-width: calc(100% - 90px); }
+.community-voice-tile .voice-participant-caption strong { position: static; max-width: 100%; padding: 0; background: none; backdrop-filter: none; -webkit-backdrop-filter: none; font-size: 13px; }
+.voice-participant-caption > span { color: var(--muted-text); font-size: 11px; }
+.has-video .voice-participant-caption { padding: 7px 10px; border-radius: 10px; background: rgba(0,0,0,.72); color: #fff; }
+.has-video .voice-participant-caption > span { color: #d0d8e5; }
+.community-voice-tile .community-voice-badges { bottom: 17px; right: 14px; background: transparent; padding: 0; }
+.community-voice-badges > span { display: inline-flex; }
+.voice-device-panel { position: relative; z-index: 6; flex-shrink: 0; margin: 0 20px; padding: 14px 16px; border: 1px solid var(--dm-border); border-radius: 14px; background: var(--dm-panel); max-height: 35vh; overflow: auto; }
+.voice-device-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.voice-device-heading h2 { margin: 0; font-size: 14px; }
+.voice-device-heading button { display: grid; place-items: center; width: 36px; height: 36px; border: 0; border-radius: 8px; background: transparent; color: var(--muted-text); cursor: pointer; }
+.voice-device-heading svg { width: 18px; height: 18px; }
+.voice-device-panel .community-voice-device-settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); gap: 12px; padding: 8px 0; }
+.voice-device-panel label { min-width: 0; color: var(--muted-text); }
+.voice-device-panel select { min-height: 40px; padding: 8px; }
+.voice-device-panel p { margin: 4px 0 0; color: var(--muted-text); font-size: 11px; line-height: 1.5; }
+.voice-call-footer { position: relative; z-index: 6; flex: 0 0 auto; border-top: 1px solid var(--dm-border); padding: 12px 16px max(16px, env(safe-area-inset-bottom)); background: var(--page-background); }
+.community-voice-room .glean-app-stage { top: 76px; bottom: 108px; }
+.voice-self-status { margin: 0 0 10px; color: var(--muted-text); text-align: center; font-size: 11px; }
+.voice-call-footer .community-voice-controls { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); width: min(100%, 610px); margin: 0 auto; padding: 0; gap: 8px; background: transparent; border: 0; backdrop-filter: none; -webkit-backdrop-filter: none; }
+.voice-call-footer .community-voice-controls button { width: 100%; min-width: 0; min-height: 58px; margin: 0; padding: 9px 3px; border-radius: 12px; transform: none; cursor: pointer; }
+.voice-call-footer .community-voice-controls button:hover:not(:disabled) { transform: none; filter: brightness(1.1); }
+.voice-call-footer .community-voice-controls button.is-danger, .community-voice-dock .community-voice-dock-actions button.is-danger { color: #fff; background: #b83c49; border-color: transparent; }
+.voice-call-footer .community-voice-controls button[aria-pressed='true']:not(.is-media):not(.community-apps-button) { color: var(--error); background: color-mix(in srgb, var(--error) 16%, var(--card-background)); border-color: color-mix(in srgb, var(--error) 45%, var(--dm-border)); }
+.voice-call-footer .community-voice-controls button.is-utility[aria-expanded='true'], .voice-call-footer .community-apps-button[aria-pressed='true'] { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
+.community-voice-dock.community-voice-dock { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; padding: 12px; }
+.community-voice-dock .community-voice-dock-info strong { display: flex; align-items: center; gap: 7px; font-size: 11px; text-transform: none; }
+.community-voice-dock .community-voice-dock-info small { padding-left: 13px; font-size: 12px; }
+.community-voice-dock.community-voice-dock .community-voice-dock-actions { display: grid; grid-template-columns: repeat(5,minmax(0,1fr)); gap: 5px; }
+.community-voice-dock .community-voice-dock-actions button { width: 100%; height: 38px; border: 1px solid var(--dm-border); background: var(--card-background); border-radius: 9px; cursor: pointer; }
+.community-voice-dock .community-voice-dock-actions button:disabled { opacity: .5; cursor: default; }
+.community-voice-room.community-voice-room button:focus-visible, .community-voice-dock.community-voice-dock button:focus-visible, .community-voice-room.community-voice-room select:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+@media (max-width: 620px) {
+  .community-voice-room.community-voice-room > header { min-height: 68px; padding: 12px; gap: 8px; }
+  .voice-room-heading { gap: 9px; }
+  .voice-room-heading.voice-room-heading h1 { font-size: 16px; }
+  .voice-room-heading p { font-size: 11px; }
+  .voice-room-icon { width: 34px; height: 34px; border-radius: 10px; }
+  .voice-room-status { font-size: 10px; gap: 4px; }
+  .voice-room-body { padding: 12px; }
+  .voice-room-body .community-voice-grid { grid-template-columns: repeat(2,minmax(0,1fr)); gap: 10px; }
+  .voice-room-body .community-voice-grid.count-1 { grid-template-columns: minmax(0,1fr); }
+  .voice-room-body .community-voice-tile { min-height: 170px; aspect-ratio: auto; }
+  .voice-room-body .community-voice-tile .community-avatar { width: 56px; height: 56px; font-size: 22px; }
+  .voice-participant-caption { left: 10px; bottom: 12px; max-width: calc(100% - 40px); }
+  .community-voice-tile .voice-participant-caption strong { font-size: 12px; }
+  .community-voice-tile .community-voice-badges { bottom: auto; top: 12px; left: 10px; right: auto; }
+  .voice-call-footer { padding: 10px 8px max(12px, env(safe-area-inset-bottom)); }
+  .voice-call-footer .community-voice-controls { grid-template-columns: repeat(4,minmax(0,1fr)); gap: 6px; }
+  .voice-call-footer .community-voice-controls button { min-height: 48px; font-size: 10px; }
+  .voice-call-footer .community-voice-controls button.is-utility { order: 5; }
+  .voice-call-footer .community-apps-button { order: 6; }
+  .voice-call-footer .community-voice-controls .is-danger { order: 7; grid-column: span 2; }
+  .community-app.mobile-chat-open.has-voice .voice-call-footer .community-voice-controls { padding-bottom: 0; }
+  .community-voice-room .glean-app-stage { top: 68px; bottom: 158px; }
+  .voice-device-panel { margin: 0 12px; padding: 12px; }
+  .voice-device-panel select { font-size: 16px; }
+}
+@media (max-width: 700px) { .community-app.mobile-chat-open.has-voice.voice-room-visible .community-sidebar-footer { display: none; } }
+@media (prefers-reduced-motion: reduce) { .voice-room-body .community-voice-tile { transition: none; } }

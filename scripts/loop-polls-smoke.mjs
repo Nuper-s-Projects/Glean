@@ -35,6 +35,24 @@ try {
   assert.equal(changed.body.post.poll.options[0].votes, 0);
   assert.equal(changed.body.post.poll.options[1].voted, true);
   const second = await request(votePath,'POST',{optionIndex:0},2);
+  const voterPath = `/api/loop/posts/${id}/poll/voters`;
+  assert.equal((await request(voterPath + '?option=0', 'GET', {}, 999)).status, 401);
+  assert.deepEqual((await request(voterPath + '?option=0')).body.voters.map(voter => voter.username), ['Bob']);
+  assert.deepEqual((await request(voterPath + '?option=1')).body.voters.map(voter => voter.username), ['Alice']);
+  assert.equal((await request(voterPath + '?option=5')).status, 400);
+  assert.equal((await request(voterPath + '?option=0&after=-1')).status, 400);
+  for (let userId = 3; userId <= 54; userId++) {
+    database.prepare('INSERT INTO users(id,username) VALUES(?,?)').run(userId, `Voter${userId}`);
+    database.prepare('INSERT INTO loop_poll_votes(post_id,user_id,option_index) VALUES(?,?,0)').run(id, userId);
+  }
+  const firstPage = (await request(voterPath + '?option=0')).body;
+  assert.equal(firstPage.voters.length, 50);
+  assert.ok(firstPage.next);
+  const nextPage = (await request(voterPath + '?option=0&after=' + firstPage.next)).body;
+  assert.equal(nextPage.voters.length, 3);
+  assert.equal(nextPage.next, null);
+  assert.equal(new Set([...firstPage.voters, ...nextPage.voters].map(voter => voter.id)).size, 53);
+  database.prepare('DELETE FROM loop_poll_votes WHERE user_id >= 3').run();
   assert.equal(second.body.post.poll.voterCount, 2);
   assert.deepEqual(second.body.post.poll.options.map(option => option.voted), [true,false]);
   assert.equal((await request(`/api/loop/posts?type=poll&author=1&tag=snack`)).body.posts.length, 1);
@@ -42,11 +60,13 @@ try {
   assert.equal((await request('/api/loop/posts?type=text')).body.posts.length, 0);
   assert.equal((await request(`/api/loop/posts/${id}`, 'PATCH', {content:''})).status, 200);
   database.prepare('INSERT INTO loop_blocks VALUES(?,?,?)').run(1,2,new Date().toISOString());
+  assert.equal((await request(voterPath + '?option=0', 'GET', {}, 2)).status, 404);
   assert.equal((await request(votePath,'POST',{optionIndex:1},2)).status, 404);
   assert.equal((await request('/api/loop/posts?type=poll', 'GET', {}, 2)).body.posts.length, 0);
   database.prepare('DELETE FROM loop_blocks').run();
   assert.equal((await request(`/api/loop/posts/${id}`, 'DELETE', {}, 2)).status, 403);
   await request(`/api/loop/posts/${id}`, 'DELETE');
+  assert.equal((await request(voterPath + '?option=0')).status, 404);
   assert.equal((await request(votePath,'POST',{optionIndex:0})).status, 404);
   assert.equal((await request('/api/loop/posts?type=poll')).body.posts.length, 0);
   assert.ok(events.some(([event]) => event === 'loop-post-updated'));

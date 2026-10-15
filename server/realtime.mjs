@@ -2,6 +2,18 @@ import { createHash } from 'node:crypto';
 import { hasBearerAuthorization, isSameOriginOrigin } from './security.mjs';
 
 const MAGIC = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+const EPHEMERAL_EVENTS = new Set(['typing', 'channel-typing', 'presence']);
+const SOFT_BUFFER_LIMIT = 64 * 1024;
+const HARD_BUFFER_LIMIT = 1024 * 1024;
+
+function frameHeader(opcode, length) {
+  const header = Buffer.allocUnsafe(length < 126 ? 2 : length <= 0xffff ? 4 : 10);
+  header[0] = 0x80 | opcode;
+  if (header.length === 2) header[1] = length;
+  else if (header.length === 4) { header[1] = 126; header.writeUInt16BE(length, 2); }
+  else { header[1] = 127; header.writeBigUInt64BE(BigInt(length), 2); }
+  return header;
+}
 
 function encodeFrame(opcode, payload = Buffer.alloc(0)) {
   const isBuffer = Buffer.isBuffer(payload);
@@ -64,6 +76,52 @@ function decodeFrames(buffer) {
 export function createRealtimeHub({ authenticate, onClientEvent, onConnect, onDisconnect }) {
   const clients = new Map();
 
+  function write(socket, frame, event, length = frame.length) {
+    if (socket.destroyed || !socket.writable || socket.writableEnded) return false;
+    const buffered = socket.writableLength || 0;
+    if (EPHEMERAL_EVENTS.has(event) && buffered + length > SOFT_BUFFER_LIMIT) return false;
+    if (buffered + length > HARD_BUFFER_LIMIT) {
+      // Reconnection resyncs durable state instead of retaining an unlimited backlog.
+      socket.destroy();
+      return false;
+    }
+    try {
+      if (Array.isArray(frame)) {
+        socket.cork();
+        try { for (const part of frame) socket.write(part); }
+        finally { socket.uncork(); }
+      } else socket.write(frame);
+      return true;
+    } catch {
+      socket.destroy();
+      return false;
+    }
+  }
+
+  function prepareEvent(event, payload = {}) {
+    const json = JSON.stringify(payload);
+    if (!json || json[0] !== '{') throw new TypeError('Realtime payload must be an object.');
+    return {
+      event,
+      payload,
+      prefix: Buffer.from(`{"event":${JSON.stringify(event)},"payload":${json.slice(0, -1)}`),
+      hasFields: json.length > 2,
+    };
+  }
+
+  function sendPrepared(userId, prepared, extra = {}) {
+    const set = clients.get(Number(userId));
+    if (!set?.size) return;
+    // The large message/attachment payload is serialized and retained once for
+    // the whole fanout. Only small, private unread fields vary per recipient.
+    const fields = JSON.stringify(extra).slice(1, -1);
+    const suffix = Buffer.from(`${fields ? `${prepared.hasFields ? ',' : ''}${fields}` : ''}}}`);
+    const length = prepared.prefix.length + suffix.length;
+    const header = frameHeader(0x1, length);
+    const parts = [header, prepared.prefix, suffix];
+    for (const socket of set) write(socket, parts, prepared.event, header.length + length);
+  }
+
   function add(userId, socket, sessionHash) {
     socket.gleanSessionHash = sessionHash || '';
     socket.gleanAlive = true;
@@ -83,7 +141,7 @@ export function createRealtimeHub({ authenticate, onClientEvent, onConnect, onDi
     const set = clients.get(Number(userId));
     if (!set) return;
     const frame = encodeFrame(0x1, JSON.stringify({ event, payload }));
-    for (const socket of set) if (!socket.destroyed && socket.writable) socket.write(frame);
+    for (const socket of set) write(socket, frame, event);
   }
 
   function broadcast(userIds, event, payload = {}) {
@@ -96,7 +154,7 @@ export function createRealtimeHub({ authenticate, onClientEvent, onConnect, onDi
       const set = clients.get(userId);
       if (!set) continue;
       for (const socket of set) {
-        if (!socket.destroyed && socket.writable) socket.write(frame);
+        write(socket, frame, event);
       }
     }
   }
@@ -139,7 +197,7 @@ export function createRealtimeHub({ authenticate, onClientEvent, onConnect, onDi
     return clients.get(Number(userId))?.size || 0;
   }
 
-  function upgrade(request, socket) {
+  function upgrade(request, socket, head = Buffer.alloc(0)) {
     try {
       const url = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`);
       if (url.pathname !== '/api/v1/realtime' && url.pathname !== '/api/realtime') return socket.destroy();
@@ -156,6 +214,7 @@ export function createRealtimeHub({ authenticate, onClientEvent, onConnect, onDi
       const key = request.headers['sec-websocket-key'];
       if (!key || String(request.headers.upgrade || '').toLowerCase() !== 'websocket') return socket.destroy();
       const accept = createHash('sha1').update(`${key}${MAGIC}`).digest('base64');
+      socket.setNoDelay?.(true);
       socket.write([
         'HTTP/1.1 101 Switching Protocols',
         'Upgrade: websocket',
@@ -165,9 +224,8 @@ export function createRealtimeHub({ authenticate, onClientEvent, onConnect, onDi
       ].join('\r\n'));
       add(Number(user.id), socket, user.sessionHash);
       socket.write(encodeFrame(0x1, JSON.stringify({ event: 'connected', payload: { userId: Number(user.id) } })));
-      onConnect?.(user, socket);
       let pending = Buffer.alloc(0);
-      socket.on('data', (chunk) => {
+      const receive = (chunk) => {
         try {
           pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
           const decoded = decodeFrames(pending);
@@ -179,7 +237,7 @@ export function createRealtimeHub({ authenticate, onClientEvent, onConnect, onDi
               return;
             }
             if (frame.opcode === 0x9) {
-              socket.write(encodeControlFrame(0xA, frame.payload));
+              write(socket, encodeControlFrame(0xA, frame.payload));
               continue;
             }
             if (frame.opcode === 0xA) {
@@ -194,23 +252,32 @@ export function createRealtimeHub({ authenticate, onClientEvent, onConnect, onDi
         } catch {
           socket.destroy();
         }
-      });
+      };
+      socket.on('data', receive);
       let closed = false;
       const cleanup = () => {
         if (closed) return;
         closed = true;
+        pending = Buffer.alloc(0);
+        socket.removeListener('data', receive);
         remove(Number(user.id), socket);
+        // Upgraded HTTP sockets can remain half-open after the peer sends FIN.
+        if (!socket.destroyed) socket.destroy();
         onDisconnect?.(user, socket);
       };
       socket.on('close', cleanup);
       socket.on('end', cleanup);
       socket.on('error', cleanup);
+      onConnect?.(user, socket);
+      if (head.length && !socket.destroyed) receive(head);
     } catch {
       socket.destroy();
     }
   }
 
   const heartbeat = setInterval(() => {
+    const ping = encodeFrame(0x9, Buffer.from('glean'));
+    const state = encodeFrame(0x1, JSON.stringify({ event: 'heartbeat', payload: { at: Date.now() } }));
     for (const set of clients.values()) {
       for (const socket of [...set]) {
         if (socket.destroyed || !socket.writable) continue;
@@ -219,12 +286,16 @@ export function createRealtimeHub({ authenticate, onClientEvent, onConnect, onDi
           continue;
         }
         socket.gleanAlive = false;
-        socket.write(encodeFrame(0x9, Buffer.from('glean')));
-        socket.write(encodeFrame(0x1, JSON.stringify({ event: 'heartbeat', payload: { at: Date.now() } })));
+        write(socket, ping);
+        write(socket, state, 'heartbeat');
       }
     }
   }, 15_000);
   heartbeat.unref?.();
 
-  return { send, broadcast, broadcastAll, closeAll, upgrade, dropSession, dropUserExcept, connectedCount, close: () => clearInterval(heartbeat) };
+  const close = () => {
+    clearInterval(heartbeat);
+    for (const set of clients.values()) for (const socket of [...set]) socket.destroy();
+  };
+  return { send, prepareEvent, sendPrepared, broadcast, broadcastAll, closeAll, upgrade, dropSession, dropUserExcept, connectedCount, close };
 }

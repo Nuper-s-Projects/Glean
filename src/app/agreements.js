@@ -1,4 +1,5 @@
-export const TERMS_VERSION = 'glean-terms-draft-2026-09-24-v2';
+export const TERMS_VERSION = 'glean-terms-2026-10-14-v3';
+export const TERMS_LABEL = 'v3 · October 14, 2026';
 export const CONDUCT_VERSION = 'uisd-student-code-2026-27';
 export const AGREEMENT_WAIT_SECONDS = 5;
 
@@ -14,7 +15,8 @@ export const TERMS_SECTIONS = [
     title: '2. Your account',
     paragraphs: [
       'Give your account a username that does not pretend to be another person. Keep your password private, use your own account, and tell Glean if you think someone else has accessed it.',
-      'You are responsible for messages and other content you send through your account. To the extent permitted by applicable law, you may be held accountable for your conduct and for harm caused by your content. These terms do not make you responsible for more than the law allows or remove rights that cannot legally be waived.',
+      'You are responsible for your own actions and for the messages, posts, uploads, and other content you choose to send or share through Glean. This applies in every server and channel, direct message (DM), group DM, voice conversation, and Glean Loop. A server owner’s permission, another user’s request, or disabling moderation does not excuse harmful or unlawful conduct.',
+      'To the extent permitted by applicable law, you may be held accountable for your conduct and for harm caused by your content. These terms do not make you responsible for more than the law allows, excuse Glean from its own legal obligations, or remove rights that cannot legally be waived.',
     ],
   },
   {
@@ -27,7 +29,7 @@ export const TERMS_SECTIONS = [
   {
     title: '4. Direct-message privacy',
     paragraphs: [
-      'Direct messages and their attachments are encrypted on your device before they are sent. Glean stores and delivers the encrypted content and does not have the private keys needed to read it in normal operation. Glean’s automatic server-side content moderation does not scan direct-message contents.',
+      'Private DMs, group DMs, and their attachments are encrypted on your device before they are sent. Glean stores and delivers the encrypted content and does not have the private keys needed to read it in normal operation. Glean’s automatic server-side content moderation does not scan these private-message contents. Conversations with bots such as Nura are different: messages and supported attachments sent to a bot are processed by the bot and its model provider to generate replies.',
       'Glean can still process limited information needed to operate and secure DMs, such as the accounts in a conversation, delivery times, and encrypted attachment sizes. A person you message can copy, capture, or share what you send. Someone with access to an unlocked or compromised device may also see messages, and losing your encryption keys may prevent you from reading older messages. Do not send anything you would not want the recipient to keep or share.',
     ],
   },
@@ -42,7 +44,9 @@ export const TERMS_SECTIONS = [
     title: '6. Safety tools and moderation',
     paragraphs: [
       'Some Glean servers may use automatic content filters. Filters can miss harmful content or make mistakes. Use blocking, reporting, and moderation tools when available, and do not rely on Glean to prevent every unsafe interaction.',
-      'Glean or server moderators may remove content or restrict an account when they reasonably believe it is needed to address a safety issue, a rule violation, or misuse of the service.',
+      'Glean’s authorized platform staff, including Nuper, reserve the right to moderate every Glean server, whether public or private, when reasonably necessary to enforce these terms, protect users, respond to reports, or address misuse. This authority applies even if a server owner disallows platform moderation, disables automatic moderation, or sets server roles or permissions that would otherwise prevent moderation. Server settings and local rules do not override Glean’s platform rules or authorized platform moderation.',
+      'Moderation may include removing accessible content, restricting participation, issuing timeouts, removing or banning members, suspending accounts, or restricting a server, subject to applicable law and the moderation tools available. Server owners and local moderators remain responsible for moderation within their assigned permissions. These terms do not give ordinary users moderation authority over other servers.',
+      'Platform moderation does not grant staff access to encrypted private DM or group DM contents or bypass encryption. Glean may act on reports, content voluntarily shared with staff, and information available to operate and secure the service. Moderation is not a promise that every message or action will be reviewed or that all harmful conduct will be prevented.',
     ],
   },
   {
@@ -54,7 +58,8 @@ export const TERMS_SECTIONS = [
   {
     title: '8. Changes and availability',
     paragraphs: [
-      'Glean may change features or temporarily be unavailable. If Glean makes a material change to these terms, it may ask you to review and accept the new version before you continue using your account.',
+      'These terms were updated on October 14, 2026. New and existing users must review and accept this version before continuing to use their account. Earlier acceptances remain recorded but do not count as acceptance of this updated version. The updated terms apply going forward after acceptance, not as a retroactive change to previous privacy commitments.',
+      'Glean may change features or temporarily be unavailable. If Glean makes a material change to these terms, it will ask you to review and accept the new version before you continue using your account.',
     ],
   },
 ];

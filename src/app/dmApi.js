@@ -44,6 +44,8 @@ export async function joinPublicServer(serverId) {
   return request(apiRoutes.publicServerJoin(serverId), { method: 'POST', body: '{}' });
 }
 export async function getUserProfile(username) { return request(`/users/${encodeURIComponent(username)}`); }
+export async function getVerifiedUsers(query = '') { return request(`/account/verified-users?q=${encodeURIComponent(query)}`); }
+export async function setUserVerified(userId, verified) { return request(`/account/verified-users/${encodeURIComponent(userId)}`, { method: 'PATCH', body: JSON.stringify({ verified: Boolean(verified) }) }); }
 export async function updateUserNote(username, note) {
   return request(`/users/${encodeURIComponent(username)}/note`, { method: 'PATCH', body: JSON.stringify({ note }) });
 }
@@ -56,6 +58,12 @@ export async function getBlockedUsers() { return request('/blocks'); }
 export async function blockUser(username) { return request('/blocks', { method: 'POST', body: JSON.stringify({ username }) }); }
 export async function unblockUser(username) { return request(`/blocks/${encodeURIComponent(username)}`, { method: 'DELETE' }); }
 export async function getConversations() { return request('/conversations'); }
+export async function createGroupConversation(name, memberIds) { return request('/conversations/groups', { method: 'POST', body: JSON.stringify({ name, memberIds }) }); }
+export async function renameGroupConversation(id, name) { return request(`/conversations/${id}/group`, { method: 'PATCH', body: JSON.stringify({ name }) }); }
+export async function addGroupMember(id, userId) { return request(`/conversations/${id}/group/members`, { method: 'POST', body: JSON.stringify({ userId }) }); }
+export async function removeGroupMember(id, userId) { return request(`/conversations/${id}/group/members/${userId}`, { method: 'DELETE' }); }
+export async function leaveGroupConversation(id) { return request(`/conversations/${id}/group/leave`, { method: 'POST', body: '{}' }); }
+export async function setConversationMuted(id, muted) { return request(`/conversations/${id}/mute`, { method: 'PATCH', body: JSON.stringify({ muted }) }); }
 export async function setConversationPinned(conversationId, pinned) {
   return request(`/conversations/${conversationId}/pin`, { method: 'PATCH', body: JSON.stringify({ pinned: Boolean(pinned) }) });
 }
@@ -179,7 +187,7 @@ export async function getChannelMessages(id, { before = null, limit = 50 } = {})
   if (!before) invalidateServersCache();
   return payload;
 }
-export async function sendChannelMessage(id, body, files = [], replyToMessageId = null, poll = null) {
+export async function sendChannelMessage(id, body, files = [], replyToMessageId = null, poll = null, onUploadProgress) {
   const path = apiRoutes.channelMessages(id);
   if (!files.length) {
     return request(path, { method: 'POST', body: JSON.stringify({ body, ...(replyToMessageId ? { replyToMessageId } : {}), ...(poll ? { poll } : {}) }) });
@@ -190,7 +198,7 @@ export async function sendChannelMessage(id, body, files = [], replyToMessageId 
   if (replyToMessageId) formData.append('replyToMessageId', String(replyToMessageId));
   if (poll) formData.append('poll', JSON.stringify(poll));
   uploadFiles.forEach((file) => formData.append('files', file));
-  return request(path, { method: 'POST', body: formData });
+  return request(path, { method: 'POST', body: formData, onUploadProgress });
 }
 export async function voteChannelPoll(channelId, messageId, optionIndex) {
   return request(`/channels/${channelId}/messages/${messageId}/poll/vote`, { method: 'POST', body: JSON.stringify({ optionIndex }) });
@@ -227,7 +235,7 @@ export async function getMessages(conversationId, { before = null, limit = 50, s
   return payload;
 }
 
-export async function sendMessage(conversationId, body, files = [], replyToMessageId = null) {
+export async function sendMessage(conversationId, body, files = [], replyToMessageId = null, onUploadProgress) {
   const path = apiRoutes.conversationMessages(conversationId);
   if (!files.length) {
     return request(path, {
@@ -240,7 +248,7 @@ export async function sendMessage(conversationId, body, files = [], replyToMessa
   formData.append('body', body ?? '');
   if (replyToMessageId) formData.append('replyToMessageId', String(replyToMessageId));
   uploadFiles.forEach((file) => formData.append('files', file));
-  return request(path, { method: 'POST', body: formData });
+  return request(path, { method: 'POST', body: formData, onUploadProgress });
 }
 
 export async function editDirectMessage(conversationId, messageId, body) {
@@ -251,7 +259,7 @@ export async function removeDirectMessage(conversationId, messageId) {
   return request(apiRoutes.conversationMessage(conversationId, messageId), { method: 'DELETE' });
 }
 
-export async function sendEncryptedMessage(conversationId, encrypted) {
+export async function sendEncryptedMessage(conversationId, encrypted, onUploadProgress) {
   const { envelope, attachmentMeta, encryptedFiles, replyToMessageId } = encrypted;
   if (!encryptedFiles.length) {
     return request(`/conversations/${conversationId}/messages`, {
@@ -264,7 +272,7 @@ export async function sendEncryptedMessage(conversationId, encrypted) {
   formData.append('attachmentMeta', JSON.stringify(attachmentMeta));
   if (replyToMessageId) formData.append('replyToMessageId', String(replyToMessageId));
   encryptedFiles.forEach((file) => formData.append('files', file));
-  return request(`/conversations/${conversationId}/messages`, { method: 'POST', body: formData });
+  return request(`/conversations/${conversationId}/messages`, { method: 'POST', body: formData, onUploadProgress });
 }
 
 export async function sendTyping(conversationId, typing) {
@@ -368,10 +376,10 @@ export async function updateAccountMainTheme(payload, photo) {
   return account;
 }
 
-export async function updateAccountAccessibility(contrast, saturation, reduceMotion, glassFrost, glassDepth, glassRefraction, theme) {
+export async function updateAccountAccessibility(contrast, saturation, reduceMotion, glassFrost, glassDepth, glassRefraction, theme, showLoopStreakReminder = true) {
   const { account } = await request('/account/accessibility', {
     method: 'POST',
-    body: JSON.stringify({ contrast, saturation, reduceMotion, glassFrost, glassDepth, glassRefraction, theme }),
+    body: JSON.stringify({ contrast, saturation, reduceMotion, glassFrost, glassDepth, glassRefraction, theme, showLoopStreakReminder }),
   });
   return account;
 }
@@ -393,24 +401,12 @@ export async function unsubscribeDesktopPush(endpoint) {
   return request('/push/subscribe', { method: 'DELETE', body: JSON.stringify({ endpoint }) });
 }
 
-export async function sendTestPush() {
-  return request('/push/test', { method: 'POST', body: '{}' });
-}
-
-export async function sendPushAnnouncement(message) {
-  return request('/push/announcement', { method: 'POST', body: JSON.stringify({ message }) });
-}
-
 export async function changePassword(currentPassword, newPassword, profileKeyBackup = null) {
   return request('/account/password', { method: 'POST', body: JSON.stringify({ currentPassword, newPassword, ...(profileKeyBackup ? { profileKeyBackup } : {}) }) });
 }
 export async function deleteAccount(password) {
   return request('/account', { method: 'DELETE', body: JSON.stringify({ password }) });
 }
-export async function resetUserPassword(username, newPassword) {
-  return request('/admin/password-reset', { method: 'POST', body: JSON.stringify({ username, newPassword }) });
-}
-
 export async function getAccountSessions() {
   return request('/account/sessions');
 }
@@ -457,6 +453,8 @@ export function inspectServersVisible(account) {
 }
 
 let realtimeSession = null;
+const EPHEMERAL_SOCKET_EVENTS = new Set(['presence', 'presence-sync-request', 'typing', 'channel-typing']);
+const SOCKET_EPHEMERAL_BUFFER_LIMIT = 64 * 1024;
 
 function safeCall(callback, ...args) {
   try { callback?.(...args); } catch { /* one subscriber cannot block realtime delivery */ }
@@ -468,6 +466,7 @@ function createRealtimeSession(key) {
   let socket = null;
   let stopped = false;
   let reconnectTimer = null;
+  let connectTimer = null;
   let attempt = 0;
   let status = 'disconnected';
   let connectedPayload = null;
@@ -492,12 +491,26 @@ function createRealtimeSession(key) {
 
   const scheduleReconnect = () => {
     if (stopped || !subscribers.size || reconnectTimer || isNetworkOffline()) return;
-    const delay = Math.min(10_000, 500 * (2 ** Math.min(attempt, 5))) + Math.floor(Math.random() * 250);
+    const delay = Math.min(10_000, 250 * (2 ** Math.min(attempt, 6))) + Math.floor(Math.random() * 150);
     attempt += 1;
     reconnectTimer = window.setTimeout(() => {
       reconnectTimer = null;
       connect();
     }, delay);
+  };
+
+  const clearConnectTimer = () => {
+    if (connectTimer !== null) window.clearTimeout(connectTimer);
+    connectTimer = null;
+  };
+
+  const retireSocket = (target, code, reason) => {
+    if (socket !== target || stopped) return;
+    socket = null;
+    clearConnectTimer();
+    if (target.readyState < WebSocket.CLOSING) target.close(code, reason);
+    notifyStatus('reconnecting');
+    scheduleReconnect();
   };
 
   const connect = () => {
@@ -518,9 +531,11 @@ function createRealtimeSession(key) {
     socket = nextSocket;
     connectedPayload = null;
     notifyStatus('connecting');
+    connectTimer = window.setTimeout(() => retireSocket(nextSocket, 4000, 'connection timeout'), 10_000);
 
     nextSocket.addEventListener('open', () => {
       if (socket !== nextSocket) return;
+      clearConnectTimer();
       attempt = 0;
       lastServerHeartbeatAt = Date.now();
       notifyStatus('connected');
@@ -529,7 +544,7 @@ function createRealtimeSession(key) {
           sendSocketData(nextSocket, JSON.stringify({ event: 'presence', payload: { active: true } }));
         }
       });
-      while (queue.length && nextSocket.readyState === WebSocket.OPEN) sendSocketData(nextSocket, queue.shift());
+      while (queue.length && socket === nextSocket && nextSocket.readyState === WebSocket.OPEN) sendSocketData(nextSocket, queue.shift());
     });
     nextSocket.addEventListener('message', (event) => {
       if (socket !== nextSocket) return;
@@ -544,8 +559,8 @@ function createRealtimeSession(key) {
         const eventName = message?.event;
         const payload = message?.payload || {};
         if (!eventName) return;
+        lastServerHeartbeatAt = Date.now();
         if (eventName === 'heartbeat') {
-          lastServerHeartbeatAt = Date.now();
           return;
         }
         if (eventName === 'maintenance' && payload.active === true) {
@@ -566,17 +581,21 @@ function createRealtimeSession(key) {
     });
     nextSocket.addEventListener('close', () => {
       if (socket !== nextSocket || stopped) return;
+      clearConnectTimer();
       socket = null;
       notifyStatus('reconnecting');
       scheduleReconnect();
     });
     nextSocket.addEventListener('error', () => {
-      if (socket === nextSocket) nextSocket.close();
+      retireSocket(nextSocket, 4000, 'connection error');
     });
   };
 
   const onOffline = () => {
     if (stopped) return;
+    if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    clearConnectTimer();
     notifyStatus('reconnecting');
     const staleSocket = socket;
     socket = null;
@@ -585,8 +604,11 @@ function createRealtimeSession(key) {
 
   const onOnline = () => {
     if (stopped || !subscribers.size) return;
+    // Duplicate network-online events must not tear down a healthy call/socket.
+    if (socket?.readyState === WebSocket.OPEN && Date.now() - lastServerHeartbeatAt <= heartbeatTimeoutMs) return;
     if (reconnectTimer) window.clearTimeout(reconnectTimer);
     reconnectTimer = null;
+    clearConnectTimer();
     const staleSocket = socket;
     socket = null;
     if (staleSocket && staleSocket.readyState < WebSocket.CLOSING) staleSocket.close(4001, 'network restored');
@@ -596,7 +618,7 @@ function createRealtimeSession(key) {
   const ensureCurrentConnection = () => {
     if (stopped || !subscribers.size || isNetworkOffline()) return;
     if (socket?.readyState === WebSocket.OPEN && Date.now() - lastServerHeartbeatAt > heartbeatTimeoutMs) {
-      socket.close(4000, 'heartbeat timeout');
+      retireSocket(socket, 4000, 'heartbeat timeout');
       return;
     }
     if (!socket && !reconnectTimer) connect();
@@ -619,8 +641,10 @@ function createRealtimeSession(key) {
     if (stopped) return;
     stopped = true;
     subscribers.clear();
+    queue.length = 0;
     clearPresenceActivity();
     window.clearInterval(heartbeatWatchdog);
+    clearConnectTimer();
     if (reconnectTimer) window.clearTimeout(reconnectTimer);
     reconnectTimer = null;
     window.removeEventListener('offline', onOffline);
@@ -637,7 +661,7 @@ function createRealtimeSession(key) {
     if (status !== 'disconnected') safeCall(onStatus, status);
     if (status === 'connected' && connectedPayload) {
       Promise.resolve().then(() => {
-        if (subscribers.has(subscriber) && !stopped) safeCall(onEvent, 'connected', connectedPayload);
+        if (subscribers.has(subscriber) && !stopped) safeCall(onEvent, 'connected', connectedPayload, { replayed: true });
       });
     }
     if (!socket && !reconnectTimer) connect();
@@ -655,6 +679,8 @@ function createRealtimeSession(key) {
     key,
     add,
     send(event, payload) {
+      const ephemeral = EPHEMERAL_SOCKET_EVENTS.has(event);
+      if (ephemeral && (socket?.readyState !== WebSocket.OPEN || socket.bufferedAmount > SOCKET_EPHEMERAL_BUFFER_LIMIT)) return;
       const data = JSON.stringify({ event, payload });
       if (socket?.readyState === WebSocket.OPEN) sendSocketData(socket, data);
       else if (queue.length < 20) queue.push(data);

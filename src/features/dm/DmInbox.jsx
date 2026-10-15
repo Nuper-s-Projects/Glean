@@ -4,6 +4,7 @@ import { Avatar, PresenceWrap } from './DmPrimitives';
 import DisplayName from './DisplayName';
 import { MoreIcon } from './icons';
 import { selectConversations, selectUnstartedFriends } from './conversationState';
+import { GroupAvatar } from './GroupDmDialog';
 
 function relativeTime(value) {
   const date = new Date(value);
@@ -20,11 +21,11 @@ export function DmSkeleton({ transcript = false }) {
 }
 
 const ConversationRow = memo(function ConversationRow({ conversation, selected, onSelect, onMenu }) {
-  return <PresenceWrap user={conversation.user} className={`dm-inbox-row${selected ? ' is-selected' : ''}${conversation.unreadCount ? ' is-unread' : ''}`} onContextMenu={event => onMenu(event, conversation)}>
-    <Avatar user={conversation.user} presence />
+  return <PresenceWrap user={conversation.user} className={`dm-inbox-row${selected ? ' is-selected' : ''}${conversation.unreadCount && !conversation.muted ? ' is-unread' : ''}`} onContextMenu={event => onMenu(event, conversation)}>
+    {conversation.kind === 'group' ? <GroupAvatar /> : <Avatar user={conversation.user} presence />}
     <button type="button" className="dm-inbox-open" onClick={() => onSelect(conversation.id)} aria-current={selected ? 'page' : undefined}>
       <span className="dm-inbox-row-heading"><strong><DisplayName user={conversation.user} /></strong><time dateTime={conversation.lastMessageAt || undefined}>{relativeTime(conversation.lastMessageAt)}</time></span>
-      <span className="dm-inbox-row-preview"><small>{conversation.lastMessage || 'Start a conversation'}</small>{conversation.unreadCount ? <b className="dm-unread-count" aria-label={`${conversation.unreadCount} unread messages`}>{formatUnreadCount(conversation.unreadCount)}</b> : null}</span>
+      <span className="dm-inbox-row-preview"><small>{conversation.muted ? 'Muted · ' : ''}{conversation.lastMessage || 'Start a conversation'}</small>{conversation.unreadCount && !conversation.muted ? <b className="dm-unread-count" aria-label={`${conversation.unreadCount} unread messages`}>{formatUnreadCount(conversation.unreadCount)}</b> : null}</span>
     </button>
     <button className="dm-inbox-more" type="button" onClick={event => onMenu(event, conversation)} aria-label={`Options for ${conversation.user?.username}`} title="Conversation options"><MoreIcon /></button>
   </PresenceWrap>;
@@ -52,9 +53,9 @@ export default function DmInbox({ conversations, friends, selectedId, onSelect, 
   const deferredQuery = useDeferredValue(query);
   const visible = useMemo(() => selectConversations(conversations, deferredQuery, filter), [conversations, deferredQuery, filter]);
   const availableFriends = useMemo(() => selectUnstartedFriends(friends, conversations, deferredQuery, filter), [friends, conversations, deferredQuery, filter]);
-  const unread = conversations.filter(item => item.unreadCount).length;
-  const pinned = visible.filter(item => item.pinned);
-  const recent = visible.filter(item => !item.pinned);
+  const unread = useMemo(() => conversations.filter(item => item.unreadCount && !item.muted).length, [conversations]);
+  const pinned = useMemo(() => visible.filter(item => item.pinned), [visible]);
+  const recent = useMemo(() => visible.filter(item => !item.pinned), [visible]);
   const renderRows = items => items.map(conversation => <ConversationRow key={conversation.id} conversation={conversation} selected={Number(conversation.id) === Number(selectedId)} onSelect={onSelect} onMenu={onMenu} />);
   return <div className="dm-inbox">
     <div className="dm-inbox-tools">

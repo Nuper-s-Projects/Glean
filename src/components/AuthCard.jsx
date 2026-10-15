@@ -7,6 +7,7 @@ export default function AuthCard({ children, variant = '', brandContent = null }
   useEffect(() => {
     let cancelled = false;
     const loadStats = async () => {
+      if (document.visibilityState === 'hidden') return;
       try {
         const response = await fetch('/api/v1/auth/stats', { headers: { Accept: 'application/json' } });
         if (!response.ok) return;
@@ -15,8 +16,9 @@ export default function AuthCard({ children, variant = '', brandContent = null }
       } catch { /* Auth should remain usable if public stats are unavailable. */ }
     };
     loadStats();
+    document.addEventListener('visibilitychange', loadStats);
     const timer = window.setInterval(loadStats, 30_000);
-    return () => { cancelled = true; window.clearInterval(timer); };
+    return () => { cancelled = true; window.clearInterval(timer); document.removeEventListener('visibilitychange', loadStats); };
   }, []);
 
   return (

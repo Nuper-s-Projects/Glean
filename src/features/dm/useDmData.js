@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { pendingImagePreviews, withLocalImagePreviews, retainLocalImagePreviews } from '../../app/attachmentPreviews';
+import { subscribePageActivity } from '../../app/pageActivity';
+import { trimInactiveTranscripts } from './conversationState';
+import useMemorySaver from '../../app/useMemorySaver';
 import {
   acceptFriendRequest,
+  createGroupConversation, renameGroupConversation, addGroupMember, removeGroupMember, leaveGroupConversation,
   blockUser,
   cancelFriendRequest,
   declineFriendRequest,
@@ -16,6 +21,7 @@ import {
   sendMessage,
   sendFriendRequest,
   setConversationPinned,
+  setConversationMuted,
   sendTyping,
   subscribeToDmEvents,
   unfriendUser,
@@ -41,12 +47,14 @@ function rememberCachedConversationPatch(accountId, conversationId, patch) {
 }
 
 export function useDmData(account, reportError, onUnread = null) {
+  const memorySaver = useMemorySaver();
   const cachedSidebar = peekCachedDmSidebar(account?.id);
   const [friends, setFriends] = useState(() => cachedSidebar?.friends || []);
   const [requests, setRequests] = useState(() => cachedSidebar?.requests || []);
   const [sent, setSent] = useState(() => cachedSidebar?.sent || []);
   const [peopleRevision, setPeopleRevision] = useState(0);
   const [conversations, setConversations] = useState(() => cachedSidebar?.conversations || []);
+  const conversationsRef = useRef(conversations);
   const [selectedId, setSelectedId] = useState(null);
   const [messages, setMessages] = useState([]);
   const [transcriptId, setTranscriptId] = useState(null);
@@ -75,8 +83,10 @@ export function useDmData(account, reportError, onUnread = null) {
   const liveEventVersionsRef = useRef(new Map());
   const olderLockRef = useRef(null);
   const previewCacheRef = useRef(new Map());
+  const rawConversationsRef = useRef([]);
   if (!liveMessageJournalRef.current) liveMessageJournalRef.current = createLiveMessageJournal();
   selectedIdRef.current = selectedId;
+  conversationsRef.current = conversations;
   accountIdRef.current = account?.id;
   onUnreadRef.current = onUnread;
 
@@ -113,10 +123,12 @@ export function useDmData(account, reportError, onUnread = null) {
         setFriends(nextFriends);
         setRequests(nextRequests);
         setSent(nextSent || []);
+        rawConversationsRef.current = nextConversations;
         const previewIdentity = identityRef.current;
         const previews = await Promise.all(nextConversations.map(async conversation => {
           if (!conversation.lastEncryptedMessage) return conversation;
           const message = conversation.lastEncryptedMessage;
+          if (!previewIdentity?.privateKey) return { ...conversation, lastMessage: conversationPreview(message) };
           const previewKey = `${conversation.id}:${message.id}:${previewIdentity?.fingerprint || ''}:${message.crypto?.ciphertext || ''}`;
           const cachedPreview = previewCacheRef.current.get(previewKey);
           if (cachedPreview !== undefined) return { ...conversation, lastMessage: cachedPreview };
@@ -190,12 +202,36 @@ export function useDmData(account, reportError, onUnread = null) {
     return () => { cancelled = true; };
   }, [account?.id, refreshSidebar, reportError]);
 
-  // The first sidebar request may finish before the account key is restored.
-  // Retry encrypted previews after React has committed the ready identity/ref.
+  // Decrypt the already-fetched sidebar previews after the account key is restored.
+  // This avoids refetching friends and every conversation just to hydrate text.
   useEffect(() => {
     if (!identity?.privateKey || Number(identity.accountId) !== Number(account?.id)) return;
-    refreshSidebar().catch(reportError);
-  }, [account?.id, identity, refreshSidebar, reportError]);
+    let cancelled = false;
+    const source = rawConversationsRef.current;
+    Promise.all(source.map(async (conversation) => {
+      if (!conversation.lastEncryptedMessage) return null;
+      const message = conversation.lastEncryptedMessage;
+      const previewKey = `${conversation.id}:${message.id}:${identity.fingerprint || ''}:${message.crypto?.ciphertext || ''}`;
+      const cachedPreview = previewCacheRef.current.get(previewKey);
+      if (cachedPreview !== undefined) return [Number(conversation.id), cachedPreview];
+      const decrypted = await decryptMessage(identity, message, conversation.id);
+      const preview = conversationPreview(decrypted);
+      if (decrypted.decryptionFailed === false) {
+        previewCacheRef.current.set(previewKey, preview);
+        while (previewCacheRef.current.size > 256) previewCacheRef.current.delete(previewCacheRef.current.keys().next().value);
+      }
+      return [Number(conversation.id), preview];
+    })).then((entries) => {
+      if (cancelled) return;
+      const previews = new Map(entries.filter(Boolean));
+      const next = conversationsRef.current.map((conversation) => previews.has(Number(conversation.id))
+        ? { ...conversation, lastMessage: previews.get(Number(conversation.id)) }
+        : conversation);
+      setConversations(next);
+      if (accountIdRef.current) rememberDmSidebar(accountIdRef.current, { friends, requests, sent, conversations: next });
+    }).catch(reportError);
+    return () => { cancelled = true; };
+  }, [account?.id, identity, friends, requests, sent, reportError]);
 
   useEffect(() => {
     const synced = event => {
@@ -266,8 +302,22 @@ export function useDmData(account, reportError, onUnread = null) {
     const cache = transcriptCacheRef.current;
     cache.delete(Number(selectedId));
     cache.set(Number(selectedId), { messages, hasMore: hasMoreMessages });
-    while (cache.size > 8) cache.delete(cache.keys().next().value);
-  }, [selectedId, transcriptId, messages, hasMoreMessages, isLoadingMessages, messagesError]);
+    if (memorySaver) trimInactiveTranscripts(cache, selectedId);
+    else while (cache.size > 8) cache.delete(cache.keys().next().value);
+  }, [selectedId, transcriptId, messages, hasMoreMessages, isLoadingMessages, messagesError, memorySaver]);
+
+  useEffect(() => {
+    if (!memorySaver) return;
+    trimInactiveTranscripts(transcriptCacheRef.current, selectedId);
+    previewCacheRef.current.clear();
+  }, [memorySaver, selectedId]);
+
+  useEffect(() => subscribePageActivity(activity => {
+    if (activity !== 'hidden') return;
+    // Keep the displayed transcript and optimistic sends; other history can reload.
+    trimInactiveTranscripts(transcriptCacheRef.current, selectedIdRef.current);
+    previewCacheRef.current.clear();
+  }), []);
 
   const identityRef = useRef(identity);
   identityRef.current = identity;
@@ -355,14 +405,17 @@ export function useDmData(account, reportError, onUnread = null) {
             return current.map((item) => Number(item.id) === conversationId ? { ...item, ...conversationPatch } : item);
           });
         }
-        const decrypted = await decryptMessage(identityRef.current, payload.message, conversationId);
+        let decrypted = await decryptMessage(identityRef.current, payload.message, conversationId);
         if (liveEventVersionsRef.current.get(eventKey) !== eventVersion) return;
-        liveMessageJournalRef.current.record(`dm:${conversationId}`, action, decrypted);
         if (mine && decrypted.clientMessageId) {
           for (const job of pendingSendsRef.current.values()) {
-            if (job.conversationId === conversationId && job.encrypted?.envelope.clientMessageId === decrypted.clientMessageId) job.confirmed = decrypted;
+            if (job.conversationId === conversationId && job.encrypted?.envelope.clientMessageId === decrypted.clientMessageId) {
+              decrypted = withLocalImagePreviews(decrypted, job.attachments);
+              job.confirmed = decrypted;
+            }
           }
         }
+        liveMessageJournalRef.current.record(`dm:${conversationId}`, action, decrypted);
         if (action !== 'edited') {
           const patch = { lastMessage: conversationPreview(decrypted), lastMessageAt: decrypted.createdAt };
           recordConversationUpdate(conversationId, patch);
@@ -379,7 +432,7 @@ export function useDmData(account, reportError, onUnread = null) {
             );
             if (duplicateIndex >= 0) {
               const copy = [...current];
-              copy[duplicateIndex] = { ...decrypted, status: 'sent' };
+              copy[duplicateIndex] = { ...retainLocalImagePreviews(decrypted, current[duplicateIndex]), status: 'sent' };
               return copy;
             }
             if (action === 'edited') return current;
@@ -428,6 +481,10 @@ export function useDmData(account, reportError, onUnread = null) {
         refreshSidebar().catch(() => {});
         if (peopleLoadedRef.current) refreshPeople().catch(() => {});
       }
+      if (eventName === 'user-verification-updated') {
+        refreshSidebar().catch(() => {});
+        if (peopleLoadedRef.current) refreshPeople().catch(() => {});
+      }
     }, setConnectionState, account?.id);
     realtimeRef.current = connection;
     return () => {
@@ -442,6 +499,29 @@ export function useDmData(account, reportError, onUnread = null) {
     setSelectedId(conversation.id);
     return conversation;
   }, [refreshSidebar]);
+
+  const createGroup = useCallback(async (name, memberIds) => {
+    const { conversation } = await createGroupConversation(name, memberIds);
+    await refreshSidebar();
+    setSelectedId(conversation.id);
+    return conversation;
+  }, [refreshSidebar]);
+  const muteConversation = useCallback(async (id, muted) => {
+    await setConversationMuted(id, muted);
+    recordConversationUpdate(id, { muted });
+    setConversations(current => current.map(item => Number(item.id) === Number(id) ? { ...item, muted } : item));
+    await refreshSidebar();
+  }, [recordConversationUpdate, refreshSidebar]);
+  const changeGroup = useCallback(async (id, action, value) => {
+    if (action === 'mute') return muteConversation(id, value);
+    if (action === 'rename') await renameGroupConversation(id, value);
+    else if (action === 'add') await addGroupMember(id, value);
+    else if (action === 'remove') await removeGroupMember(id, value);
+    else if (action === 'leave') await leaveGroupConversation(id);
+    else throw new Error('Unknown group action.');
+    transcriptCacheRef.current.delete(Number(id));
+    await refreshSidebar();
+  }, [muteConversation, refreshSidebar]);
 
   const requestFriendship = useCallback(async (username) => {
     const result = await sendFriendRequest(username);
@@ -508,7 +588,7 @@ export function useDmData(account, reportError, onUnread = null) {
         body: String(replyParent.body || ''),
       } : null,
       sender: { id: Number(account.id), username: account.username, avatarUrl: account.avatarUrl || null, nameStyle: account.nameStyle || null, customBadges: account.customBadges || [] },
-      attachments: [],
+      attachments: pendingImagePreviews(attachments),
       encrypted: false,
       status: 'sending',
     };
@@ -522,18 +602,19 @@ export function useDmData(account, reportError, onUnread = null) {
     const { conversationId, optimistic, body, attachments, replyToMessageId } = job;
     if (sendLocksRef.current.has(optimistic.id)) return null;
     sendLocksRef.current.add(optimistic.id);
-    const patchStatus = (status) => {
-      if (Number(selectedIdRef.current) === conversationId) setMessages(current => current.map(message => message.id === optimistic.id ? { ...message, status } : message));
+    const patchStatus = (status, sendLabel = null) => {
+      if (Number(selectedIdRef.current) === conversationId) setMessages(current => current.map(message => message.id === optimistic.id ? { ...message, status, sendLabel } : message));
       const cached = transcriptCacheRef.current.get(conversationId);
-      if (cached) transcriptCacheRef.current.set(conversationId, { ...cached, messages: cached.messages.map(message => message.id === optimistic.id ? { ...message, status } : message) });
+      if (cached) transcriptCacheRef.current.set(conversationId, { ...cached, messages: cached.messages.map(message => message.id === optimistic.id ? { ...message, status, sendLabel } : message) });
     };
-    patchStatus('sending');
+    patchStatus('sending', attachments.length ? 'Preparing attachments…' : null);
+    const onProgress = percent => patchStatus('sending', percent === 100 ? 'Upload complete · Sending…' : percent == null ? 'Uploading…' : `Uploading ${percent}%`);
     try {
       const latest = (await getConversations()).conversations.find(item => Number(item.id) === conversationId);
       if (!latest || latest.blocked) throw new Error('This conversation is unavailable.');
       if (latest.user.isBot) {
-        const response = await sendMessage(conversationId, body, attachments, replyToMessageId);
-        const message = response.message;
+        const response = await sendMessage(conversationId, body, attachments, replyToMessageId, onProgress);
+        const message = withLocalImagePreviews(response.message, attachments);
         if (!message || !Number.isSafeInteger(Number(message.id))) throw new Error('Nura did not confirm the message. Please retry.');
         liveMessageJournalRef.current.record(`dm:${conversationId}`, 'created', message);
         if (Number(selectedIdRef.current) === conversationId) setMessages(current => reconcileSentMessage(current, optimistic.id, message));
@@ -551,10 +632,11 @@ export function useDmData(account, reportError, onUnread = null) {
         optimistic.clientMessageId = job.encrypted.envelope.clientMessageId;
         if (Number(selectedIdRef.current) === conversationId) setMessages(current => current.map(message => message.id === optimistic.id ? { ...message, clientMessageId: optimistic.clientMessageId } : message));
       }
-      const response = await sendEncryptedMessage(conversationId, { ...job.encrypted, replyToMessageId });
-      const message = response.message
+      const response = await sendEncryptedMessage(conversationId, { ...job.encrypted, replyToMessageId }, onProgress);
+      const decrypted = response.message
         ? await decryptMessage(activeIdentity, response.message, conversationId)
         : { ...optimistic, id: response.messageId };
+      const message = withLocalImagePreviews(decrypted, attachments);
       if (!Number.isSafeInteger(Number(message.id))) throw new Error('The message was not confirmed. Please retry.');
       liveMessageJournalRef.current.record(`dm:${conversationId}`, 'created', message);
       if (Number(selectedIdRef.current) === conversationId) setMessages(current => reconcileSentMessage(current, optimistic.id, message));
@@ -570,6 +652,7 @@ export function useDmData(account, reportError, onUnread = null) {
         pendingSendsRef.current.delete(optimistic.id);
         return job.confirmed;
       }
+      if (error.status === 409 && job.encrypted?.envelope.version === 2) job.encrypted = null;
       patchStatus('failed');
       throw error;
     } finally {
@@ -651,7 +734,7 @@ export function useDmData(account, reportError, onUnread = null) {
   return {
     friends, requests, sent, peopleRevision, conversations, messages: Number(transcriptId) === Number(selectedId) ? messages : [], selectedId, selectedConversation, isLoading, loadPeople,
     isLoadingMessages, messagesError, retryMessages: () => setMessageHistoryRetry((value) => value + 1),
-    refreshSidebar, setSelectedId, startConversation, requestFriendship, acceptFriendship, declineFriendship, cancelFriendship, unfriendConversation, blockConversation, pinConversation, submitMessage, retryMessage, discardFailedMessage, editMessage, removeMessage, updateTyping,
+    refreshSidebar, setSelectedId, startConversation, createGroup, changeGroup, muteConversation, requestFriendship, acceptFriendship, declineFriendship, cancelFriendship, unfriendConversation, blockConversation, pinConversation, submitMessage, retryMessage, discardFailedMessage, editMessage, removeMessage, updateTyping,
     hasMoreMessages, isLoadingOlder, loadOlder, connectionState,
     typingUsers: selectedId ? Object.values(typingByConversation[selectedId] || {}).filter((item) => item.expiresAt > Date.now()).map((item) => item.name) : [],
     isRecipientTyping: Boolean(selectedId && Object.keys(typingByConversation[selectedId] || {}).length),

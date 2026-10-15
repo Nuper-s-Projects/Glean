@@ -1,8 +1,16 @@
+import { memorySaverLimits, subscribeMemorySaver } from './memorySaver.js';
 // Session-only metadata. Never store messages, credentials, or upload blobs here.
 export function createLoopCache({ ttl = 10_000, maxEntries = 80, maxBytes = 8 * 1024 * 1024, now = Date.now } = {}) {
   const entries = new Map();
   const pending = new Map();
   let account = null, session = 0, bytes = 0;
+  const trim = () => {
+    const limits = memorySaverLimits(maxEntries, maxBytes);
+    while (entries.size > limits.maxEntries || bytes > limits.maxBytes) {
+      const oldest = entries.keys().next().value;
+      bytes -= entries.get(oldest).bytes; entries.delete(oldest);
+    }
+  };
   const invalidate = (matches = () => true) => {
     for (const [key, entry] of entries) if (matches(key)) { bytes -= entry.bytes; entries.delete(key); }
     // Old responses cannot repopulate the cache or win over a newer request.
@@ -35,13 +43,10 @@ export function createLoopCache({ ttl = 10_000, maxEntries = 80, maxBytes = 8 * 
           return read(key, fetcher, { attempt: attempt + 1 });
         }
         const size = JSON.stringify(value).length * 2;
-        if (size <= maxBytes) {
+        if (size <= memorySaverLimits(maxEntries, maxBytes).maxBytes) {
           const old = entries.get(key); if (old) bytes -= old.bytes;
           entries.delete(key); entries.set(key, { value, bytes: size, time: now() }); bytes += size;
-          while (entries.size > maxEntries || bytes > maxBytes) {
-            const oldest = entries.keys().next().value;
-            bytes -= entries.get(oldest).bytes; entries.delete(oldest);
-          }
+          trim();
         }
         return value;
       }).finally(() => { if (pending.get(key) === task) pending.delete(key); });
@@ -55,10 +60,11 @@ export function createLoopCache({ ttl = 10_000, maxEntries = 80, maxBytes = 8 * 
         .finally(() => signal?.removeEventListener('abort', abort));
     });
   };
-  return { read, peek, invalidate, setAccount };
+  return { read, peek, invalidate, setAccount, trim, get size() { return entries.size; }, get bytes() { return bytes; } };
 }
 
 export const loopCache = createLoopCache();
+const unsubscribeSaver = subscribeMemorySaver(loopCache.trim);
 
 // Other tabs can change the same cookie/session and the same posts.
 const channel = typeof window !== 'undefined' && typeof BroadcastChannel !== 'undefined'
@@ -73,6 +79,7 @@ if (typeof window !== 'undefined') {
   document.addEventListener('visibilitychange', resumed);
 }
 if (import.meta.hot) import.meta.hot.dispose(() => {
+  unsubscribeSaver();
   channel?.close(); window.removeEventListener('online', resumed); document.removeEventListener('visibilitychange', resumed);
 });
 
@@ -83,7 +90,7 @@ export function invalidateLoopMutation(path) {
 }
 
 export function invalidateLoopEvent(event, payload) {
-  if (['connected', 'friends', 'account-privacy-settings', 'user-updated', 'account-updated'].includes(event)) loopCache.invalidate();
+  if (['connected', 'friends', 'account-privacy-settings', 'user-updated', 'user-verification-updated', 'account-updated'].includes(event)) loopCache.invalidate();
   else if (/^loop-(post-|comment-|follow-)/.test(event)) {
     const id = Number(payload?.postId);
     loopCache.invalidate(key => key.startsWith('/loop/posts?') || key === '/loop/posts'

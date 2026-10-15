@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { apiRequest } from '../../app/apiClient';
+import VerifiedMark from '../../components/VerifiedMark';
 import { subscribeToDmEvents } from '../../app/dmApi';
 import CommentIcon from './CommentIcon';
 
@@ -105,7 +106,7 @@ const Comment = memo(function Comment({ item,postId,onReply,onCount,onOpenProfil
   return <div className={`loop-thread${selected || recent ? ' is-highlighted' : ''}`} ref={node}>
     <div className="loop-comment">
       <button className="loop-comment-avatar" type="button" aria-label={`View ${item.author.username}'s profile`} onClick={()=>onOpenProfile?.(item.author.id,item.author.username)}>{item.author.avatarUrl ? <img src={item.author.avatarUrl} alt="" loading="lazy" decoding="async"/> : <span>{item.author.username.slice(0,2).toUpperCase()}</span>}</button>
-      <div className="loop-comment-content"><div className="loop-comment-byline"><button type="button" onClick={()=>onOpenProfile?.(item.author.id,item.author.username)}>{item.author.username}</button><time dateTime={item.createdAt} title={new Date(item.createdAt).toLocaleString()}>{relativeTime(item.createdAt)}</time></div>
+      <div className="loop-comment-content"><div className="loop-comment-byline"><button type="button" onClick={()=>onOpenProfile?.(item.author.id,item.author.username)}>{item.author.username}{item.author.verified ? <VerifiedMark /> : null}</button><time dateTime={item.createdAt} title={new Date(item.createdAt).toLocaleString()}>{relativeTime(item.createdAt)}</time></div>
         <p>{item.deleted ? <em>Comment deleted</em> : <CommentText text={item.content}/>}</p>
         <div className="loop-comment-controls">
           {!item.deleted ? <button type="button" onClick={()=>onReply(item)}>Reply</button> : null}
@@ -182,8 +183,8 @@ export default function LoopComments({ postId,onCount,onOpenProfile,focusComment
       <ThreadList key={`${postId}:${path.join(',')}`} {...{postId,onCount,onOpenProfile,sent}} onWrite={focusInput} focusPath={path} onReply={selectReply}/>
     </div>
     <div className="loop-comment-composer">
-      {reply ? <div className="loop-reply-target"><div><span>Replying to <strong>{reply.author.username}</strong></span><p>{reply.content}</p></div><button type="button" disabled={busy} onClick={()=>{setReply(null);focusInput();}} aria-label="Cancel reply"><CommentIcon name="close"/></button></div> : null}
-      {suggestions.length ? <div id={suggestionId} className="loop-mention-suggestions" role="listbox" aria-label="Mention suggestions">{suggestions.map((user,index)=><button type="button" role="option" aria-label={`@${user.username}`} aria-selected={selected===index} id={`${suggestionId}-${index}`} key={user.id} onMouseDown={event=>event.preventDefault()} onClick={()=>chooseMention(user)}>{user.avatarUrl ? <img src={user.avatarUrl} alt=""/> : <span>{user.username.slice(0,2).toUpperCase()}</span>}<strong>@{user.username}</strong></button>)}</div> : null}
+      {reply ? <div className="loop-reply-target"><div><span>Replying to <strong>{reply.author.username}{reply.author.verified ? <VerifiedMark /> : null}</strong></span><p>{reply.content}</p></div><button type="button" disabled={busy} onClick={()=>{setReply(null);focusInput();}} aria-label="Cancel reply"><CommentIcon name="close"/></button></div> : null}
+        {suggestions.length ? <div id={suggestionId} className="loop-mention-suggestions" role="listbox" aria-label="Mention suggestions">{suggestions.map((user,index)=><button type="button" role="option" aria-label={`@${user.username}`} aria-selected={selected===index} id={`${suggestionId}-${index}`} key={user.id} onMouseDown={event=>event.preventDefault()} onClick={()=>chooseMention(user)}>{user.avatarUrl ? <img src={user.avatarUrl} alt=""/> : <span>{user.username.slice(0,2).toUpperCase()}</span>}<strong>@{user.username}{user.verified ? <VerifiedMark /> : null}</strong></button>)}</div> : null}
       <form className="loop-comment-form" onSubmit={send}>
         <textarea ref={input} aria-label={reply ? `Reply to ${reply.author.username}` : 'Write a comment'} role="combobox" aria-autocomplete="list" aria-expanded={Boolean(suggestions.length)} aria-controls={suggestions.length ? suggestionId : undefined} aria-activedescendant={suggestions.length && selected>=0 ? `${suggestionId}-${selected}` : undefined} value={draft} maxLength={1000} rows={1} placeholder={reply ? 'Write a reply…' : 'Write a comment…'} onChange={event=>{setDraft(event.target.value);setCaret(event.target.selectionStart);setDismissed(false);}} onSelect={event=>setCaret(event.target.selectionStart)} onKeyDown={keyDown} disabled={busy}/>
         <button type="submit" aria-label={reply ? 'Send reply' : 'Send comment'} disabled={busy || !draft.trim()}>{busy ? 'Sending…' : 'Send'}<CommentIcon name="send" size={18}/></button>

@@ -2,9 +2,9 @@ import { useEffect, useRef, useState } from 'react';
 import { apiRequest } from '../../app/apiClient';
 import FlowSubtitles from './FlowSubtitles';
 import { playbackTime } from './flowPlayback';
-
-const preferenceKey = 'glean-loop-video-cc-v1';
-const readPreference = () => { try { return localStorage.getItem(preferenceKey) === 'on'; } catch { return false; } };
+import useLoopVideoPlayback from './useLoopVideoPlayback';
+import { readCaptionPreference, setCaptionPreference } from './loopVideoPreferences';
+import useMediaMemory from '../../app/useMediaMemory';
 
 export default function LoopVideo({ file, autoPlay = false, canRetry = false, active = true, muted = false, onMutedChange, loop = false, variant, onError }) {
   const video = useRef(null);
@@ -12,10 +12,12 @@ export default function LoopVideo({ file, autoPlay = false, canRetry = false, ac
   const clock = useRef(null);
   const manualPause = useRef(false);
   const flow = variant === 'flow';
+  const playback = useLoopVideoPlayback({ file, video, active, flow });
+  useMediaMemory(video, playback.source);
   const [paused, setPaused] = useState(true);
   const [silent, setSilent] = useState(muted);
   const [captions, setCaptions] = useState(file.captions);
-  const [enabled, setEnabled] = useState(readPreference);
+  const [enabled, setEnabled] = useState(readCaptionPreference);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [nativeFullscreen,setNativeFullscreen]=useState(false);
@@ -47,29 +49,29 @@ export default function LoopVideo({ file, autoPlay = false, canRetry = false, ac
     update();
     document.addEventListener('visibilitychange',update);
     return () => { disposed=true;document.removeEventListener('visibilitychange',update); element?.pause(); };
-  }, [active,autoPlay,file.url,flow]);
+  }, [active,autoPlay,playback.source,flow]);
   useEffect(() => {
-    const sync = () => setEnabled(readPreference());
+    const sync = () => setEnabled(readCaptionPreference());
     window.addEventListener('storage',sync); window.addEventListener('glean-loop-cc',sync);
     return () => { window.removeEventListener('storage',sync); window.removeEventListener('glean-loop-cc',sync); };
   }, []);
   useEffect(() => {
-    if (!['queued','processing'].includes(captions?.status)) return;
+    if (!active || !playback.near || !['queued','processing'].includes(captions?.status)) return;
     const controller = new AbortController(); let timer;
     const poll = async () => {
+      if (document.visibilityState !== 'visible') { timer = setTimeout(poll,5000); return; }
       try { const data = await apiRequest(`/loop/media/${file.id}/captions`,{signal:controller.signal}); if (!controller.signal.aborted) setCaptions(data.captions); }
       catch (failure) { if (!controller.signal.aborted && failure.status === 404) setCaptions(null); }
       finally { if (!controller.signal.aborted) timer = setTimeout(poll,5000); }
     };
     timer = setTimeout(poll,3000);
     return () => { controller.abort(); clearTimeout(timer); };
-  }, [file.id, captions?.status]);
+  }, [file.id, captions?.status, active, playback.near]);
   const apply = () => { if (video.current) for (const track of video.current.textTracks) if (track.kind === 'captions') track.mode = enabled ? (flow && !nativeFullscreen ? 'hidden' : 'showing') : 'disabled'; };
   useEffect(apply,[enabled,captions?.url,flow,nativeFullscreen]);
   const toggle = () => {
     const next = !enabled; setEnabled(next);
-    try { localStorage.setItem(preferenceKey,next ? 'on' : 'off'); } catch {}
-    window.dispatchEvent(new Event('glean-loop-cc'));
+    setCaptionPreference(next);
   };
   const retry = async () => {
     if (busy) return; setBusy(true); setError('');
@@ -106,9 +108,9 @@ export default function LoopVideo({ file, autoPlay = false, canRetry = false, ac
       else setError('Fullscreen is not supported in this browser.');
     } catch {setError('Fullscreen could not open. Try again.');}
   };
-  return <div className={`loop-caption-video${flow ? ' is-flow-video' : ''}`}><video ref={video} src={file.url} controls={!flow || nativeFullscreen} preload="metadata" autoPlay={autoPlay && active} muted={flow ? silent : muted} loop={loop} playsInline onLoadedMetadata={() => { apply(); progress(); }} onTimeUpdate={flow ? progress : undefined} onPlay={flow ? () => setPaused(false) : undefined} onPlaying={flow ? () => setBuffering(false) : undefined} onWaiting={flow ? () => setBuffering(true) : undefined} onCanPlay={flow ? () => setBuffering(false) : undefined} onPause={flow ? () => {setPaused(true);setBuffering(false);} : undefined} onError={onError}>
+  return <div className={`loop-caption-video${flow ? ' is-flow-video' : ''}`}><video ref={video} src={playback.source} controls={!flow || nativeFullscreen} preload={active && playback.near ? 'metadata' : 'none'} autoPlay={autoPlay && active} muted={flow ? silent : muted} loop={loop} playsInline onLoadedMetadata={() => { playback.loaded(); apply(); progress(); }} onTimeUpdate={flow ? progress : undefined} onPlay={flow ? () => setPaused(false) : undefined} onPlaying={flow ? () => setBuffering(false) : undefined} onWaiting={flow ? () => setBuffering(true) : undefined} onCanPlay={flow ? () => setBuffering(false) : undefined} onPause={flow ? () => {setPaused(true);setBuffering(false);} : undefined} onError={event => { playback.onError(); onError?.(event); }}>
     {captions?.status === 'ready' ? <track key={captions.url} kind="captions" src={captions.url} srcLang="und" label="Automatic captions" default={enabled} onLoad={apply} /> : null}
-  </video>{flow ? <>
+  </video>{playback.failed ? <div className="loop-video-recovery" role="status"><span>{playback.loading ? 'Preparing this video for your device…' : playback.error || 'Preparing a compatible video…'}</span>{!playback.loading && playback.retryable ? <button type="button" onClick={playback.retry}>Retry video</button> : null}</div> : null}{flow && !playback.failed ? <>
     <FlowSubtitles video={video} enabled={enabled && !nativeFullscreen} source={captions?.url}/>
     <button className="loop-flow-play" type="button" aria-label={paused ? 'Play video' : 'Pause video'} onClick={playPause}>{buffering ? <span className="loop-flow-buffering" role="status" aria-label="Buffering video"/> : paused ? <svg width="48" height="48" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="m8 5 11 7-11 7Z"/></svg> : null}</button>
     <button className="loop-flow-sound" type="button" aria-label={silent ? 'Unmute video' : 'Mute video'} aria-pressed={silent} onClick={toggleSound}><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="m11 5-6 4H2v6h3l6 4Z"/>{silent ? <path d="m16 9 6 6m0-6-6 6"/> : <path d="M15 8a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14"/>}</svg>{soundBlocked ? <span>Tap for sound</span> : null}</button>

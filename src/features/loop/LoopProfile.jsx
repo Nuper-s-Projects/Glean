@@ -3,6 +3,7 @@ import { apiRequest } from '../../app/apiClient';
 import { UserPopoutProvider } from '../dm/userPopout';
 import ProfilePosts from './ProfilePosts';
 import { loopRequest } from './loopRequest';
+import { subscribeToDmEvents } from '../../app/dmApi';
 
 export function LoopProfile({ id, username, account, onBack, onMessage, renderPost }) {
   const [profile, setProfile] = useState(null);
@@ -37,6 +38,14 @@ export function LoopProfile({ id, username, account, onBack, onMessage, renderPo
     load().catch((failure) => { if (!controller.signal.aborted) setError(failure.message); });
     return () => { controller.abort(); generation.current += 1; };
   }, [id, username, retry]);
+  useEffect(() => {
+    const subscription = subscribeToDmEvents((event, payload) => {
+      if (event !== 'user-verification-updated' || Number(payload?.userId) !== Number(id)) return;
+      setUser(current => current ? { ...current, verified:Boolean(payload.verified) } : current);
+      setProfile(current => current ? { ...current, verified:Boolean(payload.verified) } : current);
+    });
+    return () => subscription.close();
+  }, [id]);
   const toggleFollow = async () => {
     if (followLock.current) return;
     const requestedGeneration = generation.current;

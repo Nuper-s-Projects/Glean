@@ -10,6 +10,7 @@ import ProgramPromptModal from '../components/ProgramPromptModal';
 import SocialLinksPromptModal from '../components/SocialLinksPromptModal';
 import { UserPopoutProvider } from '../features/dm/userPopout';
 import { ImagePreviewProvider } from '../features/dm/ImagePreview';
+import { MessageReportsProvider } from '../features/dm/MessageReports';
 import { DmCallProvider } from '../features/dm/DmCall';
 import { disableDesktopPush, enableDesktopPush, notificationPermission, startDesktopPush } from './desktopPush';
 import { applyUpdate, dismissInstallHint, promptInstall, subscribePwa } from './pwa';
@@ -17,15 +18,16 @@ import { invalidateServersCache } from './dmApi';
 import { applyAccessibilitySettings } from './accessibility';
 import GleanErrorState from '../components/GleanErrorState';
 import AgreementPromptModal from '../components/AgreementPromptModal';
-import PlatformAnnouncement from '../components/PlatformAnnouncement';
 import { CONDUCT_VERSION, TERMS_VERSION } from './agreements';
 import { isDeveloperModeEnabled, subscribeDeveloperMode } from './developerMode';
 import DeveloperModeWindow from '../features/dm/DeveloperModeWindow';
 import BackupLinksModal from '../components/BackupLinksModal';
+import LoopIntroductionModal from '../components/LoopIntroductionModal';
 import { loopReturnPath, loopSignInPath } from './loopEntry';
 import MainThemeBackdrop from './MainThemeBackdrop';
 
 const BACKUP_LINKS_DISMISSED_KEY = 'glean-backup-links-dismissed-v1';
+const LOOP_INTRO_DISMISSED_KEY = 'glean-loop-intro-dismissed-v1';
 
 function hasDismissedBackupLinks(accountId) {
   const key = `${BACKUP_LINKS_DISMISSED_KEY}:${accountId}`;
@@ -34,8 +36,16 @@ function hasDismissedBackupLinks(accountId) {
   }
 }
 
+function hasDismissedLoopIntro(accountId) {
+  const key = `${LOOP_INTRO_DISMISSED_KEY}:${accountId}`;
+  try { return window.localStorage.getItem(key) === '1'; } catch {
+    try { return window.sessionStorage.getItem(key) === '1'; } catch { return false; }
+  }
+}
+
 const TRANSITION_MS = 180;
 const AccountScreen = lazy(() => import('../screens/AccountScreen'));
+const FeedbackSurveyModal = lazy(() => import('../components/FeedbackSurveyModal'));
 const DirectMessagesScreen = lazy(() => import('../screens/DirectMessagesScreen'));
 const CommunityScreen = lazy(() => import('../screens/CommunityScreen'));
 const LoopScreen = LOOP_ROUTES_ENABLED ? lazy(() => import('../screens/LoopScreen')) : null;
@@ -81,6 +91,9 @@ export default function App() {
   const [pushHint, setPushHint] = useState(false);
   const [pwa, setPwa] = useState(() => ({ standalone: false, canInstall: false, updateReady: false, offline: false, showInstallHint: false }));
   const [showBackupLinks, setShowBackupLinks] = useState(false);
+  const [loopIntroDismissedFor, setLoopIntroDismissedFor] = useState(null);
+  const [surveyDeferredFor, setSurveyDeferredFor] = useState(null);
+  const [surveyAccountReady, setSurveyAccountReady] = useState(false);
 
   useEffect(() => {
     setShowBackupLinks(hasAcceptedCurrentAgreements(account) && !hasDismissedBackupLinks(account.id));
@@ -93,6 +106,32 @@ export default function App() {
     }
     setShowBackupLinks(false);
   }, [account?.id]);
+
+  const dismissLoopIntro = useCallback(() => {
+    const key = `${LOOP_INTRO_DISMISSED_KEY}:${account?.id}`;
+    try { window.localStorage.setItem(key, '1'); } catch {
+      try { window.sessionStorage.setItem(key, '1'); } catch { /* Keep it dismissed for the current app session. */ }
+    }
+    setLoopIntroDismissedFor(account?.id ?? null);
+  }, [account?.id]);
+
+  const surveyEligible = surveyAccountReady && authReady && hasAcceptedCurrentAgreements(account)
+    && account?.grade != null && account?.school != null
+    && account?.programAnswered === true && account?.socialPromptSeen === true
+    && hasDismissedBackupLinks(account.id) && !showBackupLinks
+    && account?.surveyCompleted !== true && surveyDeferredFor !== account?.id && !runtimeError;
+
+  const loopIntroEligible = !surveyEligible && LOOP_ROUTES_ENABLED
+    && hasAcceptedCurrentAgreements(account)
+    && account?.grade != null
+    && account?.school != null
+    && account?.programAnswered === true
+    && account?.socialPromptSeen === true
+    && hasDismissedBackupLinks(account.id)
+    && !showBackupLinks
+    && displayedRoute !== ROUTES.LOOP
+    && loopIntroDismissedFor !== account?.id
+    && !hasDismissedLoopIntro(account.id);
 
   useEffect(() => {
     const onError = (event) => setRuntimeError(import.meta.env.DEV ? (event.error?.stack || event.message || 'Unknown application error') : 'Glean hit an unexpected error. Please retry.');
@@ -143,6 +182,7 @@ export default function App() {
   }, [transitionTo]);
 
   const completeAuthentication = useCallback((nextAccount) => {
+    setSurveyAccountReady(true);
     rememberAccount(nextAccount);
     accountRef.current = nextAccount;
     setAccount(nextAccount);
@@ -155,6 +195,7 @@ export default function App() {
   }, [transitionTo]);
 
   const completeSignOut = useCallback(() => {
+    setSurveyAccountReady(false);
     pendingLoop.current = null;
     disableDesktopPush();
     invalidateServersCache();
@@ -195,6 +236,7 @@ export default function App() {
       targetRoute.current = target;
       setDisplayedRoute(target);
       setAuthReady(true);
+      setSurveyAccountReady(true);
     });
     return () => { cancelled = true; };
   }, []);
@@ -285,8 +327,8 @@ export default function App() {
     <UserPopoutProvider account={hasAcceptedCurrentAgreements(account) ? account : null} onAccountUpdated={updateAccount}>
       <MainThemeBackdrop preferences={account?.mainThemes} enabled={Boolean(account) && displayedRoute !== ROUTES.LOOP} />
       <ImagePreviewProvider>
+      <MessageReportsProvider account={hasAcceptedCurrentAgreements(account) ? account : null}>
       <DmCallProvider account={hasAcceptedCurrentAgreements(account) ? account : null}>
-      {hasAcceptedCurrentAgreements(account) ? <PlatformAnnouncement account={account} /> : null}
       {hasAcceptedCurrentAgreements(account) && pwa.offline ? <div className="glean-offline-bar" role="status">You're offline. Cached Glean still opens; new messages wait until you're back.</div> : null}
       {account && !hasAcceptedCurrentAgreements(account) ? <div className="agreement-app-blocked" aria-hidden="true" /> : (
         <div className={`screen-transition ${displayedRoute === ROUTES.LOOP ? 'is-loop-screen' : ''} ${routeMotion ? `is-dms-server-route is-route-${routeMotion}` : ''} ${isLeaving ? 'is-leaving' : 'is-entering'}`} style={displayedRoute === ROUTES.LOOP ? { position: 'fixed', inset: 0, width: '100vw', height: '100dvh', minHeight: '100dvh', maxWidth: 'none', margin: 0, padding: 0, overflow: 'hidden' } : undefined} key={displayedRoute}>
@@ -326,8 +368,11 @@ export default function App() {
       {hasAcceptedCurrentAgreements(account) && account.grade != null && account.school != null && account.programAnswered !== true ? <ProgramPromptModal account={account} onSaved={updateAccount} /> : null}
       {hasAcceptedCurrentAgreements(account) && account.grade != null && account.school != null && account.programAnswered === true && !account.socialPromptSeen ? <SocialLinksPromptModal account={account} onSaved={updateAccount} /> : null}
       {showBackupLinks && hasAcceptedCurrentAgreements(account) ? <BackupLinksModal onDismiss={dismissBackupLinks} /> : null}
+      {loopIntroEligible ? <LoopIntroductionModal onDismiss={dismissLoopIntro} onOpenLoop={() => { dismissLoopIntro(); navigate(ROUTES.LOOP); }} /> : null}
+      {surveyEligible ? <Suspense fallback={null}><FeedbackSurveyModal key={account.id} onCompleted={updateAccount} onLater={() => setSurveyDeferredFor(account.id)} /></Suspense> : null}
       {hasAcceptedCurrentAgreements(account) && runtimeError ? <GleanErrorState title="Glean ran into a problem" description="Something did not load correctly. You can report it so it can be fixed." error={runtimeError} onDismiss={() => setRuntimeError(null)} /> : null}
       </DmCallProvider>
+      </MessageReportsProvider>
       </ImagePreviewProvider>
     </UserPopoutProvider>
   );

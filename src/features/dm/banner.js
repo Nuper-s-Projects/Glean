@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react';
+import { createMemoryCache } from '../../app/memoryCache.js';
 import { PROFILE_BACKGROUND_URL, profileImageAdjustments } from '../../app/profileBackground';
 
 export const BANNER_HEX = /^#[0-9a-f]{6}$/i;
 const AVATAR_URL = /^\/api\/v1\/avatars\/[a-z0-9._-]+$/i;
 const BANNER_IMAGE_URL = /^\/api\/v1\/(?:banners\/banner-[a-z2-7]+\.jpg|server-banners\/server-banner-[a-z2-7]+\.jpg|invites\/[a-z0-9_-]{6,32}\/banner)$/i;
-const paletteCache = new Map();
+const paletteCache = createMemoryCache({ maxEntries: 128 });
+if (import.meta.hot) import.meta.hot.dispose(() => paletteCache.dispose());
 const palettePending = new Map();
 
 export function normalizeHex(value, fallback = '#249cff') {
@@ -267,20 +269,20 @@ export function contactBannerStyle(user) {
 export function useContactBannerStyle(user) {
   const custom = bannerStyle(user?.banner);
   const url = !custom && AVATAR_URL.test(String(user?.avatarUrl || '')) ? user.avatarUrl : '';
-  const [, bump] = useState(0);
+  const [sample, setSample] = useState(null);
 
   useEffect(() => {
-    if (!url || paletteCache.has(url)) return undefined;
+    if (!url) return undefined;
     let alive = true;
-    loadAvatarPalette(url).then(() => {
-      if (alive) bump((value) => value + 1);
+    loadAvatarPalette(url).then(palette => {
+      if (alive) setSample({ url, palette });
     });
     return () => { alive = false; };
   }, [url]);
 
   if (custom) return custom;
-  const sampled = url ? paletteCache.get(url) : null;
+  const sampled = sample?.url === url ? sample.palette : url ? paletteCache.get(url) : null;
   if (sampled) return gradientStyle(sampled.from, sampled.to);
-  if (url && !paletteCache.has(url)) return gradientStyle('#1a2733', '#101a23');
+  if (url && sample?.url !== url && !paletteCache.has(url)) return gradientStyle('#1a2733', '#101a23');
   return roleBannerStyle(user?.roleColor);
 }

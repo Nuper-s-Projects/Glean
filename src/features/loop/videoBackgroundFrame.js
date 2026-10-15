@@ -1,4 +1,6 @@
-const frames = new Map();
+import { createMemoryCache } from '../../app/memoryCache.js';
+import { memorySaverEnabled } from '../../app/memorySaver.js';
+const frames = createMemoryCache({ maxEntries: 100, maxBytes: 2 * 1024 * 1024, sizeOf: (url, frame) => (url.length + frame.length) * 2 });
 const pending = new Map();
 const queue = [];
 let active = 0;
@@ -49,12 +51,11 @@ function capture(url) {
 }
 
 function drain() {
-  while (active < 2 && queue.length) {
+  while (active < (memorySaverEnabled() ? 1 : 2) && queue.length) {
     const { url, resolve } = queue.shift();
     active++;
     capture(url).then((frame) => {
       frames.set(url, frame);
-      if (frames.size > 100) frames.delete(frames.keys().next().value);
       pending.delete(url);
       resolve(frame);
     }).finally(() => { active--; drain(); });

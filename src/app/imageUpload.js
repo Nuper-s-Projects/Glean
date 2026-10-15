@@ -1,6 +1,16 @@
 const OPTIMIZE_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 const MAX_IMAGE_EDGE = 1920;
 const MIN_OPTIMIZE_BYTES = 1_500_000;
+const preparedFiles = new WeakMap();
+
+export function prepareUploadFile(file) {
+  if (!preparedFiles.has(file)) {
+    const pending = optimizeImage(file);
+    preparedFiles.set(file, pending);
+    pending.then(result => preparedFiles.set(result, Promise.resolve(result)));
+  }
+  return preparedFiles.get(file);
+}
 
 async function optimizeImage(file) {
   if (!OPTIMIZE_MIME_TYPES.has(file.type) || typeof createImageBitmap !== 'function') return file;
@@ -36,7 +46,7 @@ export async function prepareUploadFiles(files) {
   const workers = Array.from({ length: Math.min(2, source.length) }, async () => {
     while (nextIndex < source.length) {
       const index = nextIndex++;
-      output[index] = await optimizeImage(source[index]);
+      output[index] = await prepareUploadFile(source[index]);
     }
   });
   await Promise.all(workers);

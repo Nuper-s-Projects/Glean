@@ -2,6 +2,7 @@ import { createHash, createHmac, randomBytes, scryptSync, timingSafeEqual } from
 import { appendFileSync, existsSync, mkdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { DatabaseSync } from 'node:sqlite';
+import { createMessageFanoutQueue } from './server/messageFanout.mjs';
 import { createServer } from 'node:http';
 import { extname, join, resolve, sep } from 'node:path';
 import { Readable } from 'node:stream';
@@ -23,11 +24,16 @@ import { MAIN_THEME_IMAGE_URL, normalizeMainThemes } from './src/app/mainTheme.j
 import { createMainThemeService } from './server/mainThemes.mjs';
 import { createServerModelService } from './server/serverModel.mjs';
 import { createServerCategories } from './server/serverCategories.mjs';
+import { createGroupDmService } from './server/groupDms.mjs';
+import { createFeedbackSurveyService } from './server/feedbackSurvey.mjs';
 import { applySecurityHeaders, isSameOriginRequest, pruneRateLimits, requestId, takeRateLimit } from './server/security.mjs';
 import { createRealtimeHub } from './server/realtime.mjs';
+import { createPresenceBatch } from './server/presenceBatch.mjs';
 import { createPushService } from './server/push.mjs';
 import { createScheduledNotifications } from './server/scheduledNotifications.mjs';
 import { createOfficialAnnouncements } from './server/officialAnnouncements.mjs';
+import { createMessageReports } from './server/messageReports.mjs';
+import { createNotificationPreferences } from './server/notificationPreferences.mjs';
 import { applyNuraMoodDelta, buildNuraMessages, formatNuraMoodContext, NURA_IMAGE_TYPES, NURA_MAX_IMAGE_BYTES, NURA_MAX_IMAGES, requestNuraReply } from './server/nura.mjs';
 import { getManagedSchoolAccessState, getSchoolAccessState } from './server/schoolSchedule.mjs';
 import { createAppService } from './server/apps.mjs';
@@ -61,24 +67,13 @@ mkdirSync(dataDirectory, { recursive: true, mode: 0o700 });
 mkdirSync(uploadDirectory, { recursive: true, mode: 0o700 });
 mkdirSync(errorReportsDirectory, { recursive: true, mode: 0o700 });
 const database = new DatabaseSync(databasePath, { enableForeignKeyConstraints: true, defensive: true });
+let messageReports;
 database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA temp_store = MEMORY; PRAGMA mmap_size = 67108864; PRAGMA cache_size = -8000; PRAGMA wal_autocheckpoint = 1000;');
-database.exec("CREATE TABLE IF NOT EXISTS platform_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT; INSERT OR IGNORE INTO platform_settings (key, value) VALUES ('maintenance_mode', '0'), ('allow_school_hours', '0'), ('offline_screen_mode', '0'), ('announcement_enabled', '0'), ('announcement_message', ''), ('official_server_hidden', '0');");
+database.exec("CREATE TABLE IF NOT EXISTS platform_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT; INSERT OR IGNORE INTO platform_settings (key, value) VALUES ('allow_school_hours', '0');");
 const readPlatformSetting = database.prepare('SELECT value FROM platform_settings WHERE key = ?');
 const writePlatformSetting = database.prepare('INSERT INTO platform_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value');
-function isMaintenanceMode() { return readPlatformSetting.get('maintenance_mode')?.value === '1'; }
 function isSchoolHoursAllowed() { return readPlatformSetting.get('allow_school_hours')?.value === '1'; }
-function isOfflineScreenMode() { return readPlatformSetting.get('offline_screen_mode')?.value === '1'; }
-function currentAnnouncement() {
-  const adminRef = findUserByUsername.get('Nuper');
-  const profile = adminRef ? findUserById.get(Number(adminRef.id)) : null;
-  return {
-    enabled: readPlatformSetting.get('announcement_enabled')?.value === '1',
-    message: readPlatformSetting.get('announcement_message')?.value || '',
-    profile: profile ? { id: Number(profile.id), username: profile.username, avatarUrl: profile.avatar_url || null } : { id: null, username: 'Nuper', avatarUrl: null },
-  };
-}
 function currentSchoolAccess(now = new Date()) {
-  if (isOfflineScreenMode()) return { available: false, nextOpenAt: null, timeZone: schoolScheduleTimeZone, offlineScreen: true };
   return getManagedSchoolAccessState(now, schoolScheduleTimeZone, isSchoolHoursAllowed());
 }
 
@@ -369,6 +364,14 @@ database.exec(`
     PRIMARY KEY (user_id, server_id)
   ) STRICT;
   CREATE INDEX IF NOT EXISTS user_server_mutes_server_index ON user_server_mutes(server_id, user_id);
+  CREATE TABLE IF NOT EXISTS user_notification_settings (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, settings_json TEXT NOT NULL
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS user_conversation_mutes (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    PRIMARY KEY(user_id,conversation_id)
+  ) STRICT;
   CREATE TABLE IF NOT EXISTS channel_reads (
     channel_id INTEGER NOT NULL REFERENCES server_channels(id) ON DELETE CASCADE,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -466,6 +469,7 @@ if (!existingUserColumns.some((column) => column.name === 'presence_status')) da
 if (!existingUserColumns.some((column) => column.name === 'avatar_url')) database.exec('ALTER TABLE users ADD COLUMN avatar_url TEXT');
 if (!existingUserColumns.some((column) => column.name === 'public_key_jwk')) database.exec('ALTER TABLE users ADD COLUMN public_key_jwk TEXT');
 if (!existingUserColumns.some((column) => column.name === 'is_bot')) database.exec('ALTER TABLE users ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0 CHECK(is_bot IN (0, 1))');
+if (!existingUserColumns.some((column) => column.name === 'is_verified')) database.exec('ALTER TABLE users ADD COLUMN is_verified INTEGER NOT NULL DEFAULT 0 CHECK(is_verified IN (0, 1))');
 if (!existingUserColumns.some((column) => column.name === 'key_fingerprint')) database.exec('ALTER TABLE users ADD COLUMN key_fingerprint TEXT');
 if (!existingUserColumns.some((column) => column.name === 'is_admin')) database.exec('ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0');
 if (!existingUserColumns.some((column) => column.name === 'banner_json')) database.exec('ALTER TABLE users ADD COLUMN banner_json TEXT');
@@ -501,6 +505,7 @@ if (!existingUserColumns.some((column) => column.name === 'accessibility_glass_f
 if (!existingUserColumns.some((column) => column.name === 'accessibility_glass_depth')) database.exec('ALTER TABLE users ADD COLUMN accessibility_glass_depth INTEGER NOT NULL DEFAULT 20 CHECK(accessibility_glass_depth BETWEEN 0 AND 100)');
 if (!existingUserColumns.some((column) => column.name === 'accessibility_glass_refraction')) database.exec('ALTER TABLE users ADD COLUMN accessibility_glass_refraction INTEGER NOT NULL DEFAULT 100 CHECK(accessibility_glass_refraction BETWEEN 0 AND 100)');
 if (!existingUserColumns.some((column) => column.name === 'accessibility_theme')) database.exec("ALTER TABLE users ADD COLUMN accessibility_theme TEXT NOT NULL DEFAULT 'system' CHECK(accessibility_theme IN ('system', 'light', 'dark'))");
+if (!existingUserColumns.some((column) => column.name === 'accessibility_loop_streak_reminder')) database.exec('ALTER TABLE users ADD COLUMN accessibility_loop_streak_reminder INTEGER NOT NULL DEFAULT 1 CHECK(accessibility_loop_streak_reminder IN (0, 1))');
 if (!existingUserColumns.some((column) => column.name === 'main_theme_json')) database.exec('ALTER TABLE users ADD COLUMN main_theme_json TEXT');
 if (!existingUserColumns.some((column) => column.name === 'agreement_prompted_at')) database.exec('ALTER TABLE users ADD COLUMN agreement_prompted_at TEXT');
 const migrateProgramFromSchool = database.prepare("SELECT id, school, program_json FROM users WHERE school IN ('magnet', 'laredo-college')");
@@ -556,8 +561,11 @@ database.exec(`
     PRIMARY KEY (message_id, user_id, option_index)
   ) STRICT;
   CREATE INDEX IF NOT EXISTS channel_poll_votes_message_index ON channel_poll_votes(message_id);
+  CREATE INDEX IF NOT EXISTS channel_poll_votes_option_index ON channel_poll_votes(message_id, option_index, user_id);
 `);
 database.exec('CREATE INDEX IF NOT EXISTS channel_messages_channel_id_index ON channel_messages(channel_id, id)');
+database.exec('CREATE INDEX IF NOT EXISTS channel_messages_live_count_index ON channel_messages(channel_id, id) WHERE deleted_at IS NULL');
+database.exec('CREATE INDEX IF NOT EXISTS channel_messages_live_author_index ON channel_messages(channel_id, user_id, id) WHERE deleted_at IS NULL');
 database.exec(`CREATE TABLE IF NOT EXISTS e2ee_sync_vaults (
   user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
   revision INTEGER NOT NULL,
@@ -672,11 +680,25 @@ database.exec("UPDATE users SET last_visited_at = created_at WHERE last_visited_
 const existingMessageColumns = database.prepare('PRAGMA table_info(messages)').all();
 for (const [name, definition] of [
   ['ciphertext', 'TEXT'], ['iv', 'TEXT'], ['salt', 'TEXT'], ['sender_public_key', 'TEXT'], ['recipient_public_key', 'TEXT'],
-  ['client_message_id', 'TEXT'], ['encryption_version', 'INTEGER NOT NULL DEFAULT 0']
+  ['client_message_id', 'TEXT'], ['encryption_version', 'INTEGER NOT NULL DEFAULT 0'], ['group_keys_json', 'TEXT']
 ]) if (!existingMessageColumns.some((column) => column.name === name)) database.exec(`ALTER TABLE messages ADD COLUMN ${name} ${definition}`);
 database.exec('CREATE UNIQUE INDEX IF NOT EXISTS messages_client_message_id_index ON messages(conversation_id, sender_id, client_message_id) WHERE client_message_id IS NOT NULL');
 database.exec('CREATE INDEX IF NOT EXISTS messages_live_conversation_id_index ON messages(conversation_id, id) WHERE deleted_at IS NULL');
 database.exec('CREATE INDEX IF NOT EXISTS messages_live_unread_index ON messages(conversation_id, sender_id, id) WHERE deleted_at IS NULL');
+// Keep join/read boundaries valid when account deletion removes the highest row ID.
+database.exec(`
+  CREATE TABLE IF NOT EXISTS dm_message_sequence (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), last_id INTEGER NOT NULL) STRICT;
+  INSERT OR IGNORE INTO dm_message_sequence VALUES(1, (SELECT COALESCE(MAX(id), 0) FROM messages));
+  UPDATE dm_message_sequence SET last_id = MAX(last_id, (SELECT COALESCE(MAX(id), 0) FROM messages)) WHERE singleton = 1;
+  CREATE TRIGGER IF NOT EXISTS dm_message_sequence_insert AFTER INSERT ON messages BEGIN
+    UPDATE dm_message_sequence SET last_id = MAX(last_id, NEW.id) WHERE singleton = 1;
+  END;
+`);
+
+const groupDms = createGroupDmService({ database, areFriends, isBlockedEither, publicPresence, publicNameStyle, publicCustomBadges, sendEvent,
+  directMessagePayload: row => directMessagePayload(loadDirectMessageRow.get(row.id)), publicKeyMatchesStored, removeStoredUploads });
+const handleFeedbackSurvey = createFeedbackSurveyService({ database, withTransaction, requireSignedInUser, readJson, sendJson, publicAccount, isNuperAdmin });
+database.exec('DROP TABLE IF EXISTS outcome_memory_ribbons');
 
 const existingAttachmentColumns = database.prepare('PRAGMA table_info(message_attachments)').all();
 for (const [name, definition] of [
@@ -706,7 +728,8 @@ const findKeepInformationSecret = database.prepare('SELECT keep_information_secr
 const findUserByUsername = database.prepare('SELECT id FROM users WHERE username = ? COLLATE NOCASE');
 const findNuraAccount = database.prepare('SELECT id, email, is_bot FROM users WHERE username = ? COLLATE NOCASE');
 const findUserBySession = database.prepare(`
-  SELECT users.main_theme_json, users.id, users.email, users.username, users.bio, users.custom_badges_json, users.private_notes_enabled, users.presence_status, users.avatar_url, users.banner_json, users.profile_background_json, users.name_style_json, users.public_key_jwk, users.key_fingerprint, users.created_at, users.last_visited_at, users.presence_hidden, users.keep_information_secret, users.show_inspect_servers, users.grade, users.school, users.program_json, users.discord_username, users.instagram_url, users.instagram_username, users.tiktok_url, users.tiktok_username, users.social_prompt_seen, users.accessibility_contrast, users.accessibility_saturation, users.accessibility_reduce_motion, users.accessibility_glass_frost, users.accessibility_glass_depth, users.accessibility_glass_refraction, users.accessibility_theme, users.agreement_prompted_at
+  SELECT users.feedback_survey_completed_at,
+  users.main_theme_json, users.id, users.email, users.username, users.bio, users.custom_badges_json, users.private_notes_enabled, users.presence_status, users.avatar_url, users.banner_json, users.profile_background_json, users.name_style_json, users.public_key_jwk, users.key_fingerprint, users.is_verified, users.created_at, users.last_visited_at, users.presence_hidden, users.keep_information_secret, users.show_inspect_servers, users.grade, users.school, users.program_json, users.discord_username, users.instagram_url, users.instagram_username, users.tiktok_url, users.tiktok_username, users.social_prompt_seen, users.accessibility_contrast, users.accessibility_saturation, users.accessibility_reduce_motion, users.accessibility_glass_frost, users.accessibility_glass_depth, users.accessibility_glass_refraction, users.accessibility_theme, users.accessibility_loop_streak_reminder, users.agreement_prompted_at
   FROM sessions JOIN users ON users.id = sessions.user_id
   WHERE sessions.token_hash = ? AND sessions.expires_at > ?
 `);
@@ -729,7 +752,7 @@ const updateProgram = database.prepare('UPDATE users SET program_json = ? WHERE 
 const updateDiscordUsername = database.prepare('UPDATE users SET discord_username = ? WHERE id = ?');
 const updateSocialLinks = database.prepare('UPDATE users SET instagram_url = ?, instagram_username = ?, tiktok_url = ?, tiktok_username = ? WHERE id = ?');
 const markSocialPromptSeen = database.prepare('UPDATE users SET social_prompt_seen = 1 WHERE id = ?');
-const updateAccessibilitySettings = database.prepare('UPDATE users SET accessibility_contrast = ?, accessibility_saturation = ?, accessibility_reduce_motion = ?, accessibility_glass_frost = ?, accessibility_glass_depth = ?, accessibility_glass_refraction = ?, accessibility_theme = ? WHERE id = ?');
+const updateAccessibilitySettings = database.prepare('UPDATE users SET accessibility_contrast = ?, accessibility_saturation = ?, accessibility_reduce_motion = ?, accessibility_glass_frost = ?, accessibility_glass_depth = ?, accessibility_glass_refraction = ?, accessibility_theme = ?, accessibility_loop_streak_reminder = ? WHERE id = ?');
 const updatePrivateNotesEnabled = database.prepare('UPDATE users SET private_notes_enabled = ? WHERE id = ?');
 const updatePresenceStatus = database.prepare('UPDATE users SET presence_status = ? WHERE id = ?');
 const getUserNote = database.prepare('SELECT note FROM user_notes WHERE owner_id = ? AND target_id = ?');
@@ -823,20 +846,20 @@ const listNuraHistory = database.prepare(`
   ORDER BY messages.id DESC LIMIT 30
 `);
 const listFriends = database.prepare(`
-  SELECT users.id, users.username, users.avatar_url, users.name_style_json, users.is_bot
+  SELECT users.id, users.username, users.avatar_url, users.name_style_json, users.is_bot, users.is_verified
   FROM friendships
   JOIN users ON users.id = CASE WHEN friendships.user_one_id = ? THEN friendships.user_two_id ELSE friendships.user_one_id END
   WHERE friendships.user_one_id = ? OR friendships.user_two_id = ?
   ORDER BY users.username COLLATE NOCASE
 `);
 const listIncomingRequests = database.prepare(`
-  SELECT friend_requests.id, users.id AS user_id, users.username, users.avatar_url, users.name_style_json, friend_requests.created_at
+  SELECT friend_requests.id, users.id AS user_id, users.username, users.avatar_url, users.name_style_json, users.is_verified, friend_requests.created_at
   FROM friend_requests JOIN users ON users.id = friend_requests.sender_id
   WHERE friend_requests.receiver_id = ? AND friend_requests.status = 'pending'
   ORDER BY friend_requests.created_at DESC
 `);
 const listOutgoingRequests = database.prepare(`
-  SELECT friend_requests.id, users.id AS user_id, users.username, users.avatar_url, users.name_style_json, friend_requests.created_at
+  SELECT friend_requests.id, users.id AS user_id, users.username, users.avatar_url, users.name_style_json, users.is_verified, friend_requests.created_at
   FROM friend_requests JOIN users ON users.id = friend_requests.receiver_id
   WHERE friend_requests.sender_id = ? AND friend_requests.status = 'pending'
   ORDER BY friend_requests.created_at DESC
@@ -846,7 +869,7 @@ const deleteIncomingRequest = database.prepare(`DELETE FROM friend_requests WHER
 const findOutgoingRequest = database.prepare(`SELECT id, receiver_id FROM friend_requests WHERE id = ? AND sender_id = ? AND status = 'pending'`);
 const listUserCensus = database.prepare('SELECT grade, school, program_json, created_at FROM users WHERE username IS NOT NULL AND is_bot = 0');
 const listAnalyticsPeople = database.prepare(`
-  SELECT id, username, avatar_url, grade, school, program_json, created_at
+  SELECT id, username, avatar_url, grade, school, program_json, created_at, is_verified
   FROM users
   WHERE username IS NOT NULL AND is_bot = 0 AND id > ? AND instr(lower(username), lower(?)) > 0
   ORDER BY id ASC
@@ -855,7 +878,7 @@ const listAnalyticsPeople = database.prepare(`
 const discoverPeopleSql = `
   WITH params AS (SELECT ? AS viewer_id, ? AS query, ? AS school, ? AS program, ? AS grade, ? AS relation_filter, ? AS attributes),
   directory AS (
-  SELECT users.id, users.username, users.avatar_url, users.bio, users.grade, users.school, users.program_json, users.custom_badges_json,
+  SELECT users.id, users.username, users.avatar_url, users.bio, users.grade, users.school, users.program_json, users.custom_badges_json, users.is_verified,
     CASE
       WHEN friend.user_one_id IS NOT NULL THEN 'friend'
       WHEN outgoing.id IS NOT NULL THEN 'outgoing'
@@ -905,7 +928,7 @@ const countDiscoverPeople = database.prepare(`${discoverPeopleSql}
     (SELECT COUNT(*) FROM matches) AS matched_total FROM directory
 `);
 const findProfileByUsername = database.prepare(`
-  SELECT users.id, users.username, users.avatar_url, users.banner_json, users.profile_background_json, users.name_style_json, users.bio, users.created_at, users.is_admin, users.grade, users.school, users.program_json, users.custom_badges_json, users.discord_username, users.instagram_url, users.instagram_username, users.tiktok_url, users.tiktok_username,
+  SELECT users.id, users.username, users.avatar_url, users.banner_json, users.profile_background_json, users.name_style_json, users.bio, users.created_at, users.is_admin, users.is_verified, users.grade, users.school, users.program_json, users.custom_badges_json, users.discord_username, users.instagram_url, users.instagram_username, users.tiktok_url, users.tiktok_username,
     CASE
       WHEN users.id = ? THEN 'self'
       WHEN blocked.blocker_id IS NOT NULL THEN 'blocked'
@@ -933,6 +956,7 @@ const findDirectConversation = database.prepare(`
   JOIN conversation_members first_member ON first_member.conversation_id = conversations.id AND first_member.user_id = ?
   JOIN conversation_members second_member ON second_member.conversation_id = conversations.id AND second_member.user_id = ?
   WHERE conversations.kind = 'direct'
+    AND NOT EXISTS (SELECT 1 FROM group_conversations g WHERE g.conversation_id = conversations.id)
     AND (SELECT COUNT(*) FROM conversation_members WHERE conversation_id = conversations.id) = 2
   LIMIT 1
 `);
@@ -946,13 +970,13 @@ const listConversationPeerIdsForUser = database.prepare(`
   WHERE my_member.user_id = ? AND other_member.user_id != ?
 `);
 const findConversationPeer = database.prepare(`
-  SELECT users.id, users.username, users.avatar_url, users.public_key_jwk, users.key_fingerprint, users.custom_badges_json, users.is_bot
+  SELECT users.id, users.username, users.avatar_url, users.public_key_jwk, users.key_fingerprint, users.custom_badges_json, users.is_bot, users.is_verified
   FROM conversation_members JOIN users ON users.id = conversation_members.user_id
   WHERE conversation_members.conversation_id = ? AND users.id != ? LIMIT 1
 `);
 const listConversations = database.prepare(`
   SELECT conversations.id, other_user.id AS user_id, other_user.username, other_user.bio, other_user.avatar_url,
-    other_user.public_key_jwk, other_user.key_fingerprint, other_user.name_style_json, other_user.custom_badges_json, other_user.is_bot,
+    other_user.public_key_jwk, other_user.key_fingerprint, other_user.name_style_json, other_user.custom_badges_json, other_user.is_bot, other_user.is_verified,
     last_message.body AS last_message_body, last_message.ciphertext AS last_message_ciphertext, last_message.created_at AS last_message_at,
     last_message.id AS preview_id, last_message.sender_id AS preview_sender_id,
     last_message.iv AS preview_iv, last_message.salt AS preview_salt,
@@ -978,48 +1002,50 @@ const listConversations = database.prepare(`
   LEFT JOIN blocks they_blocked ON they_blocked.blocker_id = other_user.id AND they_blocked.blocked_id = my_member.user_id
   LEFT JOIN conversation_pins pinned ON pinned.user_id = my_member.user_id AND pinned.conversation_id = conversations.id
   WHERE conversations.kind = 'direct'
+    AND NOT EXISTS (SELECT 1 FROM group_conversations g WHERE g.conversation_id = conversations.id)
   ORDER BY pinned DESC, COALESCE(last_message.created_at, conversations.created_at) DESC
 `);
 const setConversationPin = database.prepare('INSERT INTO conversation_pins (user_id, conversation_id, created_at) VALUES (?, ?, ?) ON CONFLICT(user_id, conversation_id) DO NOTHING');
 const clearConversationPin = database.prepare('DELETE FROM conversation_pins WHERE user_id = ? AND conversation_id = ?');
 const listMessages = database.prepare(`
-  SELECT messages.id, messages.body, messages.ciphertext, messages.iv, messages.salt, messages.sender_public_key, messages.recipient_public_key,
+  SELECT messages.id, messages.body, messages.ciphertext, messages.iv, messages.salt, messages.sender_public_key, messages.recipient_public_key, messages.group_keys_json,
     messages.client_message_id, messages.encryption_version, messages.created_at, messages.edited_at, messages.reply_to_message_id,
-    users.id AS sender_id, users.username AS sender_username, users.avatar_url AS sender_avatar_url, users.name_style_json AS sender_name_style_json, users.custom_badges_json AS sender_custom_badges_json,
+    users.id AS sender_id, users.username AS sender_username, users.avatar_url AS sender_avatar_url, users.name_style_json AS sender_name_style_json, users.custom_badges_json AS sender_custom_badges_json, users.is_verified AS sender_verified,
     reply.id AS reply_id, reply.body AS reply_body, reply.ciphertext AS reply_ciphertext, reply.deleted_at AS reply_deleted_at,
-    reply.encryption_version AS reply_encryption_version, reply_user.username AS reply_username,
+    reply.encryption_version AS reply_encryption_version, reply.group_keys_json AS reply_group_keys_json, reply_user.username AS reply_username,
     reply.iv AS reply_iv, reply.salt AS reply_salt, reply.sender_public_key AS reply_sender_key,
     reply.recipient_public_key AS reply_recipient_key, reply.client_message_id AS reply_client_id, reply.sender_id AS reply_sender_id
   FROM messages JOIN users ON users.id = messages.sender_id
   LEFT JOIN messages reply ON reply.id = messages.reply_to_message_id
   LEFT JOIN users reply_user ON reply_user.id = reply.sender_id
-  WHERE messages.conversation_id = ? AND messages.deleted_at IS NULL AND messages.id < ?
+  WHERE messages.conversation_id = ? AND messages.deleted_at IS NULL AND messages.id < ? AND messages.id > ?
   ORDER BY messages.id DESC LIMIT ?
 `);
 const listLatestMessages = database.prepare(`
-  SELECT messages.id, messages.body, messages.ciphertext, messages.iv, messages.salt, messages.sender_public_key, messages.recipient_public_key,
+  SELECT messages.id, messages.body, messages.ciphertext, messages.iv, messages.salt, messages.sender_public_key, messages.recipient_public_key, messages.group_keys_json,
     messages.client_message_id, messages.encryption_version, messages.created_at, messages.edited_at, messages.reply_to_message_id,
-    users.id AS sender_id, users.username AS sender_username, users.avatar_url AS sender_avatar_url, users.name_style_json AS sender_name_style_json, users.custom_badges_json AS sender_custom_badges_json,
+    users.id AS sender_id, users.username AS sender_username, users.avatar_url AS sender_avatar_url, users.name_style_json AS sender_name_style_json, users.custom_badges_json AS sender_custom_badges_json, users.is_verified AS sender_verified,
     reply.id AS reply_id, reply.body AS reply_body, reply.ciphertext AS reply_ciphertext, reply.deleted_at AS reply_deleted_at,
-    reply.encryption_version AS reply_encryption_version, reply_user.username AS reply_username,
+    reply.encryption_version AS reply_encryption_version, reply.group_keys_json AS reply_group_keys_json, reply_user.username AS reply_username,
     reply.iv AS reply_iv, reply.salt AS reply_salt, reply.sender_public_key AS reply_sender_key,
     reply.recipient_public_key AS reply_recipient_key, reply.client_message_id AS reply_client_id, reply.sender_id AS reply_sender_id
   FROM messages JOIN users ON users.id = messages.sender_id
   LEFT JOIN messages reply ON reply.id = messages.reply_to_message_id
   LEFT JOIN users reply_user ON reply_user.id = reply.sender_id
-  WHERE messages.conversation_id = ? AND messages.deleted_at IS NULL
+  WHERE messages.conversation_id = ? AND messages.deleted_at IS NULL AND messages.id > ?
   ORDER BY messages.id DESC LIMIT ?
 `);
 const insertMessage = database.prepare(`
-  INSERT INTO messages (conversation_id, sender_id, body, ciphertext, iv, salt, sender_public_key, recipient_public_key, client_message_id, encryption_version, created_at, reply_to_message_id)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO messages (id, conversation_id, sender_id, body, ciphertext, iv, salt, sender_public_key, recipient_public_key, client_message_id, encryption_version, created_at, reply_to_message_id)
+  VALUES ((SELECT last_id + 1 FROM dm_message_sequence WHERE singleton = 1), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
+const updateMessageGroupKeys = database.prepare('UPDATE messages SET group_keys_json = ? WHERE id = ?');
 const loadDirectMessageRow = database.prepare(`
-  SELECT messages.id, messages.body, messages.ciphertext, messages.iv, messages.salt, messages.sender_public_key, messages.recipient_public_key,
+  SELECT messages.id, messages.body, messages.ciphertext, messages.iv, messages.salt, messages.sender_public_key, messages.recipient_public_key, messages.group_keys_json,
     messages.client_message_id, messages.encryption_version, messages.created_at, messages.edited_at, messages.reply_to_message_id, messages.deleted_at,
-    users.id AS sender_id, users.username AS sender_username, users.avatar_url AS sender_avatar_url, users.name_style_json AS sender_name_style_json, users.custom_badges_json AS sender_custom_badges_json,
+    users.id AS sender_id, users.username AS sender_username, users.avatar_url AS sender_avatar_url, users.name_style_json AS sender_name_style_json, users.custom_badges_json AS sender_custom_badges_json, users.is_verified AS sender_verified,
     reply.id AS reply_id, reply.body AS reply_body, reply.ciphertext AS reply_ciphertext, reply.deleted_at AS reply_deleted_at,
-    reply.encryption_version AS reply_encryption_version, reply_user.username AS reply_username,
+    reply.encryption_version AS reply_encryption_version, reply.group_keys_json AS reply_group_keys_json, reply_user.username AS reply_username,
     reply.iv AS reply_iv, reply.salt AS reply_salt, reply.sender_public_key AS reply_sender_key,
     reply.recipient_public_key AS reply_recipient_key, reply.client_message_id AS reply_client_id, reply.sender_id AS reply_sender_id
   FROM messages JOIN users ON users.id = messages.sender_id
@@ -1046,9 +1072,9 @@ const listDirectMessageUploadsForUser = database.prepare(`
   SELECT DISTINCT message_attachments.storage_name
   FROM message_attachments
   JOIN conversation_members ON conversation_members.conversation_id = message_attachments.conversation_id
-  WHERE conversation_members.user_id = ?
+  WHERE conversation_members.user_id = ? AND NOT EXISTS (SELECT 1 FROM group_conversations g WHERE g.conversation_id = message_attachments.conversation_id)
 `);
-const deleteDirectConversationsForUser = database.prepare('DELETE FROM conversations WHERE id IN (SELECT conversation_id FROM conversation_members WHERE user_id = ?)');
+const deleteDirectConversationsForUser = database.prepare('DELETE FROM conversations WHERE id IN (SELECT conversation_id FROM conversation_members WHERE user_id = ?) AND NOT EXISTS (SELECT 1 FROM group_conversations g WHERE g.conversation_id = conversations.id)');
 const deleteDirectMessagePinsForUser = database.prepare('DELETE FROM conversation_pins WHERE user_id = ?');
 const markConversationRead = database.prepare(`
   UPDATE conversation_members SET last_read_message_id = CASE
@@ -1069,6 +1095,7 @@ const countAllDmUnread = database.prepare(`
   FROM messages
   JOIN conversation_members ON conversation_members.conversation_id = messages.conversation_id AND conversation_members.user_id = ?
   WHERE messages.sender_id != ? AND messages.deleted_at IS NULL AND messages.id > COALESCE(conversation_members.last_read_message_id, 0)
+    AND NOT EXISTS (SELECT 1 FROM user_conversation_mutes mute WHERE mute.user_id=conversation_members.user_id AND mute.conversation_id=messages.conversation_id)
 `);
 const countIncomingFriendRequests = database.prepare("SELECT COUNT(*) AS count FROM friend_requests WHERE receiver_id = ? AND status = 'pending'");
 const maxChannelMessageId = database.prepare('SELECT MAX(id) AS id FROM channel_messages WHERE channel_id = ? AND deleted_at IS NULL');
@@ -1133,6 +1160,11 @@ const listChannelUnreadsForServer = database.prepare(`
   LEFT JOIN channel_reads ON channel_reads.channel_id = server_channels.id AND channel_reads.user_id = ?
   WHERE server_channels.server_id = ? AND server_channels.voice = 0
 `);
+const listUnreadReadPositions = database.prepare('SELECT c.id, COALESCE(r.last_read_message_id, 0) AS last_read FROM server_channels c LEFT JOIN channel_reads r ON r.channel_id = c.id AND r.user_id = ? WHERE c.server_id = ? AND c.voice = 0');
+const countLiveAfter = database.prepare('SELECT COUNT(*) AS n FROM channel_messages WHERE channel_id = ? AND id > ? AND deleted_at IS NULL');
+const countOwnLiveAfter = database.prepare('SELECT COUNT(*) AS n FROM channel_messages WHERE channel_id = ? AND user_id = ? AND id > ? AND deleted_at IS NULL');
+// Start from this user's sparse mentions, not every retained channel message.
+const countMentionLiveAfter = database.prepare('SELECT COUNT(*) AS n FROM channel_message_mentions v CROSS JOIN channel_messages m ON m.id = v.message_id WHERE v.user_id = ? AND m.channel_id = ? AND v.message_id > ? AND m.deleted_at IS NULL AND m.user_id != ?');
 const insertAttachment = database.prepare(`
   INSERT INTO message_attachments (message_id, conversation_id, uploaded_by, storage_name, original_name, mime_type, size_bytes, encrypted, iv, salt, sender_public_key, recipient_public_key, created_at)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1144,7 +1176,9 @@ const listAttachmentsForMessage = database.prepare(`
 const findAttachmentForMember = database.prepare(`
   SELECT message_attachments.storage_name, message_attachments.original_name, message_attachments.mime_type, message_attachments.encrypted
   FROM message_attachments JOIN conversation_members ON conversation_members.conversation_id = message_attachments.conversation_id
+  JOIN messages ON messages.id = message_attachments.message_id
   WHERE message_attachments.id = ? AND conversation_members.user_id = ?
+    AND messages.deleted_at IS NULL AND messages.id > conversation_members.joined_after_message_id
 `);
 const listServers = database.prepare('SELECT servers.id, servers.name, servers.owner_id, servers.icon_url, servers.description, servers.banner_json, servers.created_at, servers.moderation_enabled, servers.is_public FROM servers JOIN server_members ON server_members.server_id = servers.id WHERE server_members.user_id = ? ORDER BY server_members.sort_order, servers.id');
 const listMutedServerIds = database.prepare('SELECT server_id FROM user_server_mutes WHERE user_id = ?');
@@ -1168,7 +1202,7 @@ const findServerMember = database.prepare('SELECT server_members.role_id, server
 const insertServerAudit = database.prepare('INSERT INTO server_audit_log (server_id, actor_user_id, actor_name, action, target_type, target_id, target_name, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
 const listServerAudit = database.prepare('SELECT id, actor_user_id AS actorUserId, actor_name AS actorName, action, target_type AS targetType, target_id AS targetId, target_name AS targetName, details_json AS detailsJson, created_at AS createdAt FROM server_audit_log WHERE server_id = ? AND id < ? ORDER BY id DESC LIMIT ?');
 const listServerMembers = database.prepare(`
-  SELECT users.id, users.username, users.avatar_url, users.bio, users.name_style_json, users.custom_badges_json, users.is_bot, server_members.role_id, server_roles.name AS role_name, server_roles.color AS role_color, server_roles.permissions, server_roles.permission_flags, server_timeouts.until AS timeout_until
+  SELECT users.id, users.username, users.avatar_url, users.bio, users.name_style_json, users.custom_badges_json, users.is_bot, users.is_verified, server_members.role_id, server_roles.name AS role_name, server_roles.color AS role_color, server_roles.permissions, server_roles.permission_flags, server_timeouts.until AS timeout_until
   FROM server_members
   JOIN users ON users.id = server_members.user_id
   JOIN server_roles ON server_roles.id = server_members.role_id
@@ -1177,7 +1211,7 @@ const listServerMembers = database.prepare(`
   ORDER BY server_roles.position DESC, users.username COLLATE NOCASE
 `);
 const listServerMembersPage = database.prepare(`
-  SELECT users.id, users.username, users.avatar_url, users.bio, users.name_style_json, users.custom_badges_json, users.is_bot, server_members.role_id, server_roles.name AS role_name, server_roles.color AS role_color, server_roles.permissions, server_roles.permission_flags, server_timeouts.until AS timeout_until
+  SELECT users.id, users.username, users.avatar_url, users.bio, users.name_style_json, users.custom_badges_json, users.is_bot, users.is_verified, server_members.role_id, server_roles.name AS role_name, server_roles.color AS role_color, server_roles.permissions, server_roles.permission_flags, server_timeouts.until AS timeout_until
   FROM server_members
   JOIN users ON users.id = server_members.user_id
   JOIN server_roles ON server_roles.id = server_members.role_id
@@ -1189,6 +1223,7 @@ const listServerMembersPage = database.prepare(`
 const countServerMembers = database.prepare('SELECT COUNT(*) AS count FROM server_members WHERE server_id = ?');
 const countServerMembersByRole = database.prepare('SELECT role_id AS roleId, COUNT(*) AS count FROM server_members WHERE server_id = ? GROUP BY role_id');
 const listServerMemberIds = database.prepare('SELECT DISTINCT user_id FROM server_members WHERE server_id = ?');
+const listServerMentionNames = database.prepare('SELECT users.id, users.username FROM server_members JOIN users ON users.id = server_members.user_id WHERE server_members.server_id = ?');
 const listServerChannels = database.prepare("SELECT server_channels.id, name, kind, voice, position, category_id, channel_kind, locked, slowmode, topic, cleanup.interval_seconds AS cleanup_interval_seconds, cleanup.next_run_at AS cleanup_next_run_at, bot_channels.active AS nura_active FROM server_channels LEFT JOIN channel_message_cleanup_schedules cleanup ON cleanup.channel_id = server_channels.id LEFT JOIN server_bot_channels bot_channels ON bot_channels.channel_id = server_channels.id AND bot_channels.bot_key = 'nura' WHERE server_channels.server_id = ? ORDER BY position, server_channels.id");
 const listNuraServerHistory = database.prepare(`
   SELECT channel_messages.body, channel_messages.user_id, users.username, users.is_bot
@@ -1206,8 +1241,8 @@ const upsertNuraChannelActivation = database.prepare("INSERT INTO server_bot_cha
 const getNuraChannelActivation = database.prepare("SELECT active FROM server_bot_channels WHERE channel_id = ? AND bot_key = 'nura'");
 const listServerRoles = database.prepare('SELECT id, name, color, permissions, permission_flags, position FROM server_roles WHERE server_id = ? ORDER BY position DESC, id');
 const channelMessageSelect = `
-  SELECT channel_messages.id, channel_messages.body, channel_messages.created_at, channel_messages.edited_at, channel_messages.reply_to_message_id, channel_messages.poll_json,
-    users.id AS user_id, users.username, users.avatar_url, users.bio, users.name_style_json, users.custom_badges_json, users.is_bot,
+  SELECT channel_messages.id, channel_messages.channel_id, channel_messages.body, channel_messages.created_at, channel_messages.edited_at, channel_messages.reply_to_message_id, channel_messages.poll_json,
+    users.id AS user_id, users.username, users.avatar_url, users.bio, users.name_style_json, users.custom_badges_json, users.is_bot, users.is_verified,
     reply.id AS reply_id, reply.body AS reply_body, reply.deleted_at AS reply_deleted_at, reply.poll_json AS reply_poll_json, reply_user.username AS reply_username
   FROM channel_messages
   JOIN users ON users.id = channel_messages.user_id
@@ -1313,9 +1348,6 @@ const isChannelMember = database.prepare('SELECT 1 FROM server_members JOIN serv
 const findChannel = database.prepare('SELECT server_channels.id, server_channels.server_id, server_channels.name, server_channels.voice, server_channels.position, server_channels.category_id, server_channels.channel_kind, server_channels.locked, server_channels.slowmode, server_channels.topic, servers.moderation_enabled FROM server_channels JOIN servers ON servers.id = server_channels.server_id WHERE server_channels.id = ?');
 const updateChannelCategory = database.prepare('UPDATE server_channels SET category_id = ? WHERE id = ? AND server_id = ?');
 const officialAnnouncements = createOfficialAnnouncements(database);
-function isOfficialServerHidden() {
-  return readPlatformSetting.get('official_server_hidden')?.value === '1';
-}
 const findLastChannelMessageAt = database.prepare('SELECT created_at FROM channel_messages WHERE channel_id = ? AND user_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1');
 const updateChannelSettings = database.prepare('UPDATE server_channels SET name = ?, topic = ?, locked = ?, slowmode = ?, channel_kind = ?, voice = ? WHERE id = ? AND server_id = ?');
 const findServerTimeout = database.prepare('SELECT until FROM server_timeouts WHERE server_id = ? AND user_id = ?');
@@ -1530,7 +1562,6 @@ function listPlatformAdminIds() {
 }
 
 function canSeeServer(user, serverId) {
-  if (officialAnnouncements.isServer(serverId) && isOfficialServerHidden()) return false;
   return Boolean(isServerMember.get(serverId, user.id) || (isPlatformAdmin(user) && findServerById.get(serverId)));
 }
 
@@ -1542,7 +1573,7 @@ function serverDeviceHash(request, serverId) {
 
 function canSeeChannel(user, channelId) {
   const channel = findChannel.get(channelId);
-  if (!channel || (officialAnnouncements.isServer(channel.server_id) && isOfficialServerHidden())) return false;
+  if (!channel) return false;
   if (isChannelMember.get(channelId, user.id)) return true;
   if (!isPlatformAdmin(user)) return false;
   return true;
@@ -1637,6 +1668,8 @@ function timeoutUntilFor(serverId, userId) {
 }
 
 function postingBlockReason(user, channelRecord, { skipSlowmode = false } = {}) {
+  const restriction = messageReports?.getRestriction(user.id);
+  if (restriction) return `Your account is restricted until ${restriction.until}. ${restriction.reason}`;
   if (!channelRecord) return 'Channel not found.';
   if (channelRecord.voice) return 'Voice channels do not have messages.';
   const serverId = Number(channelRecord.server_id);
@@ -2017,6 +2050,7 @@ function publicAccount(user) {
     conductVersion: CONDUCT_VERSION,
     email: user.email,
     username: user.username || null,
+    verified: Number(user.is_verified) === 1,
     bio: user.bio || '',
     customBadges: publicCustomBadges(user.custom_badges_json),
     privateNotesEnabled: user.private_notes_enabled !== 0,
@@ -2036,6 +2070,10 @@ function publicAccount(user) {
     discordUsername: publicDiscordUsername(user.discord_username),
     socialLinks: { instagram: user.instagram_url || null, instagramUsername: user.instagram_username || null, tiktok: user.tiktok_url || null, tiktokUsername: user.tiktok_username || null },
     socialPromptSeen: Boolean(user.social_prompt_seen),
+    surveyCompleted: Boolean(user.feedback_survey_completed_at),
+    canViewSurveyResults: isNuperAdmin(user),
+    canReviewReports: Boolean(messageReports?.canReview(user)),
+    restriction: messageReports?.getRestriction(user.id) || null,
     badges: publicUserBadges(user),
     platformAdmin: isPlatformAdmin(user),
     e2ee: { enabled: Boolean(user.public_key_jwk), fingerprint: user.key_fingerprint || null },
@@ -2052,6 +2090,7 @@ function publicAccount(user) {
       glassDepth: Number(user.accessibility_glass_depth ?? 20),
       glassRefraction: Number(user.accessibility_glass_refraction ?? 100),
       theme: ['system', 'light', 'dark'].includes(user.accessibility_theme) ? user.accessibility_theme : 'system',
+      showLoopStreakReminder: user.accessibility_loop_streak_reminder == null ? true : Boolean(Number(user.accessibility_loop_streak_reminder)),
     },
   };
 }
@@ -2234,6 +2273,7 @@ function publicServerMember(item) {
   return {
     id: Number(item.id),
     username: item.username,
+    verified: Number(item.is_verified) === 1,
     avatarUrl: item.avatar_url || null,
     bio: item.bio || '',
     nameStyle: publicNameStyle(item.name_style_json),
@@ -2285,10 +2325,15 @@ function publicPresence(userId) {
   }
 }
 
-function presenceAudience(userId) {
+function presenceAudience(userId, memberCache = null) {
   const ids = presenceDirectAudience(userId);
   for (const server of listServers.all(userId)) {
-    for (const member of listServerMemberIds.all(server.id)) ids.add(Number(member.user_id));
+    let members = memberCache?.get(server.id);
+    if (!members) {
+      members = listServerMemberIds.all(server.id);
+      memberCache?.set(server.id, members);
+    }
+    for (const member of members) ids.add(Number(member.user_id));
   }
   ids.delete(Number(userId));
   return ids;
@@ -2318,7 +2363,7 @@ function broadcastPresence(userId) {
   loopService.presence.invalidate(userId);
   sendEvent(userId, 'presence', presencePayload(userId, userId));
   const payload = presencePayload(userId);
-  broadcastEvent(presenceAudience(userId), 'presence', payload);
+  presenceBatch.enqueue(userId, payload);
 }
 
 function syncPresenceFor(userId) {
@@ -2407,9 +2452,10 @@ function mentionedUserIdsFromBody(body, members) {
 
 function syncChannelMentions(messageId, channelId, body) {
   deleteChannelMentions.run(messageId);
+  if (!String(body || '').includes('@')) return;
   const channelRecord = findChannel.get(channelId);
   if (!channelRecord || channelRecord.voice) return;
-  const members = listServerMembers.all(channelRecord.server_id);
+  const members = listServerMentionNames.all(channelRecord.server_id);
   for (const userId of mentionedUserIdsFromBody(body, members)) insertChannelMention.run(messageId, userId);
 }
 
@@ -2454,8 +2500,25 @@ function channelUnreadMapForServer(userId, serverId) {
   return channels;
 }
 
-function serverUnreadSummaryForUser(userId, serverId) {
-  const channels = channelUnreadMapForServer(userId, serverId);
+function serverUnreadSummaryForUser(userId, serverId, sharedCounts) {
+  let channels;
+  if (sharedCounts) {
+    channels = new Map();
+    if (!findServerMute.get(userId, Number(serverId))) {
+      for (const row of listUnreadReadPositions.all(userId, serverId)) {
+        const key = `${row.id}:${row.last_read}`;
+        let total = sharedCounts.get(key);
+        if (total === undefined) {
+          total = Number(countLiveAfter.get(row.id, row.last_read).n);
+          if (sharedCounts.size < 8192) sharedCounts.set(key, total);
+        }
+        channels.set(Number(row.id), {
+          unreadCount: total - Number(countOwnLiveAfter.get(row.id, userId, row.last_read).n),
+          mentionCount: Number(countMentionLiveAfter.get(userId, row.id, row.last_read, userId).n),
+        });
+      }
+    }
+  } else channels = channelUnreadMapForServer(userId, serverId);
   const summary = { unread: false, unreadCount: 0, mentionCount: 0 };
   for (const unread of channels.values()) {
     summary.unread = summary.unread || unread.unreadCount > 0;
@@ -2515,36 +2578,48 @@ function applyChannelRead(channelId, userId, messageId) {
   return true;
 }
 
+const channelMessageFanout = createMessageFanoutQueue(deliverChannelMessageBatch, { onError(error) {
+  console.error('Channel message fanout failed:', error.message);
+  realtimeHub.closeAll(1011, 'Message sync failed; reconnect');
+  for (const clients of eventClients.values()) for (const client of clients) client.end();
+} });
+
 function notifyChannelMessageCreated(serverId, payload, senderId) {
+  channelMessageFanout.enqueue(Number(serverId), { prepared: realtimeHub.prepareEvent('channel-message', payload), payload, senderId });
+}
+
+function deliverChannelMessageBatch(serverId, items) {
   const seen = new Set();
+  // Counts are shared only within this synchronous flush, never across writes or reads.
+  const sharedCounts = new Map();
   for (const member of listServerMemberIds.all(serverId)) {
     const userId = Number(member.user_id);
     seen.add(userId);
     if (!hasLiveEventClient(userId)) continue;
-    const isSender = userId === Number(senderId);
-    const { channels, summary } = serverUnreadSummaryForUser(userId, serverId);
-    const channel = channels.get(Number(payload.channelId)) || { unreadCount: 0, mentionCount: 0 };
-    sendEvent(userId, 'channel-message', unreadStateFor(userId, {
-      ...payload,
-      unreadCount: isSender ? 0 : channel.unreadCount,
-      mentionCount: isSender ? 0 : channel.mentionCount,
-      serverUnread: summary.unread,
-      serverUnreadCount: summary.unreadCount,
-      serverMentionCount: summary.mentionCount,
-      mentioned: !isSender && channel.mentionCount > 0,
-    }));
+    const { channels, summary } = serverUnreadSummaryForUser(userId, serverId, sharedCounts);
+    for (const { prepared, payload, senderId } of items) {
+      const isSender = userId === Number(senderId);
+      const channel = channels.get(Number(payload.channelId)) || { unreadCount: 0, mentionCount: 0 };
+      sendPreparedEvent(userId, prepared, {
+        unreadCount: isSender ? 0 : channel.unreadCount,
+        mentionCount: isSender ? 0 : channel.mentionCount,
+        serverUnread: summary.unread,
+        serverUnreadCount: summary.unreadCount,
+        serverMentionCount: summary.mentionCount,
+        mentioned: !isSender && channel.mentionCount > 0,
+      });
+    }
   }
   for (const userId of listPlatformAdminIds()) {
     if (seen.has(userId) || !hasLiveEventClient(userId)) continue;
-    sendEvent(userId, 'channel-message', unreadStateFor(userId, {
-      ...payload,
+    for (const { prepared } of items) sendPreparedEvent(userId, prepared, {
       unreadCount: 0,
       mentionCount: 0,
       serverUnread: false,
       serverUnreadCount: 0,
       serverMentionCount: 0,
       mentioned: false,
-    }));
+    });
   }
 }
 
@@ -2553,12 +2628,17 @@ function emitFriends(userId, type) {
 }
 
 function notifyDirectMessage(conversationId, message, senderId, action = 'created') {
+  const prepared = realtimeHub.prepareEvent('message', {
+    conversationId,
+    action,
+    message: action === 'deleted' ? { id: Number(message.id) } : message,
+  });
   for (const member of listConversationMemberIds.all(conversationId)) {
     const userId = Number(member.user_id);
-    sendEvent(userId, 'message', unreadStateFor(userId, {
-      conversationId,
-      action,
-      message: action === 'deleted' ? { id: Number(message.id) } : message,
+    if (!hasLiveEventClient(userId)) continue;
+    const hiddenReply = message.replyTo && message.replyTo.id <= groupDms.historyStart(conversationId, userId);
+    sendPreparedEvent(userId, prepared, unreadStateFor(userId, {
+      ...(hiddenReply ? { message: { ...message, replyTo: { id: message.replyTo.id, body: '', deleted: true } } } : {}),
       unreadCount: userId === Number(senderId) ? 0 : conversationUnreadCount(conversationId, userId),
     }));
   }
@@ -2580,6 +2660,14 @@ function sendEvent(userId, event, payload) {
   for (const client of clients) client.write(message);
 }
 
+function sendPreparedEvent(userId, prepared, extra) {
+  realtimeHub.sendPrepared(userId, prepared, extra);
+  const clients = eventClients.get(Number(userId));
+  if (!clients?.size) return;
+  const message = `event: ${prepared.event}\ndata: ${JSON.stringify({ ...prepared.payload, ...extra })}\n\n`;
+  for (const client of clients) client.write(message);
+}
+
 function hasLiveEventClient(userId) {
   const id = Number(userId);
   return realtimeHub.connectedCount(id) > 0 || Boolean(eventClients.get(id)?.size);
@@ -2591,15 +2679,19 @@ function broadcastEvent(userIds, event, payload) {
     .filter((id) => Number.isSafeInteger(id) && id > 0 && hasLiveEventClient(id)));
   if (!ids.size) return;
   realtimeHub.broadcast(ids, event, payload);
-  const message = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
+  let message;
   for (const userId of ids) {
     const clients = eventClients.get(userId);
     if (!clients) continue;
+    message ??= `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
     for (const client of clients) client.write(message);
   }
 }
 
-const pushService = createPushService({ database, dataDirectory });
+const notificationPreferences = createNotificationPreferences({ database, requireUser: requireSignedInUser, readJson, sendJson, sendEvent,
+  onConversationMute: (userId, conversationId) => sendEvent(userId, 'unread', unreadStateFor(userId, { kind: 'dm', conversationId, unreadCount: conversationUnreadCount(conversationId, userId) })),
+  channelVisible: (userId, channelId) => { const user = findUserById.get(userId); return Boolean(user && canSeeChannel(user, channelId)); } });
+const pushService = createPushService({ database, dataDirectory, canNotify: notificationPreferences.canNotify });
 createScheduledNotifications({ database, pushService }).start();
 
 function previewText(value, fallback) {
@@ -2612,8 +2704,9 @@ function pushConversationMembers(conversationId, payload, exceptUserId) {
   pushService.notifyUsers(listConversationMemberIds.all(conversationId).map((row) => row.user_id), payload, exceptUserId);
 }
 
+const listServerPushRecipients = database.prepare('SELECT DISTINCT m.user_id FROM server_members m JOIN push_subscriptions p ON p.user_id = m.user_id LEFT JOIN user_server_mutes mute ON mute.user_id = m.user_id AND mute.server_id = m.server_id WHERE m.server_id = ? AND mute.user_id IS NULL');
 function pushServerMembers(serverId, payload, exceptUserId) {
-  pushService.notifyUsers(listServerMemberIds.all(serverId).map((row) => row.user_id), payload, exceptUserId);
+  pushService.notifyUsers(listServerPushRecipients.all(serverId).map((row) => row.user_id), payload, exceptUserId);
 }
 
 function publicVoiceMember(member) {
@@ -2694,6 +2787,7 @@ function publicCallUser(userId) {
   return {
     id: Number(row.id),
     username: row.username,
+    verified: Number(row.is_verified) === 1,
     avatarUrl: row.avatar_url || null,
     nameStyle: publicNameStyle(row.name_style_json),
     customBadges: publicCustomBadges(row.custom_badges_json),
@@ -2739,6 +2833,10 @@ function handleDmCallEvent(user, message, socket) {
     return;
   }
   const peerId = conversationPeerId(conversationId, user.id);
+  if (groupDms.isGroup(conversationId)) {
+    sendEvent(user.id, 'dm-call-error', { conversationId, error: 'Voice calls are available in one-to-one DMs only.' });
+    return;
+  }
   if (!peerId || peerId === Number(user.id)) {
     sendEvent(user.id, 'dm-call-error', { conversationId, error: 'You can only call one person in a DM.' });
     return;
@@ -2970,6 +3068,11 @@ const realtimeHub = createRealtimeHub({
     setTimeout(() => broadcastPresence(user.id), 0);
   },
   onClientEvent(user, message, _reply, socket) {
+    const restriction = messageReports?.getRestriction(user.id);
+    if (restriction && !['voice-leave', 'dm-call-hangup'].includes(message?.event)) {
+      _reply('account-restricted', restriction);
+      return;
+    }
     if (loopRoutesEnabled && loopService.presence.handle(user, message, socket)) return;
     if (String(message?.event || '').startsWith('app-')) {
       appService.handleClientEvent(user, message, socket);
@@ -3048,9 +3151,8 @@ const realtimeHub = createRealtimeHub({
       const channelId = Number(message?.payload?.channelId);
       const channelRecord = findChannel.get(channelId);
       if (!channelRecord || channelRecord.voice || !isChannelMember.get(channelId, user.id)) return;
-      for (const member of listServerMemberIds.all(channelRecord.server_id)) {
-        if (Number(member.user_id) !== Number(user.id)) sendEvent(member.user_id, 'channel-typing', { serverId: Number(channelRecord.server_id), channelId, userId: Number(user.id), username: user.username, typing: message?.payload?.typing === true });
-      }
+      const audience = listServerMemberIds.all(channelRecord.server_id).map(member => Number(member.user_id)).filter(id => id !== Number(user.id));
+      broadcastEvent(audience, 'channel-typing', { serverId: Number(channelRecord.server_id), channelId, userId: Number(user.id), username: user.username, typing: message?.payload?.typing === true });
       return;
     }
     if (message?.event !== 'typing') return;
@@ -3063,9 +3165,16 @@ const realtimeHub = createRealtimeHub({
   },
 });
 
+const presenceBatch = createPresenceBatch({
+  audienceFor: presenceAudience,
+  isConnected: hasLiveEventClient,
+  send: sendEvent,
+});
+
 const videoDownloadService = createVideoDownloadService({ dataDirectory, sendJson, readJson, requireSignedInUser, sendLocalFile, takeRateLimit });
 const loopService = createLoopService({
   database,
+  pushService,
   uploadDirectory,
   parseMultipart,
   sendLocalFile,
@@ -3087,6 +3196,8 @@ setInterval(() => {
 }, 15_000).unref?.();
 
 function notifyServerMembers(serverId, event, payload) {
+  // A later edit/delete/clear must never overtake queued message creation.
+  channelMessageFanout.flush();
   const recipients = new Set(listServerMemberIds.all(serverId).map((member) => Number(member.user_id)));
   for (const userId of listPlatformAdminIds()) recipients.add(Number(userId));
   broadcastEvent(recipients, event, payload);
@@ -3215,6 +3326,7 @@ function notifyChannelPoll(serverId, channelId, messageId) {
   for (const member of listServerMemberIds.all(serverId)) {
     const userId = Number(member.user_id);
     seen.add(userId);
+    if (!hasLiveEventClient(userId)) continue;
     sendEvent(userId, 'channel-message', {
       serverId: Number(serverId),
       channelId: Number(channelId),
@@ -3223,7 +3335,7 @@ function notifyChannelPoll(serverId, channelId, messageId) {
     });
   }
   for (const userId of listPlatformAdminIds()) {
-    if (seen.has(userId)) continue;
+    if (seen.has(userId) || !hasLiveEventClient(userId)) continue;
     sendEvent(userId, 'channel-message', {
       serverId: Number(serverId),
       channelId: Number(channelId),
@@ -3249,11 +3361,12 @@ function channelReplySnippet(message) {
 function channelMessagePayload(message, reactions = [], attachments = [], votes = [], viewerId = null) {
   return {
     id: Number(message.id),
+    channelId: Number(message.channel_id),
     body: message.body,
     createdAt: message.created_at,
     editedAt: message.edited_at || null,
     replyTo: channelReplySnippet(message),
-    author: { id: Number(message.user_id), username: message.username, avatarUrl: message.avatar_url || null, bio: message.bio || '', isBot: Boolean(Number(message.is_bot)), nameStyle: publicNameStyle(message.name_style_json), customBadges: publicCustomBadges(message.custom_badges_json) },
+    author: { id: Number(message.user_id), username: message.username, verified: Number(message.is_verified) === 1, avatarUrl: message.avatar_url || null, bio: message.bio || '', isBot: Boolean(Number(message.is_bot)), nameStyle: publicNameStyle(message.name_style_json), customBadges: publicCustomBadges(message.custom_badges_json) },
     reactions: reactions.map((reaction) => ({ emoji: reaction.emoji, count: Number(reaction.count), reacted: Boolean(reaction.reacted) })),
     attachments: attachments.map(channelAttachmentPayload),
     poll: publicPoll(message.poll_json, votes, viewerId),
@@ -3272,7 +3385,7 @@ function dmReplySnippet(row) {
     encrypted: !deleted && encrypted,
     clientMessageId: row.reply_client_id,
     sender: { id: Number(row.reply_sender_id) },
-    crypto: !deleted && encrypted ? { version: 1, ciphertext: row.reply_ciphertext, iv: row.reply_iv, salt: row.reply_salt,
+    crypto: !deleted && encrypted ? { version: Number(row.reply_encryption_version || 1), recipientKeys: safeJsonParse(row.reply_group_keys_json), ciphertext: row.reply_ciphertext, iv: row.reply_iv, salt: row.reply_salt,
       senderPublicKey: safeJsonParse(row.reply_sender_key), recipientPublicKey: safeJsonParse(row.reply_recipient_key) } : null,
   };
 }
@@ -3292,11 +3405,12 @@ function directMessagePayload(row, attachments) {
       salt: row.salt,
       senderPublicKey: safeJsonParse(row.sender_public_key),
       recipientPublicKey: safeJsonParse(row.recipient_public_key),
+      recipientKeys: safeJsonParse(row.group_keys_json),
     } : null,
     createdAt: row.created_at,
     editedAt: row.edited_at || null,
     replyTo: dmReplySnippet(row),
-    sender: { id: Number(row.sender_id), username: row.sender_username, avatarUrl: row.sender_avatar_url || null, nameStyle: publicNameStyle(row.sender_name_style_json), customBadges: publicCustomBadges(row.sender_custom_badges_json) },
+    sender: { id: Number(row.sender_id), username: row.sender_username, verified: Number(row.sender_verified) === 1, avatarUrl: row.sender_avatar_url || null, nameStyle: publicNameStyle(row.sender_name_style_json), customBadges: publicCustomBadges(row.sender_custom_badges_json) },
     attachments: files.map(attachmentPayload),
   };
 }
@@ -3530,6 +3644,24 @@ const handleServerModel = createServerModelService({
   audit: (id, user, planId, results) => writeServerAudit(id, user, 'model.changes-applied', { targetType: 'server', targetId: id, targetName: findServerById.get(id)?.name || '', details: { planId, results } }),
 });
 
+messageReports = createMessageReports({
+  database, requireUser: requireSignedInUser, readJson, sendJson,
+  isReviewer: user => {
+    if (isNuperAdmin(user)) return true;
+    const id = officialAnnouncements.getServerId();
+    const member = id ? findServerMember.get(id, user.id) : null;
+    return Boolean(member && ['owner', 'moderator'].includes(member.permissions));
+  },
+  isProtected: id => isNuperAdmin(findUserById.get(id)),
+  channelVisible: (user, id) => canSeeChannel(user, id),
+  historyStart: (id, userId) => groupDms.historyStart(id, userId),
+  onBlock: (userId, targetId) => { removeFriendship(userId, targetId); emitFriends(userId, 'blocked'); emitFriends(targetId, 'removed'); },
+  onRestrict: (id, restriction) => {
+    for (const channelId of leaveVoiceRooms(id)) sendEvent(id, 'voice-disconnected', { serverId: findChannel.get(channelId)?.server_id, channelId });
+    leaveDmCalls(id, 'restricted'); sendEvent(id, 'account-restricted', restriction);
+  },
+});
+
 async function answerWithNura(conversationId, userId, imageFiles) {
   const sendTyping = (typing) => {
     sendEvent(userId, 'typing', { conversationId, userId: NURA_USER_ID, username: 'Nura', typing });
@@ -3674,6 +3806,18 @@ async function handleApi(request, response) {
   deleteExpiredTimeouts.run(now);
   pruneRateLimits();
 
+  const restriction = user && messageReports.getRestriction(user.id);
+  const restrictionSafe = ['/api/auth/signin', '/api/auth/signup', '/api/auth/signout'].includes(path) || path.startsWith('/api/e2ee/')
+    || ['/api/account/password', '/api/account/agreements', '/api/account/sessions/others', '/api/message-reports', '/api/blocks'].includes(path)
+    || /^\/api\/account\/sessions\//.test(path) || /\/read$/.test(path) || (path === '/api/account' && method === 'DELETE')
+    || path === '/api/account/notifications' || /^\/api\/conversations\/\d+\/mute$/.test(path) || /^\/api\/servers\/\d+\/mute$/.test(path) || /^\/api\/conversations\/\d+\/group\/leave$/.test(path);
+  if (restriction && !['GET', 'HEAD', 'OPTIONS'].includes(method) && !restrictionSafe) {
+    return sendJson(response, 403, { error: `Your account is restricted until ${restriction.until}. ${restriction.reason}`, restriction });
+  }
+  if (path === '/api/account/restriction' && method === 'GET') return sendJson(response, user ? 200 : 401, user ? { restriction } : { error: 'Not signed in.' });
+  if (await messageReports.handle(request, response, path, method)) return;
+  if (await notificationPreferences.handle(request, response, path, method)) return;
+
   if (await handleMainThemes(request, response, path, method)) return;
 
   if ((path === '/api' || path === '/api/v1') && method === 'GET') {
@@ -3708,14 +3852,6 @@ async function handleApi(request, response) {
       iceServers.push({ urls: GLEAN_TURN_URLS, username, credential });
     }
     return sendJson(response, 200, { iceServers, credentialExpiresAt: GLEAN_TURN_URLS.length && GLEAN_TURN_SECRET ? expiresAt : null });
-  }
-  if (path === '/api/announcement' && method === 'GET') {
-    const announcement = currentAnnouncement();
-    return sendJson(response, 200, {
-      enabled: announcement.enabled,
-      message: announcement.enabled ? announcement.message : '',
-      profile: announcement.profile,
-    });
   }
   if (method === 'GET' && path === '/api/gifs/search') {
     const user = requireSignedInUser(request, response);
@@ -3771,94 +3907,8 @@ async function handleApi(request, response) {
   if (retryAfter) return sendJson(response, 429, { error: 'Too many requests. Try again shortly.' }, { 'Retry-After': String(retryAfter) });
 
   if (await handleServerModel(request, response, path, method, user)) return;
+  if (await handleFeedbackSurvey(request, response, path, method)) return;
   if (await serverCategories.handle(request, response, path, method, user)) return;
-
-  if (path === '/api/admin/access') {
-    const admin = requireSignedInUser(request, response);
-    if (!admin) return;
-    if (!isNuperAdmin(admin)) return sendJson(response, 403, { error: 'Only the Nuper account can change platform access settings.' });
-    if (method === 'GET') return sendJson(response, 200, { schoolHoursAllowed: isSchoolHoursAllowed(), offlineScreenEnabled: isOfflineScreenMode() });
-    if (method !== 'PATCH') return sendJson(response, 405, { error: 'Method not allowed.' }, { Allow: 'GET, PATCH' });
-    let input;
-    try { input = await readJson(request, 1024); } catch (error) { return sendJson(response, 400, { error: error.message }); }
-    const allowedKeys = new Set(['schoolHoursAllowed', 'offlineScreenEnabled']);
-    const keys = Object.keys(input || {});
-    if (!keys.length || keys.some((key) => !allowedKeys.has(key)) || keys.some((key) => typeof input[key] !== 'boolean')) {
-      return sendJson(response, 400, { error: 'Provide schoolHoursAllowed and/or offlineScreenEnabled as true or false.' });
-    }
-    if (Object.hasOwn(input, 'schoolHoursAllowed')) writePlatformSetting.run('allow_school_hours', input.schoolHoursAllowed ? '1' : '0');
-    if (Object.hasOwn(input, 'offlineScreenEnabled')) writePlatformSetting.run('offline_screen_mode', input.offlineScreenEnabled ? '1' : '0');
-    if (input.offlineScreenEnabled === true) realtimeHub.closeAll(1001, 'Glean is temporarily unavailable');
-    const nextAccess = currentSchoolAccess();
-    if (previousAccessAvailable && !nextAccess.available) {
-      realtimeHub.broadcastAll('school-access-blocked', { nextOpenAt: nextAccess.nextOpenAt });
-      realtimeHub.closeAll(1008, nextAccess.offlineScreen ? 'Glean is temporarily unavailable' : 'Glean is blocked during school hours');
-    }
-    previousAccessAvailable = nextAccess.available;
-    return sendJson(response, 200, { schoolHoursAllowed: isSchoolHoursAllowed(), offlineScreenEnabled: isOfflineScreenMode() });
-  }
-
-  if (path === '/api/admin/official-server') {
-    const admin = requireSignedInUser(request, response);
-    if (!admin) return;
-    if (!isNuperAdmin(admin)) return sendJson(response, 403, { error: 'Only the Nuper account can hide the official server.' });
-    if (method === 'GET') return sendJson(response, 200, { hidden: isOfficialServerHidden() });
-    if (method !== 'PATCH') return sendJson(response, 405, { error: 'Method not allowed.' }, { Allow: 'GET, PATCH' });
-    let input;
-    try { input = await readJson(request, 1024); } catch (error) { return sendJson(response, 400, { error: error.message }); }
-    if (typeof input.hidden !== 'boolean') return sendJson(response, 400, { error: 'Hidden must be true or false.' });
-    writePlatformSetting.run('official_server_hidden', input.hidden ? '1' : '0');
-    const serverId = officialAnnouncements.ensureAll();
-    if (serverId) {
-      realtimeHub.broadcastAll('official-server-visibility', { serverId, hidden: input.hidden });
-      if (input.hidden) closeVoiceRoomsForServer(serverId);
-    }
-    return sendJson(response, 200, { hidden: isOfficialServerHidden() });
-  }
-
-  if (path === '/api/admin/announcement') {
-    const admin = requireSignedInUser(request, response);
-    if (!admin) return;
-    if (!isNuperAdmin(admin)) return sendJson(response, 403, { error: 'Only the Nuper account can manage site announcements.' });
-    if (method === 'GET') return sendJson(response, 200, currentAnnouncement());
-    if (method !== 'PATCH') return sendJson(response, 405, { error: 'Method not allowed.' }, { Allow: 'GET, PATCH' });
-    let input;
-    try { input = await readJson(request, 4096); } catch (error) { return sendJson(response, 400, { error: error.message }); }
-    const keys = Object.keys(input || {});
-    const allowedKeys = new Set(['message', 'enabled']);
-    if (!keys.length || keys.some((key) => !allowedKeys.has(key))) return sendJson(response, 400, { error: 'Only message and enabled can be changed.' });
-    const current = currentAnnouncement();
-    const message = Object.hasOwn(input, 'message') ? String(input.message).trim() : current.message;
-    const enabled = Object.hasOwn(input, 'enabled') ? input.enabled : current.enabled;
-    if (Object.hasOwn(input, 'message') && (typeof input.message !== 'string' || message.length > 2000)) return sendJson(response, 400, { error: 'Announcement messages must be 2000 characters or fewer.' });
-    if (Object.hasOwn(input, 'enabled') && typeof input.enabled !== 'boolean') return sendJson(response, 400, { error: 'Enabled must be true or false.' });
-    if (enabled && !message) return sendJson(response, 400, { error: 'Enter a message before showing the announcement.' });
-    writePlatformSetting.run('announcement_message', message);
-    writePlatformSetting.run('announcement_enabled', enabled ? '1' : '0');
-    const updated = currentAnnouncement();
-    realtimeHub.broadcastAll('platform-announcement-updated', {
-      enabled: updated.enabled,
-      message: updated.enabled ? updated.message : '',
-      profile: updated.profile,
-    });
-    return sendJson(response, 200, updated);
-  }
-
-  if (path === '/api/admin/maintenance') {
-    const admin = requireSignedInUser(request, response);
-    if (!admin) return;
-    if (!isPlatformAdmin(admin)) return sendJson(response, 403, { error: 'Only platform admins can control maintenance mode.' });
-    if (method === 'GET') return sendJson(response, 200, { enabled: isMaintenanceMode() });
-    if (method !== 'PATCH') return sendJson(response, 405, { error: 'Method not allowed.' }, { Allow: 'GET, PATCH' });
-    let input;
-    try { input = await readJson(request, 1024); } catch (error) { return sendJson(response, 400, { error: error.message }); }
-    if (typeof input.enabled !== 'boolean') return sendJson(response, 400, { error: 'Enabled must be true or false.' });
-    writePlatformSetting.run('maintenance_mode', input.enabled ? '1' : '0');
-    if (input.enabled) {
-      for (const user of listUsersForAdmin.all()) sendEvent(user.id, 'maintenance', { active: true });
-    }
-    return sendJson(response, 200, { enabled: input.enabled });
-  }
 
   if (method === 'POST' && path === '/api/error-reports') {
     const input = await readJson(request, 24 * 1024);
@@ -4112,7 +4162,7 @@ async function handleApi(request, response) {
 
     const accountId = Number(account.id);
     const deletedAt = new Date().toISOString();
-    const directConversationIds = database.prepare('SELECT conversation_id FROM conversation_members WHERE user_id = ?').all(accountId).map((row) => Number(row.conversation_id));
+    const directConversationIds = database.prepare('SELECT conversation_id FROM conversation_members WHERE user_id = ? AND NOT EXISTS (SELECT 1 FROM group_conversations g WHERE g.conversation_id = conversation_members.conversation_id)').all(accountId).map((row) => Number(row.conversation_id));
     const loopConversationIds = database.prepare('SELECT conversation_id FROM loop_conversation_members WHERE user_id = ?').all(accountId).map((row) => Number(row.conversation_id));
     const ownedServerRows = database.prepare('SELECT id, icon_url, banner_json FROM servers WHERE owner_id = ?').all(accountId);
     const ownedServerIds = ownedServerRows.map((row) => Number(row.id));
@@ -4127,7 +4177,7 @@ async function handleApi(request, response) {
     const collectNames = (rows) => rows.forEach((row) => {
       if (typeof row.storage_name === 'string' && /^(?:[a-z2-7]{20,64}|[a-z2-7-]+\.[a-z0-9]+)$/.test(row.storage_name)) mediaNames.add(row.storage_name);
     });
-    collectNames(database.prepare(`SELECT storage_name FROM message_attachments WHERE uploaded_by = ? OR conversation_id IN (SELECT conversation_id FROM conversation_members WHERE user_id = ?)`).all(accountId, accountId));
+    collectNames(database.prepare(`SELECT storage_name FROM message_attachments WHERE uploaded_by = ? OR (conversation_id IN (SELECT conversation_id FROM conversation_members WHERE user_id = ?) AND NOT EXISTS (SELECT 1 FROM group_conversations g WHERE g.conversation_id = message_attachments.conversation_id))`).all(accountId, accountId));
     collectNames(database.prepare(`SELECT storage_name FROM channel_message_attachments WHERE uploaded_by = ? OR channel_id IN (SELECT c.id FROM server_channels c JOIN servers s ON s.id = c.server_id WHERE s.owner_id = ?) OR message_id IN (SELECT id FROM channel_messages WHERE user_id = ?)`).all(accountId, accountId, accountId));
     collectNames(database.prepare('SELECT m.storage_name FROM loop_post_media m JOIN loop_posts p ON p.id = m.post_id WHERE p.user_id = ?').all(accountId));
     if (boardScopeKeys.length) {
@@ -4153,45 +4203,29 @@ async function handleApi(request, response) {
     }
 
     const retiredId = database.prepare('INSERT INTO retired_account_ids (id, deleted_at) VALUES (?, ?)');
+    let changedGroups = [];
+    const groupUploads = [];
     withTransaction(() => {
       retiredId.run(accountId, deletedAt);
       database.prepare("UPDATE server_audit_log SET actor_name = 'Deleted user' WHERE actor_user_id = ?").run(accountId);
       database.prepare("UPDATE server_audit_log SET target_name = 'Deleted user', target_id = '' WHERE target_type IN ('user', 'member') AND target_id = ?").run(String(accountId));
       database.prepare('UPDATE channel_message_cleanup_schedules SET updated_by = NULL WHERE updated_by = ?').run(accountId);
       for (const scopeKey of boardScopeKeys) database.prepare('DELETE FROM app_boards WHERE scope_key = ?').run(scopeKey);
-      database.prepare('DELETE FROM conversations WHERE id IN (SELECT conversation_id FROM conversation_members WHERE user_id = ?)').run(accountId);
+      changedGroups = groupDms.detachUser(accountId, groupUploads);
+      deleteDirectConversationsForUser.run(accountId);
       database.prepare('DELETE FROM loop_conversations WHERE id IN (SELECT conversation_id FROM loop_conversation_members WHERE user_id = ?)').run(accountId);
       database.prepare('DELETE FROM channel_messages WHERE user_id = ?').run(accountId);
       database.prepare('DELETE FROM servers WHERE owner_id = ?').run(accountId);
       database.prepare('DELETE FROM users WHERE id = ?').run(accountId);
     });
+    for (const id of changedGroups) groupDms.notify(id);
     leaveVoiceRooms(accountId);
     leaveDmCalls(accountId, 'account-deleted');
     appService.dropUserEverywhere(accountId);
     realtimeHub.dropUserExcept(accountId, null);
-    removeStoredUploads([...mediaNames]);
+    removeStoredUploads([...mediaNames, ...groupUploads]);
     response.setHeader('Set-Cookie', sessionCookie('', 0));
     return sendJson(response, 200, { ok: true });
-  }
-
-  if (method === 'POST' && path === '/api/admin/password-reset') {
-    const admin = requireSignedInUser(request, response);
-    if (!admin) return;
-    if (!isPlatformAdmin(admin)) return sendJson(response, 403, { error: 'Only platform admins can reset passwords.' });
-    let input = {};
-    try { input = await readJson(request); } catch (error) { return sendJson(response, 400, { error: error.message }); }
-    const username = normalizeUsername(input.username);
-    const nextPassword = String(input.newPassword || '');
-    if (!username) return sendJson(response, 400, { error: USERNAME_RULES_MESSAGE });
-    if (nextPassword.length < 10 || nextPassword.length > 256) return sendJson(response, 400, { error: 'Use a password between 10 and 256 characters.' });
-    const targetId = findUserByUsername.get(username)?.id;
-    if (!targetId) return sendJson(response, 404, { error: 'That user was not found.' });
-    if (Number(targetId) === Number(admin.id)) return sendJson(response, 400, { error: 'Use the Security tab to change your own password.' });
-    const salt = randomBytes(16).toString('hex');
-    updatePassword.run(hashPassword(nextPassword, salt), salt, targetId);
-    const revoked = deleteAllUserSessions.run(targetId);
-    realtimeHub.dropUserExcept(Number(targetId), null);
-    return sendJson(response, 200, { ok: true, username, revoked: Number(revoked.changes || 0) });
   }
 
   if (method === 'GET' && path === '/api/account/sessions') {
@@ -4295,10 +4329,11 @@ async function handleApi(request, response) {
     const glassDepth = Number(input.glassDepth ?? user.accessibility_glass_depth ?? 20);
     const glassRefraction = Number(input.glassRefraction ?? user.accessibility_glass_refraction ?? 100);
     const theme = input.theme ?? user.accessibility_theme ?? 'system';
-    if (!Number.isInteger(contrast) || contrast < 50 || contrast > 150 || !Number.isInteger(saturation) || saturation < 0 || saturation > 200 || typeof input.reduceMotion !== 'boolean' || !Number.isInteger(glassFrost) || glassFrost < 0 || glassFrost > 100 || !Number.isInteger(glassDepth) || glassDepth < 0 || glassDepth > 100 || !Number.isInteger(glassRefraction) || glassRefraction < 0 || glassRefraction > 100 || !['system', 'light', 'dark'].includes(theme)) {
+    const showLoopStreakReminder = input.showLoopStreakReminder ?? (user.accessibility_loop_streak_reminder == null ? true : Boolean(Number(user.accessibility_loop_streak_reminder)));
+    if (!Number.isInteger(contrast) || contrast < 50 || contrast > 150 || !Number.isInteger(saturation) || saturation < 0 || saturation > 200 || typeof input.reduceMotion !== 'boolean' || !Number.isInteger(glassFrost) || glassFrost < 0 || glassFrost > 100 || !Number.isInteger(glassDepth) || glassDepth < 0 || glassDepth > 100 || !Number.isInteger(glassRefraction) || glassRefraction < 0 || glassRefraction > 100 || !['system', 'light', 'dark'].includes(theme) || typeof showLoopStreakReminder !== 'boolean') {
       return sendJson(response, 400, { error: 'Contrast must be 50-150, saturation 0-200, and glass frost, depth, and refraction must be 0-100.' });
     }
-    updateAccessibilitySettings.run(contrast, saturation, input.reduceMotion ? 1 : 0, glassFrost, glassDepth, glassRefraction, theme, user.id);
+    updateAccessibilitySettings.run(contrast, saturation, input.reduceMotion ? 1 : 0, glassFrost, glassDepth, glassRefraction, theme, showLoopStreakReminder ? 1 : 0, user.id);
     return sendJson(response, 200, { account: publicAccount(grantNamedPlatformAdmin(findUserById.get(user.id))) });
   }
 
@@ -4320,44 +4355,6 @@ async function handleApi(request, response) {
     const { endpoint } = await readJson(request);
     pushService.unsubscribe(user.id, endpoint);
     return sendJson(response, 200, { ok: true });
-  }
-
-  if (method === 'POST' && path === '/api/push/test') {
-    const user = requireSignedInUser(request, response);
-    if (!user) return;
-    if (!isPlatformAdmin(user)) return sendJson(response, 403, { error: 'Only platform admins can send a test notification.' });
-    const retryTest = takeRateLimit(request, 'push-test', 4, 60_000);
-    if (retryTest) return sendJson(response, 429, { error: 'Wait a bit before sending another test.', retryAfter: retryTest }, { 'Retry-After': String(retryTest) });
-    const sent = pushService.notifyAll({
-      title: 'Glean',
-      body: 'Test notification from Glean.',
-      tag: 'glean-test',
-      kind: 'test',
-      url: '/dms',
-    });
-    return sendJson(response, 200, { ok: true, sent });
-  }
-
-  if (method === 'POST' && path === '/api/push/announcement') {
-    const user = requireSignedInUser(request, response);
-    if (!user) return;
-    if (!isPlatformAdmin(user) || String(user.username || '').trim().toLowerCase() !== 'nuper') {
-      return sendJson(response, 403, { error: 'Only Nuper can send custom announcements.' });
-    }
-    const retryAfter = takeRateLimit(request, 'push-announcement', 3, 60_000);
-    if (retryAfter) return sendJson(response, 429, { error: 'Wait a bit before sending another announcement.' }, { 'Retry-After': String(retryAfter) });
-    let body;
-    try { body = await readJson(request); } catch (error) { return sendJson(response, 400, { error: error.message }); }
-    const message = typeof body.message === 'string' ? body.message.trim() : '';
-    if (!message || message.length > 240) return sendJson(response, 400, { error: 'Enter a message up to 240 characters.' });
-    const sent = pushService.notifyAll({
-      title: 'Glean',
-      body: message,
-      tag: `glean-announcement-${Date.now()}`,
-      kind: 'announcement',
-      url: '/',
-    });
-    return sendJson(response, 200, { ok: true, sent });
   }
 
   if (method === 'POST' && path === '/api/e2ee/reset') {
@@ -4907,12 +4904,12 @@ async function handleApi(request, response) {
     const user = requireSignedInUser(request, response);
     if (!user) return;
     return sendJson(response, 200, {
-      friends: listFriends.all(user.id, user.id, user.id).map((friend) => ({ id: Number(friend.id), username: friend.username, avatarUrl: friend.avatar_url || null, nameStyle: publicNameStyle(friend.name_style_json), isBot: Boolean(Number(friend.is_bot)), presence: Number(friend.is_bot) ? 'online' : publicPresence(friend.id) })),
+      friends: listFriends.all(user.id, user.id, user.id).map((friend) => ({ id: Number(friend.id), username: friend.username, verified: Number(friend.is_verified) === 1, avatarUrl: friend.avatar_url || null, nameStyle: publicNameStyle(friend.name_style_json), isBot: Boolean(Number(friend.is_bot)), presence: Number(friend.is_bot) ? 'online' : publicPresence(friend.id) })),
       requests: listIncomingRequests.all(user.id).map((friendRequest) => ({
-        id: Number(friendRequest.id), user: { id: Number(friendRequest.user_id), username: friendRequest.username, avatarUrl: friendRequest.avatar_url || null, nameStyle: publicNameStyle(friendRequest.name_style_json), presence: publicPresence(friendRequest.user_id) }, createdAt: friendRequest.created_at,
+        id: Number(friendRequest.id), user: { id: Number(friendRequest.user_id), username: friendRequest.username, verified: Number(friendRequest.is_verified) === 1, avatarUrl: friendRequest.avatar_url || null, nameStyle: publicNameStyle(friendRequest.name_style_json), presence: publicPresence(friendRequest.user_id) }, createdAt: friendRequest.created_at,
       })),
       sent: listOutgoingRequests.all(user.id).map((friendRequest) => ({
-        id: Number(friendRequest.id), user: { id: Number(friendRequest.user_id), username: friendRequest.username, avatarUrl: friendRequest.avatar_url || null, nameStyle: publicNameStyle(friendRequest.name_style_json), presence: publicPresence(friendRequest.user_id) }, createdAt: friendRequest.created_at,
+        id: Number(friendRequest.id), user: { id: Number(friendRequest.user_id), username: friendRequest.username, verified: Number(friendRequest.is_verified) === 1, avatarUrl: friendRequest.avatar_url || null, nameStyle: publicNameStyle(friendRequest.name_style_json), presence: publicPresence(friendRequest.user_id) }, createdAt: friendRequest.created_at,
       })),
     });
   }
@@ -4943,6 +4940,7 @@ async function handleApi(request, response) {
         return {
           id: Number(person.id),
           username: person.username,
+          verified: Number(person.is_verified) === 1,
           avatarUrl: person.avatar_url || null,
           grade,
           gradeLabel: gradeLabel(grade),
@@ -4990,6 +4988,7 @@ async function handleApi(request, response) {
         return {
           id: Number(person.id),
           username: person.username,
+          verified: Number(person.is_verified) === 1,
           avatarUrl: person.avatar_url || null,
           bio: person.bio || '',
           grade: personGrade,
@@ -5012,6 +5011,35 @@ async function handleApi(request, response) {
     });
   }
 
+  if (path === '/api/account/verified-users' && method === 'GET') {
+    const admin = requireSignedInUser(request, response);
+    if (!admin) return;
+    if (!isNuperAdmin(admin)) return sendJson(response, 403, { error: 'Only the Nuper account can manage verified badges.' });
+    const query = String(new URL(request.url, `http://${request.headers.host || 'localhost'}`).searchParams.get('q') || '').trim().slice(0, 80);
+    const users = database.prepare(`SELECT id,username,avatar_url,is_verified FROM users
+      WHERE username IS NOT NULL AND is_bot=0 AND (?='' OR instr(lower(username),lower(?))>0)
+      ORDER BY is_verified DESC,username COLLATE NOCASE LIMIT 50`).all(query,query);
+    return sendJson(response, 200, { users: users.map(person => ({ id:Number(person.id),username:person.username,avatarUrl:person.avatar_url || null,verified:Number(person.is_verified) === 1 })) });
+  }
+  const verifiedUserMatch = path.match(/^\/api\/account\/verified-users\/(\d+)$/);
+  if (verifiedUserMatch && method === 'PATCH') {
+    const admin = requireSignedInUser(request, response);
+    if (!admin) return;
+    if (!isNuperAdmin(admin)) return sendJson(response, 403, { error: 'Only the Nuper account can manage verified badges.' });
+    const targetId = Number(verifiedUserMatch[1]);
+    if (!Number.isSafeInteger(targetId) || targetId < 1) return sendJson(response, 400, { error: 'Choose a valid account.' });
+    let input;
+    try { input = await readJson(request); } catch (error) { return sendJson(response, 400, { error: error.message }); }
+    if (typeof input.verified !== 'boolean') return sendJson(response, 400, { error: 'Choose whether the account is verified.' });
+    const target = findUserById.get(targetId);
+    if (!target?.username || Number(target.is_bot)) return sendJson(response, 404, { error: 'That Glean account was not found.' });
+    database.prepare('UPDATE users SET is_verified=? WHERE id=?').run(input.verified ? 1 : 0,targetId);
+    const updated = findUserById.get(targetId);
+    realtimeHub.broadcastAll('user-verification-updated', { userId:targetId,verified:input.verified });
+    realtimeHub.broadcastAll('user-updated', { userId:targetId });
+    return sendJson(response, 200, { user:{ id:targetId,username:updated.username,avatarUrl:updated.avatar_url || null,verified:input.verified } });
+  }
+
   const userProfileMatch = path.match(/^\/api\/users\/([^/]+)$/);
   if (method === 'GET' && userProfileMatch) {
     const user = requireSignedInUser(request, response);
@@ -5025,6 +5053,7 @@ async function handleApi(request, response) {
       user: {
         id: Number(profile.id),
         username: profile.username,
+        verified: Number(profile.is_verified) === 1,
         avatarUrl: profile.avatar_url || null,
         banner: publicBanner(profile.banner_json),
         profileBackground: publicProfileBackground(profile.profile_background_json),
@@ -5194,10 +5223,13 @@ async function handleApi(request, response) {
   if (method === 'GET' && path === '/api/conversations') {
     const user = requireSignedInUser(request, response);
     if (!user) return;
-    return sendJson(response, 200, { conversations: listConversations.all(user.id, user.id).map((conversation) => ({
+    const direct = listConversations.all(user.id, user.id).map((conversation) => ({
       id: Number(conversation.id),
+      kind: 'direct',
       user: {
         id: Number(conversation.user_id), username: conversation.username, bio: conversation.bio || '', avatarUrl: conversation.avatar_url || null,
+        verified: Number(conversation.is_verified) === 1,
+        verified: Number(conversation.is_verified) === 1,
         nameStyle: publicNameStyle(conversation.name_style_json),
         customBadges: publicCustomBadges(conversation.custom_badges_json),
         isBot: Boolean(Number(conversation.is_bot)),
@@ -5215,7 +5247,15 @@ async function handleApi(request, response) {
       lastMessageAt: conversation.last_message_at || null,
       unreadCount: Number(conversation.unread_count || 0),
       pinned: Boolean(Number(conversation.pinned)),
-    })), ...homeUnread(user.id) });
+    }));
+    const muted = new Set(database.prepare('SELECT conversation_id FROM user_conversation_mutes WHERE user_id=?').all(user.id).map(row => Number(row.conversation_id)));
+    return sendJson(response, 200, { conversations: [...direct, ...groupDms.list(user.id)].map(item => ({ ...item, muted: muted.has(Number(item.id)) })), ...homeUnread(user.id) });
+  }
+
+  if (path === '/api/conversations/groups' || /^\/api\/conversations\/\d+\/group(?:\/|$)/.test(path)) {
+    const user = requireSignedInUser(request, response);
+    if (!user) return;
+    if (await groupDms.handle({ path, method, request, response, user, readJson, sendJson }) !== false) return;
   }
 
   const conversationPinMatch = path.match(/^\/api\/conversations\/(\d+)\/pin$/);
@@ -5259,9 +5299,9 @@ async function handleApi(request, response) {
   if (method === 'GET' && path === '/api/servers') {
     const user = requireSignedInUser(request, response);
     if (!user) return;
-    const memberRows = listServers.all(user.id).filter((server) => !(officialAnnouncements.isServer(server.id) && isOfficialServerHidden()));
+    const memberRows = listServers.all(user.id);
     const memberIds = new Set(memberRows.map((server) => Number(server.id)));
-    const inspectingRows = showInspectServersFor(user) ? listAllServers.all().filter((server) => !memberIds.has(Number(server.id)) && !(officialAnnouncements.isServer(server.id) && isOfficialServerHidden())) : [];
+    const inspectingRows = showInspectServersFor(user) ? listAllServers.all().filter((server) => !memberIds.has(Number(server.id))) : [];
     const rows = [...memberRows, ...inspectingRows];
     const unread = serverRailUnreadMap(user.id);
     const mutedServerIds = new Set(listMutedServerIds.all(user.id).map((row) => Number(row.server_id)));
@@ -5287,8 +5327,10 @@ async function handleApi(request, response) {
     let input = {};
     try { input = await readJson(request); } catch (error) { return sendJson(response, 400, { error: error.message }); }
     if (typeof input.muted !== 'boolean') return sendJson(response, 400, { error: 'Muted must be true or false.' });
+    if (!isServerMember.get(serverId, user.id)) return sendJson(response, 403, { error: 'Join this server before changing its notifications.' });
     if (input.muted) setServerMute.run(user.id, serverId, now);
     else clearServerMute.run(user.id, serverId);
+    sendEvent(user.id, 'notification-settings', { serverId, muted: input.muted });
     return sendJson(response, 200, { serverId, muted: input.muted });
   }
 
@@ -6419,24 +6461,30 @@ const moderationMessageMatch = path.match(/^\/api\/channels\/(\d+)\/messages\/(\
       auditModerationResult(channelRecord, user, 'blocked', moderationResult);
       return rejectUpload(422, 'This message was blocked by server moderation. Please edit it and try again.');
     }
-    const result = insertChannelMessage.run(channelId, user.id, cleanBody, now, reply.id, pollResult.poll ? JSON.stringify(pollResult.poll) : null);
-    const messageId = Number(result.lastInsertRowid);
+    if (!isChannelMember.get(channelId, user.id)) return rejectUpload(404, 'Channel not found.');
+    const currentBlock = postingBlockReason(user, findChannel.get(channelId), { skipSlowmode: isNuraCommand });
+    if (currentBlock) return rejectUpload(currentBlock.startsWith('Slowmode') ? 429 : 403, currentBlock);
+    let messageId;
+    const committedAt = new Date().toISOString();
     try {
-      for (const file of files) {
-        insertChannelAttachment.run(messageId, channelId, user.id, file.storageName, safeFileName(file.name), channelFileMimeType(file), Number(file.size || 0), now);
-      }
+      withTransaction(() => {
+        messageId = Number(insertChannelMessage.run(channelId, user.id, cleanBody, committedAt, reply.id, pollResult.poll ? JSON.stringify(pollResult.poll) : null).lastInsertRowid);
+        for (const file of files) {
+          insertChannelAttachment.run(messageId, channelId, user.id, file.storageName, safeFileName(file.name), channelFileMimeType(file), Number(file.size || 0), committedAt);
+        }
+        syncChannelMentions(messageId, channelId, cleanBody);
+        upsertChannelRead.run(channelId, user.id, messageId);
+      });
     } catch (error) {
       removeStoredUploads(storedNames);
-      hardDeleteChannelMessage.run(messageId);
       return sendJson(response, 400, { error: error.message || 'Unable to save that attachment.' });
     }
     if (moderationResult && ['warn', 'flag'].includes(moderationResult.action)) auditModerationResult(channelRecord, user, moderationResult.action, moderationResult, messageId, 'channel-message');
-    syncChannelMentions(messageId, channelId, cleanBody);
-    upsertChannelRead.run(channelId, user.id, messageId);
     const payload = channelMessageFullPayload(channelId, messageId, user.id);
     notifyChannelMessageCreated(channelRecord.server_id, { serverId: Number(channelRecord.server_id), channelId, action: 'created', message: payload }, user.id);
     pushServerMembers(channelRecord.server_id, {
       kind: 'channel',
+      messageId,
       title: `${user.username} in #${channelRecord.name}`,
       body: files.length && !cleanBody ? 'Sent an attachment' : previewText(cleanBody, pollResult.poll ? pollResult.poll.question : 'New message'),
       icon: user.avatar_url || '/icon-192.png',
@@ -6472,6 +6520,21 @@ const moderationMessageMatch = path.match(/^\/api\/channels\/(\d+)\/messages\/(\
     return sendJson(response, 200, { message: payload });
   }
 
+  const pollVotersMatch = path.match(/^\/api\/channels\/(\d+)\/messages\/(\d+)\/poll\/voters$/);
+  if (method === 'GET' && pollVotersMatch) {
+    const user = requireSignedInUser(request, response);
+    if (!user) return;
+    const channelId = Number(pollVotersMatch[1]), messageId = Number(pollVotersMatch[2]);
+    const message = findChannelMessage.get(messageId);
+    if (!canSeeChannel(user, channelId) || !message || message.deleted_at || Number(message.channel_id) !== channelId) return sendJson(response, 404, { error: 'Poll not found.' });
+    const poll = parseStoredPoll(getChannelMessagePoll.get(messageId)?.poll_json);
+    if (!poll) return sendJson(response, 404, { error: 'Poll not found.' });
+    const url = new URL(request.url, 'http://localhost');
+    const option = Number(url.searchParams.get('option')), after = Number(url.searchParams.get('after') || 0);
+    if (!Number.isInteger(option) || option < 0 || option >= poll.options.length || !Number.isSafeInteger(after) || after < 0) return sendJson(response, 400, { error: 'Invalid voter page.' });
+    const rows = database.prepare('SELECT users.id, users.username, users.avatar_url AS avatarUrl FROM channel_poll_votes v JOIN users ON users.id = v.user_id WHERE v.message_id = ? AND v.option_index = ? AND v.user_id > ? ORDER BY v.user_id LIMIT 51').all(messageId, option, after);
+    return sendJson(response, 200, { voters: rows.slice(0, 50), next: rows.length > 50 ? Number(rows[49].id) : null });
+  }
   const pollVoteMatch = path.match(/^\/api\/channels\/(\d+)\/messages\/(\d+)\/poll\/vote$/);
   if (method === 'POST' && pollVoteMatch) {
     const user = requireSignedInUser(request, response);
@@ -6587,13 +6650,18 @@ const moderationMessageMatch = path.match(/^\/api\/channels\/(\d+)\/messages\/(\
     const before = Number.isInteger(beforeRaw) && beforeRaw > 0 ? beforeRaw : null;
     const requestedLimit = Number(url.searchParams.get('limit'));
     const limit = Number.isInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 100) : 50;
+    const historyStart = groupDms.historyStart(conversationId, user.id);
     const rows = before
-      ? listMessages.all(conversationId, before, limit + 1)
-      : listLatestMessages.all(conversationId, limit + 1);
+      ? listMessages.all(conversationId, before, historyStart, limit + 1)
+      : listLatestMessages.all(conversationId, historyStart, limit + 1);
     const hasMore = rows.length > limit;
     const page = rows.slice(0, limit).reverse();
     const attachments = attachmentsByMessageIds(page.map((row) => row.id));
-    const messages = page.map((row) => directMessagePayload(row, attachments.get(Number(row.id)) || []));
+    const messages = page.map((row) => {
+      const message = directMessagePayload(row, attachments.get(Number(row.id)) || []);
+      if (message.replyTo && message.replyTo.id <= historyStart) message.replyTo = { id: message.replyTo.id, body: '', deleted: true };
+      return message;
+    });
     if (!before) applyConversationRead(conversationId, user.id);
     return sendJson(response, 200, { messages, page: { hasMore, nextBefore: hasMore ? Number(page[0]?.id || 0) : null } });
   }
@@ -6638,15 +6706,26 @@ const moderationMessageMatch = path.match(/^\/api\/channels\/(\d+)\/messages\/(\
     if (!user) return;
     const conversationId = Number(messageMatch[1]);
     if (!isConversationMember.get(conversationId, user.id)) return sendJson(response, 404, { error: 'Conversation not found.' });
-    const peer = findConversationPeer.get(conversationId, user.id);
+    const isGroup = groupDms.isGroup(conversationId);
+    const peer = isGroup ? { is_bot: 0 } : findConversationPeer.get(conversationId, user.id);
     if (!peer) return sendJson(response, 409, { error: 'Conversation participant is unavailable.' });
-    if (isBlockedEither(user.id, peer.id)) return sendJson(response, 403, { error: "You can't message this person." });
+    if (!isGroup && isBlockedEither(user.id, peer.id)) return sendJson(response, 403, { error: "You can't message this person." });
     let input;
     try { input = await readMessageInput(request); } catch (error) { return sendJson(response, 400, { error: error.message || 'Unable to read attachments.' }); }
     const reply = requireDirectReply(conversationId, input.replyToMessageId);
     const { envelope, attachmentMeta = [], files } = input;
     const storedNames = files.map((file) => file.storageName).filter(Boolean);
     const dropUploads = () => removeStoredUploads(storedNames);
+    if (isGroup) {
+      try {
+        groupDms.validateEnvelope(conversationId, user, envelope);
+        if (reply.id && reply.id <= groupDms.historyStart(conversationId, user.id)) throw Object.assign(new Error('That message cannot be replied to.'), { status: 400 });
+      } catch (error) {
+        dropUploads();
+        if (!error.status) throw error;
+        return sendJson(response, error.status, { error: error.message });
+      }
+    }
     if (peer.is_bot && envelope) {
       dropUploads();
       return sendJson(response, 400, { error: 'Nura chats are processed by Groq and are not end-to-end encrypted. Refresh Glean and try again.' });
@@ -6687,18 +6766,20 @@ const moderationMessageMatch = path.match(/^\/api\/channels\/(\d+)\/messages\/(\
           return sendJson(response, 400, { error: error.message || 'Nura could not read one of those images.' });
         }
       }
-      const result = insertMessage.run(conversationId, user.id, cleanBody, null, null, null, null, null, null, 0, now, reply.id);
-      const messageId = Number(result.lastInsertRowid);
+      let messageId;
       try {
-        for (const file of files) {
-          insertAttachment.run(messageId, conversationId, user.id, file.storageName, safeFileName(file.name), sanitizeMimeType(file.type) || 'application/octet-stream', Number(file.size || 0), 0, null, null, null, null, now);
-        }
+        withTransaction(() => {
+          if (messageReports.getRestriction(user.id)) throw Object.assign(new Error('Your account is restricted. Reload to view the expiration.'), { status: 403 });
+          messageId = Number(insertMessage.run(conversationId, user.id, cleanBody, null, null, null, null, null, null, 0, now, reply.id).lastInsertRowid);
+          for (const file of files) {
+            insertAttachment.run(messageId, conversationId, user.id, file.storageName, safeFileName(file.name), sanitizeMimeType(file.type) || 'application/octet-stream', Number(file.size || 0), 0, null, null, null, null, now);
+          }
+          markConversationRead.run(messageId, messageId, conversationId, user.id);
+        });
       } catch (error) {
         dropUploads();
-        deleteMessage.run(messageId);
-        return sendJson(response, 400, { error: error.message || 'Unable to save that attachment.' });
+        return sendJson(response, error.status || 400, { error: error.message || 'Unable to save that attachment.' });
       }
-      markConversationRead.run(messageId, messageId, conversationId, user.id);
       const message = directMessagePayload(loadDirectMessageRow.get(messageId));
       notifyDirectMessage(conversationId, message, user.id);
       pushConversationMembers(conversationId, {
@@ -6713,8 +6794,8 @@ const moderationMessageMatch = path.match(/^\/api\/channels\/(\d+)\/messages\/(\
       if (Number(peer.is_bot)) setImmediate(() => { void answerWithNura(conversationId, Number(user.id), nuraImageFiles); });
       return sendJson(response, 201, { message });
     }
-    if (!user.public_key_jwk || !peer.public_key_jwk) { dropUploads(); return sendJson(response, 409, { error: 'Both participants must initialize private-message encryption first.' }); }
-    if (!envelope || Number(envelope.version) !== 1) { dropUploads(); return sendJson(response, 400, { error: 'Private messages must use Glean end-to-end encryption.' }); }
+    if (!user.public_key_jwk || (!isGroup && !peer.public_key_jwk)) { dropUploads(); return sendJson(response, 409, { error: 'All participants must initialize private-message encryption first.' }); }
+    if (!envelope || Number(envelope.version) !== (isGroup ? 2 : 1)) { dropUploads(); return sendJson(response, 400, { error: 'Private messages must use Glean end-to-end encryption.' }); }
     const clientMessageId = String(envelope.clientMessageId || '');
     if (!/^[a-zA-Z0-9_-]{16,96}$/.test(clientMessageId)) { dropUploads(); return sendJson(response, 400, { error: 'Invalid client message ID.' }); }
     const existing = findMessageByClientId.get(conversationId, user.id, clientMessageId);
@@ -6732,8 +6813,8 @@ const moderationMessageMatch = path.match(/^\/api\/channels\/(\d+)\/messages\/(\
     const recipientPublicKey = JSON.stringify(envelope.recipientPublicKey || {});
     if (!ciphertext || ciphertext.length > 64_000 || !/^[A-Za-z0-9_-]+$/.test(ciphertext)) { dropUploads(); return sendJson(response, 400, { error: 'Invalid encrypted message payload.' }); }
     if (!/^[A-Za-z0-9_-]{16,64}$/.test(iv) || !/^[A-Za-z0-9_-]{16,96}$/.test(salt)) { dropUploads(); return sendJson(response, 400, { error: 'Invalid encryption parameters.' }); }
-    if (!publicKeyMatchesStored(envelope.senderPublicKey, user.public_key_jwk, user.key_fingerprint)
-      || !publicKeyMatchesStored(envelope.recipientPublicKey, peer.public_key_jwk, peer.key_fingerprint)) {
+    if (!isGroup && (!publicKeyMatchesStored(envelope.senderPublicKey, user.public_key_jwk, user.key_fingerprint)
+      || !publicKeyMatchesStored(envelope.recipientPublicKey, peer.public_key_jwk, peer.key_fingerprint))) {
       dropUploads();
       return sendJson(response, 409, { error: 'Encryption keys changed. Refresh the conversation and try again.' });
     }
@@ -6744,29 +6825,32 @@ const moderationMessageMatch = path.match(/^\/api\/channels\/(\d+)\/messages\/(\
       return sendJson(response, 400, { error: 'Each encrypted attachment and the total message can be up to 2 GB.' });
     }
 
-    const result = insertMessage.run(conversationId, user.id, '', ciphertext, iv, salt, senderPublicKey, recipientPublicKey, clientMessageId, 1, now, reply.id);
-    const messageId = Number(result.lastInsertRowid);
+    let messageId;
     try {
-      for (let index = 0; index < files.length; index += 1) {
-        const file = files[index];
-        const meta = attachmentMeta[index] || {};
-        const fileIv = String(meta.iv || '');
-        const fileSalt = String(meta.salt || '');
-        if (!/^[A-Za-z0-9_-]{16,64}$/.test(fileIv) || !/^[A-Za-z0-9_-]{16,96}$/.test(fileSalt)) throw new Error('Invalid encrypted attachment metadata.');
-        insertAttachment.run(messageId, conversationId, user.id, file.storageName, safeFileName(meta.name || 'encrypted-file'), String(meta.type || 'application/octet-stream').slice(0, 160), Number(meta.size || file.size || 0), 1, fileIv, fileSalt, senderPublicKey, recipientPublicKey, now);
-      }
+      withTransaction(() => {
+        if (messageReports.getRestriction(user.id)) throw Object.assign(new Error('Your account is restricted. Reload to view the expiration.'), { status: 403 });
+        messageId = Number(insertMessage.run(conversationId, user.id, '', ciphertext, iv, salt, senderPublicKey, recipientPublicKey, clientMessageId, isGroup ? 2 : 1, now, reply.id).lastInsertRowid);
+        if (isGroup) updateMessageGroupKeys.run(JSON.stringify(envelope.recipientKeys), messageId);
+        for (let index = 0; index < files.length; index += 1) {
+          const file = files[index];
+          const meta = attachmentMeta[index] || {};
+          const fileIv = String(meta.iv || '');
+          const fileSalt = String(meta.salt || '');
+          if (!/^[A-Za-z0-9_-]{16,64}$/.test(fileIv) || !/^[A-Za-z0-9_-]{16,96}$/.test(fileSalt)) throw new Error('Invalid encrypted attachment metadata.');
+          insertAttachment.run(messageId, conversationId, user.id, file.storageName, safeFileName(meta.name || 'encrypted-file'), String(meta.type || 'application/octet-stream').slice(0, 160), Number(meta.size || file.size || 0), 1, fileIv, fileSalt, senderPublicKey, recipientPublicKey, now);
+        }
+        markConversationRead.run(messageId, messageId, conversationId, user.id);
+      });
     } catch (error) {
       dropUploads();
-      deleteMessage.run(messageId);
-      return sendJson(response, 400, { error: error.message || 'Unable to save that encrypted attachment.' });
+      return sendJson(response, error.status || 400, { error: error.message || 'Unable to save that encrypted attachment.' });
     }
-    markConversationRead.run(messageId, messageId, conversationId, user.id);
     const message = directMessagePayload(loadDirectMessageRow.get(messageId));
     notifyDirectMessage(conversationId, message, user.id);
     pushConversationMembers(conversationId, {
       kind: 'dm',
-      title: user.username,
-      body: files.length ? 'Sent an attachment' : 'Sent you a message',
+      title: isGroup ? groupDms.nameOf(conversationId) : user.username,
+      body: isGroup ? `${user.username}: ${files.length ? 'Sent an attachment' : 'Sent a message'}` : files.length ? 'Sent an attachment' : 'Sent you a message',
       icon: user.avatar_url || '/icon-192.png',
       url: `/dms?c=${conversationId}`,
       tag: `dm:${conversationId}`,
@@ -6845,7 +6929,7 @@ function serveProductionFile(request, response) {
   const fileName = filePath.split(sep).pop();
   const type = contentTypes[extname(filePath)] || 'application/octet-stream';
   const binary = type.startsWith('image/') || type === 'application/pdf';
-  const noCache = fileName === 'index.html' || fileName === 'sw.js' || fileName === 'manifest.webmanifest' || fileName === 'admin.js' || fileName === 'blocked.css' || fileName === 'blocked-countdown.js';
+  const noCache = fileName === 'index.html' || fileName === 'sw.js' || fileName === 'manifest.webmanifest' || fileName === 'blocked.css' || fileName === 'blocked-countdown.js';
   return sendLocalFile(request, response, filePath, {
     type: binary ? type : `${type}; charset=utf-8`,
     extra: {
@@ -6871,18 +6955,10 @@ const server = createServer(async (request, response) => {
   response.setHeader('X-Request-Id', id);
   try {
     const requestPath = new URL(request.url, `http://${request.headers.host || 'localhost'}`).pathname;
-    const adminMaintenancePath = ['/api/admin/maintenance', '/api/v1/admin/maintenance'].includes(requestPath);
-    const adminAccessPath = ['/api/admin/access', '/api/v1/admin/access'].includes(requestPath);
-    const adminOfficialServerPath = ['/api/admin/official-server', '/api/v1/admin/official-server'].includes(requestPath);
-    const adminAnnouncementPath = ['/api/admin/announcement', '/api/v1/admin/announcement'].includes(requestPath);
-    const adminSignInPath = ['/api/auth/signin', '/api/v1/auth/signin'].includes(requestPath) && request.method === 'POST';
-    const adminPagePath = requestPath === '/admin' || requestPath === '/admin/';
-    const adminBypass = adminPagePath || requestPath === '/admin.js' || adminMaintenancePath || adminAccessPath || adminOfficialServerPath || adminAnnouncementPath || adminSignInPath;
-    if (isMaintenanceMode() && !adminBypass) {
-      response.writeHead(503, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, max-age=0', 'Retry-After': '300' });
-      return response.end('<!doctype html><html><head><meta charset="utf-8"></head><body><font face="Times New Roman, Times, serif">temporary shutdown wait later</font></body></html>');
+    if (requestPath === '/admin' || requestPath === '/admin/' || requestPath === '/admin.js') {
+      response.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+      return response.end('Not found.');
     }
-    if (isOfflineScreenMode() && !adminBypass && requestPath !== '/blocked.css') return sendSchoolBlocked(response, { available: false, nextOpenAt: null, offlineScreen: true, timeZone: schoolScheduleTimeZone });
     if (requestPath === '/api/access/status' || requestPath === '/api/v1/access/status') {
       if (request.method !== 'GET') {
         response.writeHead(405, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', Allow: 'GET' });
@@ -6894,24 +6970,7 @@ const server = createServer(async (request, response) => {
     }
     const scheduleAsset = request.method === 'GET' && (requestPath === '/blocked.css' || requestPath === '/blocked-countdown.js');
     const access = currentSchoolAccess();
-    if (!access.available && !scheduleAsset && !adminBypass) return sendSchoolBlocked(response, access);
-    if (adminPagePath) {
-      if (request.method !== 'GET') {
-        response.writeHead(405, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', Allow: 'GET' });
-        return response.end('Method not allowed.');
-      }
-      const user = currentUser(request);
-      const isAdmin = isNuperAdmin(user);
-      const status = !user ? 200 : isAdmin ? 200 : 403;
-      const body = !user
-        ? '<p>Sign in with the Nuper account to continue.</p><form id="admin-login"><label>Username <input name="username" autocomplete="username" required></label><br><label>Password <input name="password" type="password" autocomplete="current-password" required></label><br><button type="submit">Sign in</button></form>'
-        : isAdmin
-          ? '<section id="admin-controls"><h2>Access controls</h2><label class="control-row"><span><strong>Allow access during school hours</strong><small>Temporarily override the normal school schedule.</small></span><input id="school-hours-toggle" type="checkbox"></label><label class="control-row"><span><strong>Show the blocked screen</strong><small>Take Glean offline with the blocked screen and no countdown.</small></span><input id="offline-screen-toggle" type="checkbox"></label><p id="access-status" role="status"></p><h2>Official Glean server</h2><label class="control-row"><span><strong>Hide Glean server from everyone</strong><small>Remove the official server from every account and block direct access. Its data stays preserved and returns when shown again.</small></span><input id="official-server-hidden-toggle" type="checkbox"></label><p id="official-server-status" role="status"></p><h2>Top announcement</h2><p>Set a message for everyone. When shown, it stays at the top of Glean with a clickable link to your profile.</p><textarea id="announcement-message" maxlength="2000" rows="4" placeholder="Write an announcement…"></textarea><label class="control-row"><span><strong>Show announcement</strong><small>Display it at the top of Glean.</small></span><input id="announcement-enabled" type="checkbox"></label><button id="announcement-save" type="button">Save announcement</button><p id="announcement-status" role="status"></p><h2>Emergency shutdown</h2><p id="maintenance-status">Loading status…</p><button id="maintenance-toggle" type="button">Loading…</button></section>'
-          : '<p>Platform admin access required.</p>';
-      response.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
-      response.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, max-age=0' });
-      return response.end(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex,nofollow,noarchive"><title>Glean Admin</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;box-sizing:border-box;background:#07111d;color:#f4f7fb;font:15px/1.5 system-ui,sans-serif}.panel{width:min(560px,100%);padding:28px;background:#0d1b2a;border:1px solid #263a50;border-radius:16px}h1{margin:0 0 20px}h2{margin:24px 0 8px;font-size:16px}.control-row{display:flex;justify-content:space-between;align-items:center;gap:20px;padding:16px 0;border-bottom:1px solid #263a50}.control-row small{display:block;color:#a8bbcd}.control-row input{width:22px;height:22px;accent-color:#0787ee}button{min-height:42px;padding:0 16px;border:0;border-radius:9px;background:#0787ee;color:white;font:inherit;font-weight:650;cursor:pointer}button:disabled{opacity:.55;cursor:wait}input:not([type=checkbox]){box-sizing:border-box;width:100%;min-height:42px;margin:5px 0 12px;padding:8px 10px;background:#07111d;color:#f4f7fb;border:1px solid #38506a;border-radius:8px}form button{margin-top:4px}#admin-error{color:#ff909a;min-height:1.5em}</style></head><body><main class="panel"><h1>Glean Admin</h1>${body}<p id="admin-error" role="alert"></p></main>${!user || isAdmin ? '<script src="/admin.js" defer></script>' : ''}</body></html>`);
-    }
+    if (!access.available && !scheduleAsset) return sendSchoolBlocked(response, access);
     if (request.url?.startsWith('/api/')) return await handleApi(request, response);
     if (!loopRoutesEnabled && (requestPath === '/loop' || requestPath.startsWith('/loop/'))) return sendJson(response, 404, { error: 'Not found.' });
     if (vite) return vite.middlewares(request, response, () => {});
@@ -6929,11 +6988,7 @@ server.on('connection', (socket) => {
   socket.setNoDelay(true);
   socket.setKeepAlive(true, 30_000);
 });
-server.on('upgrade', (request, socket) => {
-  if (isMaintenanceMode()) {
-    socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nRetry-After: 300\r\n\r\n');
-    return socket.destroy();
-  }
+server.on('upgrade', (request, socket, head) => {
   const access = currentSchoolAccess();
   if (access.offlineScreen) {
     socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nRetry-After: 300\r\n\r\n');
@@ -6944,7 +6999,7 @@ server.on('upgrade', (request, socket) => {
     socket.write(`HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nRetry-After: ${retryAfter}\r\n\r\n`);
     return socket.destroy();
   }
-  realtimeHub.upgrade(request, socket);
+  realtimeHub.upgrade(request, socket, head);
 });
 
 let previousAccessAvailable = currentSchoolAccess().available;
@@ -6962,7 +7017,9 @@ function shutdown(signal) {
   console.log(`\n${signal}: closing Glean server...`);
   clearInterval(scheduleTransitionTimer);
   realtimeHub.close();
-  server.close(() => { try { database.close(); } finally { process.exit(0); } });
+  presenceBatch.close();
+  const loopStopped = loopService.close();
+  server.close(async () => { try { await loopStopped; database.close(); } finally { process.exit(0); } });
   setTimeout(() => process.exit(1), 8_000).unref();
 }
 process.once('SIGINT', () => shutdown('SIGINT'));

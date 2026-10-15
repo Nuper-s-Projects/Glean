@@ -1,62 +1,34 @@
-import { useMemo, useState } from 'react';
-import { EMOJI_GROUPS } from './emojiData';
+import { EmojiPicker as Frimousse } from 'frimousse';
+
+function CategoryHeader({ category, ...props }) {
+  return <div {...props} className="dm-emoji-category">{category.label}</div>;
+}
+
+function Row({ children, ...props }) {
+  return <div {...props} className="dm-emoji-row">{children}</div>;
+}
+
+function Emoji({ emoji, ...props }) {
+  return <button {...props} type="button" className="dm-emoji-button" title={emoji.label}>{emoji.emoji}</button>;
+}
+
+const components = { CategoryHeader, Row, Emoji };
 
 export default function EmojiPicker({ value, onPick }) {
-  const [query, setQuery] = useState('');
-  const [groupId, setGroupId] = useState(EMOJI_GROUPS[0].id);
-  const needle = query.trim().toLowerCase();
-  const groups = useMemo(() => {
-    if (!needle) return EMOJI_GROUPS;
-    return EMOJI_GROUPS.map((group) => ({
-      ...group,
-      items: group.items.filter(([, name]) => name.includes(needle) || name.replace(/\s+/g, '_').includes(needle.replace(/\s+/g, '_'))),
-    })).filter((group) => group.items.length);
-  }, [needle]);
-  const active = groups.find((group) => group.id === groupId) || groups[0];
-
   return (
-    <div className="dm-emoji-picker" role="dialog" aria-label="Emoji picker">
+    <Frimousse.Root className="dm-emoji-picker" role="dialog" aria-label="Emoji picker" columns={7} locale="en" emojibaseUrl="/emoji-data/17.0.0" onEmojiSelect={({ emoji, label }) => onPick(emoji, label)}>
       <div className="dm-emoji-picker-search">
-        <input
-          value={query}
-          onChange={(event) => setQuery(event.target.value)}
-          placeholder="Search emoji"
-          aria-label="Search emoji"
-        />
+        <Frimousse.Search autoFocus placeholder="Search emoji" aria-label="Search emoji" />
+        <Frimousse.SkinToneSelector className="dm-emoji-tone" aria-label="Change emoji skin tone" />
       </div>
-      <div className="dm-emoji-picker-tabs" role="tablist">
-        {(needle ? groups : EMOJI_GROUPS).map((group) => (
-          <button
-            key={group.id}
-            type="button"
-            role="tab"
-            aria-selected={active?.id === group.id}
-            className={active?.id === group.id ? 'is-active' : ''}
-            onClick={() => setGroupId(group.id)}
-          >
-            {group.label}
-          </button>
-        ))}
+      <Frimousse.Viewport className="dm-emoji-viewport">
+        <Frimousse.Loading className="dm-emoji-picker-empty">Loading emoji…</Frimousse.Loading>
+        <Frimousse.Empty className="dm-emoji-picker-empty">No emoji matched. Try another search.</Frimousse.Empty>
+        <Frimousse.List className="dm-emoji-list" components={components} />
+      </Frimousse.Viewport>
+      <div className="dm-emoji-preview">
+        <Frimousse.ActiveEmoji>{({ emoji }) => <><span aria-hidden="true">{emoji?.emoji || value || '☺️'}</span><span>{emoji?.label || 'Choose an emoji'}</span></>}</Frimousse.ActiveEmoji>
       </div>
-      {active ? (
-        <div className="dm-emoji-picker-grid" role="listbox" aria-label={active.label}>
-          {active.items.map(([emoji, name]) => (
-            <button
-              key={`${emoji}-${name}`}
-              type="button"
-              role="option"
-              aria-selected={value === emoji}
-              className={value === emoji ? 'is-active' : ''}
-              title={name}
-              onClick={() => onPick(emoji, name)}
-            >
-              {emoji}
-            </button>
-          ))}
-        </div>
-      ) : (
-        <p className="dm-emoji-picker-empty">No emoji matched.</p>
-      )}
-    </div>
+    </Frimousse.Root>
   );
 }

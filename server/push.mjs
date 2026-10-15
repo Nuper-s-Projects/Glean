@@ -15,7 +15,7 @@ function loadKeys(dataDirectory) {
   return generated;
 }
 
-export function createPushService({ database, dataDirectory }) {
+export function createPushService({ database, dataDirectory, canNotify = () => true }) {
   const keys = loadKeys(dataDirectory);
   webpush.setVapidDetails('mailto:glean@local', keys.publicKey, keys.privateKey);
 
@@ -40,13 +40,14 @@ export function createPushService({ database, dataDirectory }) {
     if (serverId > 0 && isServerMuted.get(Number(userId), serverId)) return;
     const rows = listForUser.all(Number(userId));
     if (!rows.length) return;
+    if (!canNotify(Number(userId), payload)) return;
     const privateMode = Boolean(Number(getPrivacyMode.get(Number(userId))?.keep_information_secret));
     const safePayload = privateMode ? {
-      kind: 'activity',
-      title: 'Glean',
+      kind: payload?.kind === 'loop' ? 'loop' : 'activity',
+      title: payload?.kind === 'loop' ? 'Loop' : 'Glean',
       body: 'You have new activity.',
-      url: '/dms',
-      tag: 'glean-private-activity',
+      url: payload?.kind === 'loop' ? '/loop' : '/dms',
+      tag: payload?.kind === 'loop' ? 'loop-private-activity' : 'glean-private-activity',
     } : payload;
     const body = JSON.stringify(safePayload);
     await Promise.all(rows.map(async (row) => {

@@ -19,10 +19,11 @@ export function ReplyQuote({ reply }) {
   );
 }
 
-export function MessageHoverActions({ canReply, canEdit, canDelete, canReact, onReply, onEdit, onDelete, onReact }) {
-  if (!canReply && !canEdit && !canDelete && !canReact) return null;
+export function MessageHoverActions({ canReply, canEdit, canDelete, canReact, canReport, onReply, onEdit, onDelete, onReact, onReport }) {
+  if (!canReply && !canEdit && !canDelete && !canReact && !canReport) return null;
   return (
     <div className="community-message-actions">
+      {canReport ? <button type="button" onClick={onReport} aria-label="Report message" title="Report message">⚑</button> : null}
       {canReact ? <button type="button" className="community-message-react" onClick={onReact} aria-label="Add reaction" title="Add reaction">☺</button> : null}
       {canReply ? <button type="button" onClick={onReply} aria-label="Reply" title="Reply"><ReplyIcon /></button> : null}
       {canEdit ? <button type="button" className="community-message-edit" onClick={onEdit} aria-label="Edit message" title="Edit message"><EditIcon /></button> : null}

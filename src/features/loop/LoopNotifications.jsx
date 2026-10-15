@@ -1,62 +1,94 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { apiRequest } from '../../app/apiClient';
 import { subscribeToDmEvents } from '../../app/dmApi';
+import VerifiedMark from '../../components/VerifiedMark';
+import LoopPanelDialog, { LoopPanelIcon } from './LoopPanelDialog';
+import LoopSettings from './LoopSettings';
+import './LoopPanels.css';
 
-const categories = [['replies','Replies to my comments'],['comments','Comments on my posts'],['mentions','Mentions of me'],['likes','Likes on my posts'],['follows','New followers'],['reposts','Reposts of my posts']];
+function timeLabel(value) {
+  const time = Date.parse(value), elapsed = Math.max(0, Date.now() - time);
+  if (!Number.isFinite(time)) return '';
+  if (elapsed < 60000) return 'Just now';
+  if (elapsed < 3600000) return `${Math.floor(elapsed / 60000)}m ago`;
+  if (elapsed < 86400000) return `${Math.floor(elapsed / 3600000)}h ago`;
+  return new Date(time).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
 
-export default function LoopNotifications({ visible, showSettings, onUnread, onOpen, onToast }) {
-  const [items,setItems] = useState([]);
-  const [next,setNext] = useState(null);
-  const [preferences,setPreferences] = useState(null);
-  const [editing,setEditing] = useState(false);
-  const [busy,setBusy] = useState(false);
-  const [error,setError] = useState('');
-  const version = useRef(0);
-  const saving = useRef(false);
-  const load = useCallback(async (before=null) => {
-    const requested=++version.current;
+export default function LoopNotifications({ visible, showSettings, onUnread, onOpen, onClose, onSettings }) {
+  const [items, setItems] = useState([]), [next, setNext] = useState(null), [unread, setUnread] = useState(0);
+  const [filter, setFilter] = useState('all'), [loading, setLoading] = useState(true), [moreLoading, setMoreLoading] = useState(false);
+  const [readBusy, setReadBusy] = useState(false), [error, setError] = useState('');
+  const version = useRef(0), request = useRef(null), readLock = useRef(false);
+  const load = useCallback(async (before = null) => {
+    const requested = ++version.current;
+    request.current?.abort();
+    const controller = new AbortController(); request.current = controller;
+    if (before) setMoreLoading(true); else setLoading(true);
     try {
-      const data=await apiRequest(`/loop/notifications${before ? `?before=${before}` : ''}`);
-      if(requested!==version.current)return;
-      setItems(current=>before ? [...current,...data.notifications.filter(item=>!current.some(old=>old.id===item.id))] : data.notifications);
-      setNext(data.page?.nextBefore || null); onUnread(data.unreadCount);setError('');
-    } catch(failure){if(requested===version.current)setError(failure.message);}
-  },[onUnread]);
-  useEffect(()=>{
+      const query = new URLSearchParams({ unread: filter === 'unread' ? '1' : '0' });
+      if (before) query.set('before', before);
+      const data = await apiRequest(`/loop/notifications?${query}`, { signal: controller.signal });
+      if (requested !== version.current) return;
+      setItems(current => {
+        if (!before) return data.notifications;
+        const ids = new Set(current.map(item => item.id));
+        return [...current, ...data.notifications.filter(item => !ids.has(item.id))];
+      });
+      setNext(data.page?.nextBefore || null); setUnread(data.unreadCount); onUnread(data.unreadCount); setError('');
+    } catch (failure) { if (requested === version.current && failure.name !== 'AbortError') setError(failure.message); }
+    finally { if (requested === version.current) { setLoading(false); setMoreLoading(false); } }
+  }, [filter, onUnread]);
+  useEffect(() => {
     load();
-    const sub=subscribeToDmEvents(event=>{if(event==='loop-notification'||event==='loop-notifications-read')load();});
-    return ()=>{version.current++;sub.close();};
-  },[load]);
-  useEffect(()=>{setEditing(showSettings);},[showSettings]);
-  useEffect(()=>{
-    if(!visible)return;
-    let cancelled=false;
-    apiRequest('/loop/notification-preferences').then(data=>{if(!cancelled)setPreferences(data.preferences);}).catch(failure=>{if(!cancelled)setError(failure.message);});
-    load();
-    return ()=>{cancelled=true;};
-  },[visible,load]);
-  const save = async update => {
-    if(saving.current)return;
-    saving.current=true;
-    const previous=preferences;
-    setPreferences(current=>({...current,...update}));setBusy(true);setError('');
-    try{const data=await apiRequest('/loop/notification-preferences',{method:'PATCH',body:JSON.stringify(update)});setPreferences(data.preferences);onToast('Notification preferences saved.');}
-    catch(failure){setPreferences(previous);setError(failure.message);}finally{saving.current=false;setBusy(false);}
+    let timer;
+    const sub = subscribeToDmEvents(event => {
+      if (event !== 'loop-notification' && event !== 'loop-notifications-read') return;
+      clearTimeout(timer); timer = setTimeout(() => load(), 200);
+    });
+    return () => { version.current++; request.current?.abort(); clearTimeout(timer); sub.close(); };
+  }, [load]);
+  useEffect(() => { if (visible && !showSettings) load(); }, [visible, showSettings, load]);
+  const read = async item => {
+    if (readLock.current) return;
+    if (item?.read) { onOpen(item); return; }
+    readLock.current = true; setReadBusy(true); setError('');
+    try {
+      await apiRequest('/loop/notifications/read', { method: 'POST', body: JSON.stringify(item ? { ids: [item.id] } : {}) });
+      await load();
+    } catch (failure) { setError(failure.message); }
+    finally { readLock.current = false; setReadBusy(false); }
+    if (item) onOpen(item);
   };
-  const read = async ids => {try{await apiRequest('/loop/notifications/read',{method:'POST',body:JSON.stringify(ids ? {ids} : {})});await load();}catch(failure){setError(failure.message);}};
-  if(!visible)return null;
-  return <section className="loop-notification-panel" aria-label="Loop notifications">
-    <header className="loop-notification-heading"><h2>Notifications</h2><div><button type="button" onClick={()=>read()}>Mark all read</button><button type="button" aria-expanded={editing} onClick={()=>setEditing(!editing)}>Preferences</button></div></header>
-    {editing ? <div className="loop-notification-preferences"><p>Choose what appears here. Turning a category off stops new notifications, not the activity itself.</p>
-      {preferences ? <><label><input type="checkbox" disabled={busy} checked={categories.every(([key])=>!preferences[key])} onChange={event=>save(Object.fromEntries(categories.map(([key])=>[key,!event.target.checked])))} />Pause all notifications</label>
-      {categories.map(([key,label])=><label key={key}><input type="checkbox" checked={preferences[key]} disabled={busy} onChange={event=>save({[key]:event.target.checked})}/>{label}</label>)}</> : <p role="status">Loading preferences…</p>}
-    </div> : null}
-    {error ? <p className="loop-inline-error" role="alert">{error} <button type="button" onClick={()=>load()}>Try again</button></p> : null}
-    {items.map(item=><button className={`loop-notification-item${item.read ? '' : ' is-unread'}`} type="button" key={item.id} onClick={async()=>{await read([item.id]);onOpen(item);}}>
-      {item.actor?.avatarUrl ? <img className="loop-avatar is-small" src={item.actor.avatarUrl} alt="" loading="lazy"/> : <span className="loop-avatar is-small">{(item.actor?.username || '?').slice(0,2)}</span>}
-      <span><strong>{item.actor?.username || 'Someone'}</strong> {item.body}{item.preview ? <span className="loop-notification-preview">“{item.preview}”</span> : null}<small>{new Date(item.createdAt).toLocaleString()}{item.read ? '' : ' · Unread'}</small></span>
-    </button>)}
-    {!items.length && !error ? <p className="loop-muted">You’re all caught up. Replies, mentions, and other activity will appear here.</p> : null}
-    {next ? <button className="loop-thread-more" type="button" onClick={()=>load(next)}>Load more notifications</button> : null}
-  </section>;
+  const groups = useMemo(() => {
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const yesterday = new Date(today); yesterday.setDate(today.getDate() - 1);
+    const result = new Map();
+    for (const item of items) {
+      const time = Date.parse(item.createdAt);
+      const title = time >= today.getTime() ? 'Today' : time >= yesterday.getTime() ? 'Yesterday' : 'Earlier';
+      if (!result.has(title)) result.set(title, []);
+      result.get(title).push(item);
+    }
+    return ['Today', 'Yesterday', 'Earlier'].filter(title => result.has(title)).map(title => [title, result.get(title)]);
+  }, [items]);
+  if (!visible) return null;
+  return <LoopPanelDialog title={showSettings ? 'Loop settings' : 'Notifications'} icon={showSettings ? 'settings' : 'bell'}
+    description={showSettings ? 'Make Loop feel right for you.' : unread ? `${unread.toLocaleString()} unread · Your latest Loop activity` : 'Your latest Loop activity'} onClose={onClose}
+    actions={<div className="loop-panel-toolbar">{showSettings ? <button type="button" onClick={() => onSettings(false)}><LoopPanelIcon name="bell" size={16} />Notifications</button> : <>
+      <div className="loop-notification-tabs" role="group" aria-label="Notification filter">{['all', 'unread'].map(value => <button key={value} type="button" aria-pressed={filter === value} onClick={() => { if (value !== filter) { setItems([]); setLoading(true); setFilter(value); } }}>{value === 'all' ? 'All activity' : 'Unread'}</button>)}</div>
+      <button className="loop-mark-read" type="button" disabled={readBusy || !unread} onClick={() => read()}><LoopPanelIcon name="check" size={16} /><span>{readBusy ? 'Marking…' : 'Mark all read'}</span></button>
+      <button className="loop-panel-icon-button" type="button" aria-label="Notification settings" onClick={() => onSettings(true)}><LoopPanelIcon name="settings" size={18} /></button>
+    </>}</div>}>
+    {showSettings ? <LoopSettings /> : <>
+      {error ? <div className="loop-panel-error" role="alert"><p>{error}</p><button type="button" onClick={() => load()}>Try again</button></div> : null}
+      {loading && !items.length ? <div className="loop-panel-skeleton" role="status" aria-label="Loading notifications"><span /><span /><span /></div> : groups.map(([title, entries]) => <section className="loop-activity-group" key={title}><h3>{title}</h3><div>{entries.map(item => <button className={`loop-activity-item${item.read ? '' : ' is-unread'}`} type="button" key={item.id} disabled={readBusy} onClick={() => read(item)}>
+        <span className="loop-activity-avatar">{item.actor?.avatarUrl ? <img src={item.actor.avatarUrl} alt="" loading="lazy" decoding="async" /> : <span>{(item.actor?.username || '?').slice(0, 2).toUpperCase()}</span>}<span className={`loop-activity-kind is-${item.type}`}><LoopPanelIcon name={item.type} size={12} /></span></span>
+        <span className="loop-activity-copy"><span><strong>{item.actor?.username || 'Someone'}{item.actor?.verified ? <VerifiedMark /> : null}</strong> {item.body}</span>{item.preview ? <span className="loop-activity-preview">{item.preview}</span> : null}<time dateTime={item.createdAt} title={new Date(item.createdAt).toLocaleString()}>{timeLabel(item.createdAt)}</time></span>
+        {!item.read ? <span className="loop-activity-unread" aria-label="Unread" /> : null}
+      </button>)}</div></section>)}
+      {!loading && !items.length && !error ? <div className="loop-panel-empty"><span><LoopPanelIcon name={filter === 'unread' ? 'check' : 'bell'} size={28} /></span><h3>{filter === 'unread' ? 'You’re all caught up' : 'Your activity starts here'}</h3><p>{filter === 'unread' ? 'No unread notifications. You can still see everything in All activity.' : 'Replies, mentions, likes, and new followers will show up here.'}</p></div> : null}
+      {next ? <button className="loop-panel-load-more" type="button" disabled={moreLoading || loading} onClick={() => load(next)}>{moreLoading ? 'Loading…' : 'Show older notifications'}</button> : null}
+    </>}
+  </LoopPanelDialog>;
 }

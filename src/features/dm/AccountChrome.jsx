@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { disableDesktopPush, enableDesktopPush, notificationPermission } from '../../app/desktopPush';
 import { promptInstall, subscribePwa } from '../../app/pwa';
 import { signOut } from '../../app/storage';
-import { changePassword, deleteAccount, getAccountSessions, getBlockedUsers, resetUserPassword, revokeAccountSession, revokeOtherSessions, sendPushAnnouncement, sendTestPush, setKeepInformationSecret, setPresenceHidden, setPresenceStatus, setPrivateNotesEnabled, setShowInspectServers, subscribeToDmEvents, unblockUser, updateAccountAccessibility, updateAccountAvatar, updateAccountBio, updateAccountCustomBadges, updateAccountDiscord, updateAccountGrade, updateAccountProgram, updateAccountProfileBackground, updateAccountSchool, updateAccountSocialLinks, updateAccountUsername } from '../../app/dmApi';
-import { applyAccessibilitySettings, DEFAULT_ACCESSIBILITY, normalizeAccessibility } from '../../app/accessibility';
+import { changePassword, deleteAccount, getAccountSessions, getBlockedUsers, revokeAccountSession, revokeOtherSessions, setKeepInformationSecret, setPresenceHidden, setPresenceStatus, setPrivateNotesEnabled, setShowInspectServers, subscribeToDmEvents, unblockUser, updateAccountAccessibility, updateAccountAvatar, updateAccountBio, updateAccountCustomBadges, updateAccountDiscord, updateAccountGrade, updateAccountProgram, updateAccountProfileBackground, updateAccountSchool, updateAccountSocialLinks, updateAccountUsername } from '../../app/dmApi';
+import { applyAccessibilitySettings, normalizeAccessibility } from '../../app/accessibility';
+import { clearLoopAuraReminderHistory } from '../../app/loopAuraPreferences';
 import GleanButton from './GleanButton';
 import { schoolFitsGrade } from '../../app/laredoSchools';
 import { programDraftFromAccount } from '../../app/programs';
@@ -20,10 +21,12 @@ import { Avatar } from './DmPrimitives';
 import { SettingsIcon } from './icons';
 import { useUserPopout } from './userPopout';
 import { CURRENT_RELEASE } from '../../app/releaseNotes';
+import { APP_VERSION } from '../../app/version';
+import { ROUTES } from '../../app/routes';
 import { formatJoinedDate, formatReleaseDate } from './formatters';
 import { MAX_CUSTOM_BADGES, MAX_CUSTOM_BADGE_LABEL, normalizeCustomBadges } from '../../app/customBadges';
 import { isDeveloperModeEnabled, setDeveloperModeEnabled, subscribeDeveloperMode } from '../../app/developerMode';
-import { ProfileSettings, PrivacySettings, SecuritySettings, NotificationSettings, AccessibilitySettings } from './AccountSettingsPanels';
+import { ProfileSettings, PrivacySettings, SecuritySettings, NotificationSettings, AccessibilitySettings, AppsSettings } from './AccountSettingsPanels';
 import { SettingIcon, SettingsNotice } from './AccountSettingsPrimitives';
 import './AccountSettings.css';
 import { deleteE2EEIdentity, ensureE2EEIdentity, prepareProfileKeyBackupForPasswordChange, resetE2EEIdentity } from '../../app/e2ee';
@@ -31,12 +34,15 @@ import { deleteE2EEIdentity, ensureE2EEIdentity, prepareProfileKeyBackupForPassw
 const AVATAR_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
 const AVATAR_MAX_BYTES = 200 * 1024 * 1024;
 const RELEASE_DISMISSED_KEY = 'glean.dismissed-release-version';
+const ReportsQueue = lazy(() => import('./ReportsQueue'));
 const SETTINGS_SECTIONS = [
   { id: 'profile', title: 'Profile', description: 'Your identity, appearance, and school.' },
   { id: 'privacy', title: 'Privacy', description: 'Control your visibility and who can reach you.' },
   { id: 'security', title: 'Security', description: 'Protect your account and manage signed-in devices.' },
   { id: 'notifications', title: 'Notifications', description: 'Choose how Glean gets your attention.' },
   { id: 'accessibility', title: 'Accessibility', description: 'Make Glean comfortable for you.' },
+  { id: 'apps', title: 'Apps', description: 'Explore apps connected to your Glean account.' },
+  { id: 'reports', title: 'Reports', description: 'Review global Glean message reports and restrict accounts.', reviewerOnly: true },
   { id: 'info', title: 'Info', description: 'About Glean and developer tools.' },
 ];
 
@@ -48,7 +54,7 @@ function dismissRelease() {
   try { window.localStorage.setItem(RELEASE_DISMISSED_KEY, CURRENT_RELEASE.version); } catch { /* storage can be unavailable */ }
 }
 
-export default function AccountChrome({ account, onAccountUpdated, onSignedOut }) {
+export default function AccountChrome({ account, onAccountUpdated, onSignedOut, goTo }) {
   const accountRef = useRef(account);
   accountRef.current = account;
   const username = account?.username || 'you';
@@ -56,6 +62,7 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
   const bannerPreview = useContactBannerStyle(account);
   const profileBackgroundPreview = profileThemeStyle(account?.profileBackground);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [dmRecoveryRequested, setDmRecoveryRequested] = useState(false);
   const [showReleaseNotes, setShowReleaseNotes] = useState(() => !releaseWasDismissed());
   const [bioDraft, setBioDraft] = useState(account?.bio || '');
   const [usernameDraft, setUsernameDraft] = useState(account?.username || '');
@@ -76,11 +83,6 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
   const [isSigningOut, setIsSigningOut] = useState(false);
   const [notifyState, setNotifyState] = useState(() => notificationPermission());
   const [notifyBusy, setNotifyBusy] = useState(false);
-  const [testPushBusy, setTestPushBusy] = useState(false);
-  const [testPushNote, setTestPushNote] = useState('');
-  const [announcementDraft, setAnnouncementDraft] = useState('');
-  const [announcementBusy, setAnnouncementBusy] = useState(false);
-  const [announcementNote, setAnnouncementNote] = useState('');
   const [pwa, setPwa] = useState(() => ({ standalone: false, canInstall: false }));
   const [cropSource, setCropSource] = useState(null);
   const [cropError, setCropError] = useState('');
@@ -90,7 +92,9 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
   const [settingsTab, setSettingsTab] = useState('profile');
   const settingsDialogRef = useRef(null);
   const settingsScrollRef = useRef(null);
-  const activeSettings = SETTINGS_SECTIONS.find((section) => section.id === settingsTab);
+  const dmRecoveryDisclosureRef = useRef(null);
+  const settingsSections = SETTINGS_SECTIONS.filter(section => !section.reviewerOnly || account?.canReviewReports);
+  const activeSettings = settingsSections.find((section) => section.id === settingsTab) || SETTINGS_SECTIONS[0];
   const selectSettings = (tab) => {
     setSettingsTab(tab);
     setSettingsError('');
@@ -113,10 +117,6 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
   const [dmKeyBusy, setDmKeyBusy] = useState(false);
   const [dmKeyError, setDmKeyError] = useState('');
   const [dmKeyNote, setDmKeyNote] = useState('');
-  const [resetUsername, setResetUsername] = useState('');
-  const [resetPassword, setResetPassword] = useState('');
-  const [resetNote, setResetNote] = useState('');
-  const [isResettingPassword, setIsResettingPassword] = useState(false);
   const [sessions, setSessions] = useState([]);
   const [sessionsLoading, setSessionsLoading] = useState(false);
   const [sessionsBusy, setSessionsBusy] = useState('');
@@ -172,6 +172,38 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
 
   useEffect(() => subscribePwa(setPwa), []);
   useEffect(() => subscribeDeveloperMode(setDeveloperMode), []);
+
+  useEffect(() => {
+    const openDmRecovery = () => {
+      closeProfile();
+      setSettingsError('');
+      setDmKeyPassword('');
+      setDmKeyAcknowledged(false);
+      setDmKeyStatus('checking');
+      setDmKeyError('');
+      setDmKeyNote('');
+      setSettingsTab('security');
+      setIsSettingsOpen(true);
+      setDmRecoveryRequested(true);
+    };
+    window.addEventListener('glean-open-dm-recovery', openDmRecovery);
+    return () => window.removeEventListener('glean-open-dm-recovery', openDmRecovery);
+  }, [closeProfile]);
+
+  useEffect(() => {
+    if (!isSettingsOpen || settingsTab !== 'security' || !dmRecoveryRequested) return undefined;
+    let focusFrame = 0;
+    const frame = window.requestAnimationFrame(() => {
+      const disclosure = dmRecoveryDisclosureRef.current;
+      if (disclosure) {
+        disclosure.open = true;
+        disclosure.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        focusFrame = window.requestAnimationFrame(() => disclosure.querySelector('summary')?.focus({ preventScroll: true }));
+      }
+      setDmRecoveryRequested(false);
+    });
+    return () => { window.cancelAnimationFrame(frame); window.cancelAnimationFrame(focusFrame); };
+  }, [isSettingsOpen, settingsTab, dmRecoveryRequested]);
 
   useEffect(() => {
     if (!isSettingsOpen) return undefined;
@@ -315,7 +347,7 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
     accessibilitySaveTimer.current = window.setTimeout(() => {
       setIsSavingAccessibility(true);
       setSettingsError('');
-      updateAccountAccessibility(next.contrast, next.saturation, next.reduceMotion, next.glassFrost, next.glassDepth, next.glassRefraction, next.theme)
+      updateAccountAccessibility(next.contrast, next.saturation, next.reduceMotion, next.glassFrost, next.glassDepth, next.glassRefraction, next.theme, next.showLoopStreakReminder)
         .then((nextAccount) => {
           onAccountUpdated({ ...accountRef.current, accessibility: nextAccount.accessibility });
           setAccessibilitySaved(true);
@@ -326,11 +358,8 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
   };
 
   const changeAccessibility = (key, value) => {
-    saveAccessibilityPreferences(normalizeAccessibility({ ...accessibility, [key]: key === 'theme' ? value : Number(value) }));
-  };
-
-  const resetGlassOptics = () => {
-    saveAccessibilityPreferences(normalizeAccessibility({ ...accessibility, glassDepth: DEFAULT_ACCESSIBILITY.glassDepth, glassRefraction: DEFAULT_ACCESSIBILITY.glassRefraction }));
+    if (key === 'showLoopStreakReminder' && value) clearLoopAuraReminderHistory(account?.id);
+    saveAccessibilityPreferences(normalizeAccessibility({ ...accessibility, [key]: ['theme', 'showLoopStreakReminder'].includes(key) ? value : Number(value) }));
   };
 
   const savePassword = async (event) => {
@@ -384,23 +413,6 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
       setDmKeyError(error.message || 'Could not reset DM encryption.');
     } finally {
       setDmKeyBusy(false);
-    }
-  };
-
-  const resetUserPasswordForAdmin = async (event) => {
-    event.preventDefault();
-    if (isResettingPassword) return;
-    setIsResettingPassword(true);
-    setResetNote('');
-    setSettingsError('');
-    try {
-      const result = await resetUserPassword(resetUsername, resetPassword);
-      setResetPassword('');
-      setResetNote(`Password reset for @${result.username}. Their active sessions were signed out.`);
-    } catch (error) {
-      setSettingsError(error.message);
-    } finally {
-      setIsResettingPassword(false);
     }
   };
 
@@ -678,37 +690,6 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
     }
   };
 
-  const sendTestNotification = async () => {
-    if (testPushBusy) return;
-    setTestPushBusy(true);
-    setTestPushNote('');
-    setSettingsError('');
-    try {
-      const result = await sendTestPush();
-      setTestPushNote(result.sent ? `Sent to ${result.sent} ${result.sent === 1 ? 'person' : 'people'}.` : 'Sent. Nobody has notifications on yet.');
-    } catch (error) {
-      setSettingsError(error.message);
-    } finally {
-      setTestPushBusy(false);
-    }
-  };
-
-  const sendAnnouncement = async () => {
-    if (announcementBusy || !announcementDraft.trim()) return;
-    setAnnouncementBusy(true);
-    setAnnouncementNote('');
-    setSettingsError('');
-    try {
-      const result = await sendPushAnnouncement(announcementDraft);
-      setAnnouncementDraft('');
-      setAnnouncementNote(result.sent ? `Queued for ${result.sent} user${result.sent === 1 ? '' : 's'} with notifications enabled.` : 'No users have enabled desktop notifications yet.');
-    } catch (error) {
-      setSettingsError(error.message);
-    } finally {
-      setAnnouncementBusy(false);
-    }
-  };
-
   const saveCroppedAvatar = async (file, crop = null) => {
     setIsUploadingAvatar(true);
     setCropError('');
@@ -765,9 +746,9 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
             <aside className="dm-settings-sidebar">
               <div className="dm-settings-category"><img src="/glean-mark.svg" alt="" /><span>Glean<small>Settings</small></span></div>
               <div className="dm-settings-subnav" role="navigation" aria-label="Settings sections">
-                {SETTINGS_SECTIONS.filter((section) => section.id !== 'info').map((section) => <button key={section.id} type="button" aria-current={settingsTab === section.id ? 'page' : undefined} className={settingsTab === section.id ? 'is-active' : ''} onClick={() => selectSettings(section.id)}><SettingIcon name={section.id} /><span>{section.title}</span></button>)}
+                {settingsSections.filter((section) => section.id !== 'info').map((section) => <button key={section.id} type="button" aria-current={settingsTab === section.id ? 'page' : undefined} className={settingsTab === section.id ? 'is-active' : ''} onClick={() => selectSettings(section.id)}><SettingIcon name={section.id} /><span>{section.title}</span></button>)}
               </div>
-              <button type="button" aria-current={settingsTab === 'info' ? 'page' : undefined} className={`dm-settings-info${settingsTab === 'info' ? ' is-active' : ''}`} onClick={() => selectSettings('info')}>Info <small>Glean {CURRENT_RELEASE.version}</small></button>
+              <button type="button" aria-current={settingsTab === 'info' ? 'page' : undefined} className={`dm-settings-info${settingsTab === 'info' ? ' is-active' : ''}`} onClick={() => selectSettings('info')}>Info <small>Glean {APP_VERSION}</small></button>
               <button className="dm-settings-signout" type="button" onClick={handleSignOut} disabled={isSigningOut}>{isSigningOut ? 'Signing out…' : 'Sign out'}</button>
             </aside>
             <div className="dm-settings-content">
@@ -776,12 +757,13 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
                 {settingsTab === 'profile' ? <GleanButton className="settings-profile-save" form="account-profile-form" type="submit" disabled={isSavingBio}>{isSavingBio ? 'Saving…' : 'Save profile'}</GleanButton> : null}
                 {settingsTab === 'accessibility' ? <p className="settings-autosave" role="status">{isSavingAccessibility ? 'Saving…' : accessibilitySaved ? 'Saved to your profile' : 'Changes save automatically'}</p> : null}
                 <button type="button" className="dm-settings-close" onClick={closeSettings} aria-label="Close settings"><SettingIcon name="close" /></button>
-                <label className="dm-settings-mobile-picker"><span>Section</span><select value={settingsTab} onChange={(event) => selectSettings(event.target.value)}>{SETTINGS_SECTIONS.map((section) => <option key={section.id} value={section.id}>{section.title}</option>)}</select></label>
+                <label className="dm-settings-mobile-picker"><span>Section</span><select value={settingsTab} onChange={(event) => selectSettings(event.target.value)}>{settingsSections.map((section) => <option key={section.id} value={section.id}>{section.title}</option>)}</select></label>
               </header>
               <div className="dm-settings-scroll" ref={settingsScrollRef}>
               <div className="settings-page-body">
                 <SettingsNotice error>{settingsError}</SettingsNotice>
-                {settingsTab === 'profile' ? <ProfileSettings
+                {settingsTab === 'reports' && account?.canReviewReports ? <Suspense fallback={<p role="status">Loading reports…</p>}><ReportsQueue /></Suspense> : null}
+                {settingsTab === 'reports' ? null : settingsTab === 'profile' ? <ProfileSettings
                   account={account}
                   draft={{ username: usernameDraft, bio: bioDraft, grade: gradeDraft, school: schoolDraft, programs: programDraft, discord: discordDraft, instagram: instagramDraft, instagramUsername: instagramUsernameDraft, tiktok: tiktokDraft, tiktokUsername: tiktokUsernameDraft, badges: customBadgeDraft }}
                   onChange={changeProfileDraft} banner={bannerPreview} background={profileBackgroundPreview}
@@ -798,23 +780,27 @@ export default function AccountChrome({ account, onAccountUpdated, onSignedOut }
                   passwordBusy={isSavingPassword} passwordNote={passwordNote} onSavePassword={savePassword}
                   sessions={sessions} sessionsLoading={sessionsLoading} sessionsBusy={sessionsBusy} onRevoke={revokeSession} onRevokeOthers={revokeOthers}
                   encryption={{ status: dmKeyStatus, password: dmKeyPassword, setPassword: setDmKeyPassword, acknowledged: dmKeyAcknowledged, setAcknowledged: setDmKeyAcknowledged, busy: dmKeyBusy, reset: resetDmEncryption, note: dmKeyNote, error: dmKeyError }}
-                  admin={{ username: resetUsername, setUsername: setResetUsername, password: resetPassword, setPassword: setResetPassword, busy: isResettingPassword, submit: resetUserPasswordForAdmin, note: resetNote }}
-                  onDelete={openDeleteWarning}
+                  onDelete={openDeleteWarning} dmRecoveryDisclosureRef={dmRecoveryDisclosureRef}
                 /> : settingsTab === 'notifications' ? <NotificationSettings
                   account={account} permission={notifyState} busy={notifyBusy} onEnable={toggleNotifications}
-                  test={{ send: sendTestNotification, busy: testPushBusy, note: testPushNote }}
-                  announcement={{ draft: announcementDraft, setDraft: setAnnouncementDraft, send: sendAnnouncement, busy: announcementBusy, note: announcementNote }}
                   pwa={pwa} onInstall={() => promptInstall().catch(error => setSettingsError(error.message || 'Could not install Glean.'))}
-                /> : settingsTab === 'accessibility' ? <AccessibilitySettings value={accessibility} onChange={changeAccessibility} onReset={resetGlassOptics} mainThemes={account.mainThemes} onThemeSaved={mainThemes => onAccountUpdated({ ...accountRef.current, mainThemes })} /> : (
+                /> : settingsTab === 'accessibility' ? <AccessibilitySettings value={accessibility} onChange={changeAccessibility} mainThemes={account.mainThemes} onThemeSaved={mainThemes => onAccountUpdated({ ...accountRef.current, mainThemes })} /> : settingsTab === 'apps' ? <AppsSettings onEnterLoop={() => { closeSettings(); if (goTo) goTo(ROUTES.LOOP); else window.location.assign('/loop'); }} /> : (
                   <section className="dm-info-screen" aria-labelledby="glean-info-name">
-                    <img src="/glean-mark.svg" alt="Glean logo" />
-                    <div className="dm-info-brandline"><h2 id="glean-info-name">Glean</h2><span>Beta</span></div>
-                    <p>Version <strong>{CURRENT_RELEASE.version}</strong></p>
+                    <header className="dm-info-overview">
+                      <img src="/glean-mark.svg" alt="" />
+                      <div className="dm-info-overview-copy">
+                        <div className="dm-info-brandline"><h2 id="glean-info-name">Glean</h2><span>Beta</span></div>
+                        <p>Version <strong>{APP_VERSION}</strong></p>
+                      </div>
+                    </header>
                     <dl className="dm-info-details">
                       <div><dt>Release date</dt><dd><time dateTime={CURRENT_RELEASE.releasedAt}>{formatReleaseDate(CURRENT_RELEASE.releasedAt)}</time></dd></div>
                       <div><dt>You joined</dt><dd>{formatJoinedDate(account?.createdAt) || 'Date unavailable'}</dd></div>
                     </dl>
-                    <GleanButton type="button" onClick={() => setShowReleaseNotes(true)}>View update log</GleanButton>
+                    <div className="dm-info-release-action">
+                      <span><strong>What’s new</strong><small>See what changed in the latest Glean release.</small></span>
+                      <GleanButton type="button" onClick={() => setShowReleaseNotes(true)}>View update log</GleanButton>
+                    </div>
                     <div className="dm-developer-mode-setting"><span><strong>Developer Mode</strong><small>Show local performance and network diagnostics.</small></span><button className="dm-accessibility-switch" type="button" role="switch" aria-checked={developerMode} onClick={() => setDeveloperModeEnabled(!developerMode)}>{developerMode ? 'On' : 'Off'}</button></div>
                   </section>
                 )}

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { CommunityAvatar } from './CommunityAvatar';
 import { VoiceBadges } from './VoiceBits';
-import { HeadphonesIcon, MicIcon, MicOffIcon, PhoneOffIcon, RocketIcon, ScreenIcon, SpeakerIcon, VideoIcon } from '../dm/icons';
+import { CloseIcon, SettingsIcon, HeadphonesIcon, MicIcon, MicOffIcon, PhoneOffIcon, RocketIcon, ScreenIcon, SpeakerIcon, VideoIcon } from '../dm/icons';
+import './VoiceRoom.css';
 import AppShelf from '../apps/AppShelf';
 import AppStage from '../apps/AppStage';
 import useAppSession from '../apps/useAppSession';
@@ -16,6 +17,7 @@ const RTC_CONFIG = {
 };
 
 const VOLUME_STORAGE = 'glean:voice-person-volumes';
+const videoBindings = new WeakMap();
 
 function tuneVideoSender(sender) {
   if (!sender) return;
@@ -46,6 +48,11 @@ function streamHasLiveVideo(stream) {
 
 function clearVideo(node) {
   if (!node) return;
+  const binding = videoBindings.get(node);
+  binding?.track.removeEventListener('unmute', binding.play);
+  videoBindings.delete(node);
+  node.onloadedmetadata = null;
+  node.oncanplay = null;
   node.pause();
   node.srcObject = null;
   node.removeAttribute('src');
@@ -78,12 +85,16 @@ function bindVideo(node, track, { mirror = false } = {}) {
   }
   const current = node.srcObject;
   const same = current instanceof MediaStream && current.getVideoTracks()[0] === track;
+  const binding = videoBindings.get(node);
+  if (same && binding?.track === track) return true;
+  binding?.track.removeEventListener('unmute', binding.play);
   if (!same) node.srcObject = new MediaStream([track]);
   const play = () => node.play().catch(() => {});
   play();
   node.onloadedmetadata = play;
   node.oncanplay = play;
   track.addEventListener('unmute', play);
+  videoBindings.set(node, { track, play });
   return true;
 }
 
@@ -142,6 +153,7 @@ export default function VoiceRoom({
   const live = Boolean(stream);
   const [asking, setAsking] = useState(false);
   const [cameraBusy, setCameraBusy] = useState(false);
+  const [sharingBusy, setSharingBusy] = useState(false);
   const [muted, setMuted] = useState(false);
   const [deafened, setDeafened] = useState(false);
   const [cameraOn, setCameraOn] = useState(false);
@@ -173,6 +185,8 @@ export default function VoiceRoom({
   const localVideoRef = useRef(null);
   const localPipRef = useRef(null);
   const mutedRef = useRef(false);
+  const mutedBeforeDeafen = useRef(false);
+  const shareLock = useRef(false);
   const deafenedRef = useRef(false);
   const cameraRef = useRef(false);
   const sharingRef = useRef(false);
@@ -497,7 +511,8 @@ export default function VoiceRoom({
 
   const toggleDeafen = () => {
     const next = !deafenedRef.current;
-    emitState({ deafened: next, muted: next ? true : mutedRef.current, speaking: false });
+    if (next) mutedBeforeDeafen.current = mutedRef.current;
+    emitState({ deafened: next, muted: next ? true : mutedBeforeDeafen.current, speaking: false });
     applyLocalAudio();
     applyRemoteAudio();
   };
@@ -615,11 +630,15 @@ export default function VoiceRoom({
   };
 
   const toggleShare = async () => {
+    if (shareLock.current) return;
     if (sharingRef.current) {
       stopSharing();
       return;
     }
+    shareLock.current = true;
+    setSharingBusy(true);
     try {
+      if (!navigator.mediaDevices?.getDisplayMedia) throw new Error('Screen sharing is unavailable in this browser.');
       const display = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
       const track = display.getVideoTracks()[0];
       screenTrackRef.current?.stop();
@@ -633,6 +652,9 @@ export default function VoiceRoom({
       setError('');
     } catch {
       setError('Screen sharing was cancelled or unavailable.');
+    } finally {
+      shareLock.current = false;
+      setSharingBusy(false);
     }
   };
 
@@ -696,20 +718,24 @@ export default function VoiceRoom({
     return next;
   })();
   const showLocalVideo = cameraOn || sharing;
+  const connected = live && occupants.some(user => Number(user.id) === Number(account.id));
 
   return (
     <section className={`community-voice-room${stashed ? ' is-stashed' : ''}`} aria-label={`Voice chat in ${channel.name}`} aria-hidden={stashed || undefined}>
       <header>
-        <h1><SpeakerIcon /> {channel.name}</h1>
-        <span className="community-voice-count">{live ? `${roster.length} in call` : 'Voice'}</span>
+        <div className="voice-room-heading"><span className="voice-room-icon"><SpeakerIcon /></span><div><h1>{channel.name}</h1><p>{live ? `${roster.length} ${roster.length === 1 ? 'person' : 'people'} in voice` : occupants.length ? `${occupants.length} ${occupants.length === 1 ? 'person is' : 'people are'} here` : 'A place to talk together'}</p></div></div>
+        <span className={`voice-room-status${connected ? ' is-connected' : ''}`} role="status"><span className="voice-status-dot" />{live ? connected ? 'Connected' : 'Connecting…' : 'Voice channel'}</span>
       </header>
       {error ? <p className="community-voice-error" role="alert">{error}</p> : null}
       {audioPlaybackBlocked ? <p className="community-voice-error" role="status">Your browser blocked voice playback. <button type="button" onClick={enableRemoteAudio}>Enable audio</button></p> : null}
-      {!live ? (
+      <div className="voice-room-body">{!live ? (
         <div className="community-voice-lobby">
-          <CommunityAvatar user={account} />
-          <p>{joiningCall ? 'Connecting to voice…' : 'Join and allow microphone access when your browser asks.'}</p>
-          <button type="button" onClick={joinVoice} disabled={joiningCall}>{joiningCall ? 'Connecting…' : 'Join Voice'}</button>
+          <span className="voice-lobby-icon"><HeadphonesIcon /></span>
+          <h2>{occupants.length ? 'Join the conversation' : 'Make yourself at home'}</h2>
+          <p>{joiningCall ? 'Getting your microphone ready…' : occupants.length ? 'Your people are here. Join when you’re ready.' : 'This room is quiet. Be the first to drop in.'}</p>
+          {occupants.length ? <div className="voice-lobby-roster"><div>{occupants.slice(0,5).map(user => <CommunityAvatar key={user.id} user={user} interactive={false} />)}</div><span>{occupants.slice(0,3).map(user => user.username).join(', ')}{occupants.length > 3 ? ` and ${occupants.length - 3} more` : ''}</span></div> : null}
+          <button type="button" onClick={joinVoice} disabled={joiningCall}><MicIcon />{joiningCall ? 'Connecting…' : 'Join Voice'}</button>
+          <small>Microphone permission is required. Camera stays off.</small>
         </div>
       ) : (
         <>
@@ -778,7 +804,7 @@ export default function VoiceRoom({
                   )}
                   {showPip ? <video className="community-voice-pip" autoPlay playsInline muted ref={(node) => { if (localPipRef.current !== node) { localPipRef.current = node; attachLocalPreview(); } }} /> : null}
                   <CommunityAvatar user={participant} />
-                  <strong>{participant.username}{self ? ' (you)' : ''}</strong>
+                  <div className="voice-participant-caption"><strong>{participant.username}{self ? ' (you)' : ''}</strong><span>{participant.deafened ? 'Sound off' : participant.muted ? 'Muted' : participant.speaking ? 'Speaking' : participant.sharing ? 'Sharing screen' : participant.camera ? 'Camera on' : 'Listening'}</span></div>
                   <VoiceBadges user={participant} />
                   {!self ? <div className="community-voice-volume-control" onPointerDown={(event) => event.stopPropagation()}>
                     <button type="button" aria-label={`Adjust ${participant.username} volume`} aria-expanded={showVolumeFor === Number(participant.id)} onClick={() => setShowVolumeFor((current) => current === Number(participant.id) ? null : Number(participant.id))}>
@@ -793,28 +819,32 @@ export default function VoiceRoom({
               );
             })}
           </div>
-          {showDeviceSettings ? <div className="community-voice-device-settings">
+        </>
+      )}</div>
+      {live ? <>
+          {showDeviceSettings ? <div className="voice-device-panel"><div className="voice-device-heading"><h2>Audio & video</h2><button type="button" aria-label="Close device settings" onClick={() => setShowDeviceSettings(false)}><CloseIcon /></button></div><div className="community-voice-device-settings">
             <label>Microphone <select value={micDeviceId} onChange={(event) => changeMicrophone(event.target.value)}><option value="">Default</option>{devices.filter((item) => item.kind === 'audioinput').map((item) => <option key={item.deviceId} value={item.deviceId}>{item.label || 'Microphone'}</option>)}</select></label>
             <label>Camera <select value={cameraDeviceId} onChange={(event) => changeCamera(event.target.value)}><option value="">Default</option>{devices.filter((item) => item.kind === 'videoinput').map((item) => <option key={item.deviceId} value={item.deviceId}>{item.label || 'Camera'}</option>)}</select></label>
             {typeof HTMLMediaElement !== 'undefined' && 'setSinkId' in HTMLMediaElement.prototype ? <label>Speaker <select value={speakerDeviceId} onChange={(event) => changeSpeaker(event.target.value)}><option value="">Default</option>{devices.filter((item) => item.kind === 'audiooutput').map((item) => <option key={item.deviceId} value={item.deviceId}>{item.label || 'Speaker'}</option>)}</select></label> : null}
-          </div> : null}
+          </div><p>Changes apply to this call. {typeof HTMLMediaElement !== 'undefined' && !('setSinkId' in HTMLMediaElement.prototype) ? 'Choose your speaker in your device’s sound settings.' : ''}</p></div> : null}
+          <div className="voice-call-footer"><p className="voice-self-status" role="status">{deafened ? 'Sound off · Microphone muted' : muted ? 'Your microphone is muted' : speaking ? 'You’re speaking' : 'Your microphone is on'}</p>
           <footer className="community-voice-controls">
-            <button type="button" aria-expanded={showDeviceSettings} onClick={() => setShowDeviceSettings((value) => !value)}><span>Devices</span></button>
-            <button type="button" aria-pressed={muted} aria-label={muted ? 'Unmute' : 'Mute'} onClick={toggleMute}>
+            <button type="button" className="is-utility" aria-label="Device settings" aria-expanded={showDeviceSettings} onClick={() => setShowDeviceSettings((value) => !value)}><SettingsIcon /><span>Devices</span></button>
+            <button type="button" disabled={deafened} aria-pressed={muted} aria-label={muted ? 'Unmute' : 'Mute'} title={deafened ? 'Turn sound on to use your microphone' : undefined} onClick={toggleMute}>
               {muted ? <MicOffIcon /> : <MicIcon />}
               <span>{muted ? 'Unmute' : 'Mute'}</span>
             </button>
             <button type="button" aria-pressed={deafened} aria-label={deafened ? 'Undeafen' : 'Deafen'} onClick={toggleDeafen}>
               <HeadphonesIcon />
-              <span>{deafened ? 'Listen' : 'Deafen'}</span>
+              <span>{deafened ? 'Sound on' : 'Sound off'}</span>
             </button>
             <button className="is-media" type="button" aria-pressed={cameraOn} aria-busy={cameraBusy || undefined} aria-label={cameraOn ? 'Camera off' : 'Camera on'} onClick={toggleCamera} disabled={cameraBusy}>
               <VideoIcon />
-              <span>Camera</span>
+              <span>{cameraBusy ? 'Starting…' : cameraOn ? 'Camera off' : 'Camera'}</span>
             </button>
-            <button className="is-media" type="button" aria-pressed={sharing} aria-label={sharing ? 'Stop sharing' : 'Share screen'} onClick={toggleShare}>
+            <button className="is-media" type="button" disabled={sharingBusy} aria-busy={sharingBusy || undefined} aria-pressed={sharing} aria-label={sharing ? 'Stop sharing' : 'Share screen'} onClick={toggleShare}>
               <ScreenIcon />
-              <span>Share</span>
+              <span>{sharingBusy ? 'Starting…' : sharing ? 'Stop share' : 'Share'}</span>
             </button>
             <button
               className={`community-apps-button${appsLive ? ' is-live' : ''}`}
@@ -830,7 +860,7 @@ export default function VoiceRoom({
               <PhoneOffIcon />
               <span>Leave</span>
             </button>
-          </footer>
+          </footer></div>
           {showShelf ? (
             <AppShelf
               session={apps.session}
@@ -840,8 +870,7 @@ export default function VoiceRoom({
               onClose={() => setShowShelf(false)}
             />
           ) : null}
-        </>
-      )}
+      </> : null}
     </section>
   );
 }

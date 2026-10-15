@@ -4,13 +4,23 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
+    "test:notification-preferences": "node scripts/notification-preferences-smoke.mjs",
+    "test:reports": "node scripts/message-reports-smoke.mjs",
+    "test:survey": "node scripts/feedback-survey-smoke.mjs",
+    "test:group-dm": "node scripts/group-dm-crypto-smoke.mjs && node scripts/group-dm-smoke.mjs",
+    "test:memory-saver": "node scripts/memory-saver-smoke.mjs",
+    "predev": "node scripts/write-emoji-assets.mjs",
+    "prebuild": "node scripts/write-emoji-assets.mjs",
+    "test:hardware-acceleration": "node scripts/hardware-acceleration-smoke.mjs",
+    "test:realtime": "node scripts/realtime-hub-smoke.mjs && node scripts/realtime-client-smoke.mjs && node scripts/realtime-network-smoke.mjs",
+    "test:background-performance": "node scripts/background-performance-smoke.mjs",
     "test:community-layout": "node scripts/community-layout-smoke.mjs",
     "test:main-themes": "node scripts/main-themes-smoke.mjs",
     "test:profile-background": "node scripts/profile-background-smoke.mjs",
     "dev": "node server.mjs",
     "build": "vite build && node scripts/write-pwa-assets.mjs",
     "start": "npm run build && node scripts/start.mjs",
-    "check": "node --check server.mjs && node --check server/security.mjs && node --check server/realtime.mjs && node --check server/loopPresence.mjs && node --check server/loop.mjs && node --check server/schoolSchedule.mjs && node --check server/push.mjs && node --check server/scheduledNotifications.mjs && node --check server/files.mjs && node --check src/app/agreements.js && node --check src/app/apiClient.js && node --check src/app/apiRoutes.js && node --check src/app/serverCache.js && node --check src/app/liveMessages.js && node --check src/app/accessibility.js && node --check src/app/e2ee.js && node --check src/app/dmApi.js && node --check src/app/developerMode.js && node --check src/app/invite.js && node --check src/app/presence.js && node --check src/app/pwa.js && node --check src/app/grade.js && node --check src/app/laredoSchools.js && node --check src/app/programs.js && node --check src/app/discordUsername.js && node --check src/app/username.js && node --check src/features/dm/banner.js && node --check src/features/dm/nameFonts.js && node --check src/features/dm/nameStyle.js && node --check src/features/dm/emojiData.js && node --check public/admin.js && node --check public/sw.js && node --check scripts/write-pwa-assets.mjs && node --check scripts/api-client-smoke.mjs && node --check scripts/developer-mode-smoke.mjs && node --check scripts/live-messages-smoke.mjs && node --check scripts/realtime-client-smoke.mjs && node --check scripts/scheduled-notifications-smoke.mjs && node --check scripts/school-schedule-smoke.mjs && node --check scripts/security-smoke.mjs && node --check scripts/agreements-smoke.mjs && node --check scripts/admin-access-smoke.mjs && node --check src/app/loopCache.js && node --check src/features/loop/loopRequest.js",
+    "check": "node --check server.mjs && node --check server/security.mjs && node --check server/realtime.mjs && node --check server/loopPresence.mjs && node --check server/loop.mjs && node --check server/schoolSchedule.mjs && node --check server/push.mjs && node --check server/scheduledNotifications.mjs && node --check server/files.mjs && node --check src/app/agreements.js && node --check src/app/apiClient.js && node --check src/app/apiRoutes.js && node --check src/app/serverCache.js && node --check src/app/liveMessages.js && node --check src/app/accessibility.js && node --check src/app/e2ee.js && node --check src/app/dmApi.js && node --check src/app/developerMode.js && node --check src/app/invite.js && node --check src/app/presence.js && node --check src/app/pwa.js && node --check src/app/grade.js && node --check src/app/laredoSchools.js && node --check src/app/programs.js && node --check src/app/discordUsername.js && node --check src/app/username.js && node --check src/features/dm/banner.js && node --check src/features/dm/nameFonts.js && node --check src/features/dm/nameStyle.js && node --check src/features/dm/emojiData.js && node --check public/sw.js && node --check scripts/write-pwa-assets.mjs && node --check scripts/api-client-smoke.mjs && node --check scripts/developer-mode-smoke.mjs && node --check scripts/live-messages-smoke.mjs && node --check scripts/realtime-client-smoke.mjs && node --check scripts/scheduled-notifications-smoke.mjs && node --check scripts/school-schedule-smoke.mjs && node --check scripts/security-smoke.mjs && node --check scripts/agreements-smoke.mjs && node --check src/app/loopCache.js && node --check src/features/loop/loopRequest.js",
     "test:dm": "node scripts/dm-state-smoke.mjs && node scripts/e2ee-restore-smoke.mjs && node scripts/live-messages-smoke.mjs && node scripts/server-smoke.mjs",
     "test:nura": "node scripts/nura-smoke.mjs",
     "test:loop-cache": "node scripts/loop-cache-smoke.mjs",
@@ -21,14 +31,17 @@
     "test:loop-presence": "node scripts/loop-presence-smoke.mjs",
     "test:loop-polls": "node scripts/loop-polls-smoke.mjs",
     "test:loop-social": "node scripts/loop-social-smoke.mjs",
+    "test:loop-aura": "node scripts/loop-aura-smoke.mjs",
+    "test:verified-badge": "node scripts/verified-badge-smoke.mjs",
     "test:loop-connection": "node scripts/loop-connection-smoke.mjs",
     "test:loop-captions": "node scripts/loop-captions-smoke.mjs",
-    "test": "node scripts/loop-video-download-smoke.mjs && node scripts/loop-cache-smoke.mjs && node scripts/loop-presence-smoke.mjs && node scripts/accessibility-motion-smoke.mjs && node scripts/loop-captions-smoke.mjs && node scripts/loop-connection-smoke.mjs && node scripts/loop-social-smoke.mjs && node scripts/loop-polls-smoke.mjs && node scripts/device-link-smoke.mjs && node scripts/developer-mode-smoke.mjs && node scripts/api-client-smoke.mjs && node scripts/live-messages-smoke.mjs && node scripts/realtime-client-smoke.mjs && node scripts/scheduled-notifications-smoke.mjs && node scripts/school-schedule-smoke.mjs && node scripts/security-smoke.mjs && node scripts/moderation-smoke.mjs && node scripts/agreements-smoke.mjs && node scripts/admin-access-smoke.mjs && node scripts/server-smoke.mjs && node scripts/official-announcements-smoke.mjs"
+    "test:loop-video-playback": "node scripts/loop-video-playback-smoke.mjs",
+    "test": "node scripts/loop-video-download-smoke.mjs && node scripts/loop-cache-smoke.mjs && node scripts/loop-presence-smoke.mjs && node scripts/accessibility-motion-smoke.mjs && node scripts/loop-captions-smoke.mjs && node scripts/loop-connection-smoke.mjs && node scripts/loop-social-smoke.mjs && node scripts/loop-polls-smoke.mjs && node scripts/device-link-smoke.mjs && node scripts/developer-mode-smoke.mjs && node scripts/api-client-smoke.mjs && node scripts/live-messages-smoke.mjs && node scripts/realtime-client-smoke.mjs && node scripts/scheduled-notifications-smoke.mjs && node scripts/school-schedule-smoke.mjs && node scripts/security-smoke.mjs && node scripts/moderation-smoke.mjs && node scripts/agreements-smoke.mjs && node scripts/server-smoke.mjs && node scripts/official-announcements-smoke.mjs"
   },
   "dependencies": {
-    "@samasante/liquid-glass": "^0.1.1",
     "@vitejs/plugin-react": "latest",
     "busboy": "^1.6.0",
+    "frimousse": "^0.4.0",
     "liquid-gooey": "^0.2.2",
     "qrcode": "^1.5.4",
     "react": "latest",
@@ -38,5 +51,8 @@
     "sharp": "^0.35.5",
     "vite": "latest",
     "web-push": "^3.6.7"
+  },
+  "devDependencies": {
+    "emojibase-data": "17.0.0"
   }
 }

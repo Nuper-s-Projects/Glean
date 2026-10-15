@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useImperativeHandle, useRef, useState, forwardRef } from 'react';
 import { UndoIcon } from '../../dm/icons';
+import { startVisualLoop } from '../../../app/pageActivity';
 
 const WIDTHS = [3, 6, 12, 22];
 const PAD_WIDTH = 1000;
@@ -73,15 +74,7 @@ const DrawPad = forwardRef(function DrawPad({ seed, blind = false, disabled = fa
     render();
   }, [render, seed]);
 
-  useEffect(() => {
-    let frame = 0;
-    const loop = () => {
-      render();
-      frame = requestAnimationFrame(loop);
-    };
-    frame = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(frame);
-  }, [render]);
+  useEffect(() => startVisualLoop(render), [render]);
 
   useImperativeHandle(ref, () => ({
     value: () => JSON.stringify(strokesRef.current),

@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { getVideoBackgroundFrame } from './videoBackgroundFrame';
+import { createMemoryCache } from '../../app/memoryCache.js';
 
-const accents = new Map();
+const accents = createMemoryCache({ maxEntries: 100 });
 
 function attachmentAccent(image) {
   const canvas = document.createElement('canvas');
@@ -45,7 +46,6 @@ export default function PostAttachmentBackground({ url, mimeType, onReady, onFai
       let accent = accents.get(source);
       if (!accent) {
         accent = attachmentAccent(event.currentTarget); accents.set(source, accent);
-        if (accents.size > 100) accents.delete(accents.keys().next().value);
       }
       container.current?.parentElement.style.setProperty('--loop-post-accent-rgb', accent);
     } catch {

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { performance } from 'node:perf_hooks';
 import { createLoopService } from '../server/loop.mjs';
+import { createLoopFlow } from '../server/loopFlow.mjs';
 
 const database=new DatabaseSync(':memory:');
 database.exec(`PRAGMA foreign_keys=ON;
@@ -60,16 +61,34 @@ try {
  const continued=await ok('/api/loop/flow?cursor='+page.page.nextCursor+'&limit=30');
  assert.ok(continued.posts.every(post=>snapshotIds.has(post.id)),'new posts do not disturb current round');
  assert.ok((await round('everyone',30)).some(post=>post.id===added),'new round sees new posts');
+ // Exercise both starting strategies deterministically, including freshness and
+ // privacy. Existing cursors retain their unchanged, no-repeat round protocol.
+ database.exec("UPDATE loop_posts SET created_at='2020-01-01T00:00:00Z'");
+ database.prepare('UPDATE loop_posts SET created_at=? WHERE id=?').run('2026-10-13T12:00:00Z',added);
+ const visibility=`NOT EXISTS(SELECT 1 FROM loop_blocks b WHERE (b.user_id=? AND b.target_id=p.user_id) OR (b.user_id=p.user_id AND b.target_id=?)) AND NOT EXISTS(SELECT 1 FROM loop_mutes m WHERE m.user_id=? AND m.target_id=p.user_id)`;
+ const recentFlow=createLoopFlow(database,visibility,{random:()=>0.1,now:()=>Date.parse('2026-10-13T14:00:00Z')});
+ const recentPage=recentFlow(1,new URLSearchParams({limit:'3'}));
+ assert.equal(recentPage.ids[0],added,'recent strategy picks a post within the last week');
+ assert.notEqual(recentFlow(1,new URLSearchParams({limit:'1',avoid:String(added)})).ids[0],added,'recent starts avoid immediate repeats');
+ const randomFlow=createLoopFlow(database,visibility,{random:()=>0.8,now:()=>Date.parse('2026-10-13T14:00:00Z')});
+ const randomStart=randomFlow(1,new URLSearchParams({limit:'3'}));
+ assert.equal(randomStart.ids.length,3);
+ assert.deepEqual(recentFlow(1,new URLSearchParams({limit:'3',cursor:recentPage.page.nextCursor})),recentFlow(1,new URLSearchParams({limit:'3',cursor:recentPage.page.nextCursor})),'recent starts preserve deterministic continuation');
+ const recentPlan=database.prepare('EXPLAIN QUERY PLAN SELECT id FROM loop_posts WHERE deleted_at IS NULL AND created_at>=? ORDER BY created_at DESC,id DESC LIMIT 24').all('2026-10-06');
+ assert.ok(recentPlan.some(row=>row.detail.includes('loop_flow_recent_idx')),'recent candidates use the recency index');
+ const startPlan=database.prepare('EXPLAIN QUERY PLAN SELECT id,flow_rank FROM loop_posts WHERE deleted_at IS NULL AND flow_rank>=? ORDER BY flow_rank,id LIMIT 1').all(42);
+ assert.ok(startPlan.some(row=>row.detail.includes('loop_flow_rank_idx'))&&!startPlan.some(row=>row.detail.includes('TEMP B-TREE')),'random starts seek the index without sorting');
  // Change permissions during an existing round, not just before its first page.
  await ok('/api/loop/users/2/block','POST');await ok('/api/loop/users/3/mute','POST');
  const filtered=await ok('/api/loop/flow?cursor='+page.page.nextCursor+'&limit=30');
  assert.ok(filtered.posts.every(post=>post.author.id===1));
  assert.deepEqual((await round()).map(post=>post.id),[1]);
+ assert.deepEqual(recentFlow(1,new URLSearchParams({limit:'30'})).ids,[1],'hidden recent posts fall back to visible older posts');
  assert.deepEqual((await round('everyone',7,1)).map(post=>post.id),[1],'single post still usable');
  database.exec("UPDATE loop_posts SET deleted_at='2026-10-10' WHERE id=1");
  assert.equal((await round()).length,0,'deleted posts disappear');
  for(const query of ['feed=bad','limit=NaN','limit=0','limit=1.5','limit=31','avoid=-1','avoid=9007199254740992','cursor=','cursor=bad','cursor='+ 'a'.repeat(513), 'cursor='+Buffer.from(JSON.stringify({v:1})).toString('base64url')]) assert.equal((await req('/api/loop/flow?'+query)).status,400,query);
  const plan=database.prepare('EXPLAIN QUERY PLAN SELECT id FROM loop_posts WHERE deleted_at IS NULL AND (flow_rank,id)>(?,?) ORDER BY flow_rank,id LIMIT 13').all(42,12);
  assert.ok(plan.some(row=>row.detail.includes('loop_flow_rank_idx')),'continuation uses random-rank index');
- console.log('PASS random Flow: migration/trigger, collision-safe no-repeat rounds, new-session variation, snapshot continuation/retry, viewer/feed isolation, Following/block/mute/delete rules, empty/single-post feeds, validated cursors, indexed paging, unchanged Home.');
+ console.log('PASS Flow: indexed recent/random starts, fresh/older fallback, migration/trigger, collision-safe no-repeat rounds, new-session variation, snapshot continuation/retry, viewer/feed isolation, Following/block/mute/delete rules, empty/single-post feeds, validated cursors, unchanged Home.');
 }finally{database.close();}

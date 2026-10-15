@@ -1,3 +1,5 @@
+import { createMemoryCache } from '../../app/memoryCache.js';
+
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
 }
@@ -43,8 +45,12 @@ function embedForUrl(value) {
   return `<a class="community-link-embed" href="${safeUrl}" target="_blank" rel="noreferrer noopener"><span class="community-link-embed-icon" aria-hidden="true">${isGlean ? '✦' : '↗'}</span><span class="community-link-embed-copy"><strong>${escapeHtml(title)}</strong><small>${escapeHtml(description)}</small><em>${escapeHtml(parsed.hostname)}${parsed.pathname !== '/' ? escapeHtml(parsed.pathname) : ''}</em></span></a>`;
 }
 
-const htmlCache = new Map();
-const HTML_CACHE_LIMIT = 500;
+const htmlCache = createMemoryCache({
+  maxEntries: 256,
+  maxBytes: 2 * 1024 * 1024,
+  sizeOf: (key, html) => (key.length + html.length) * 2,
+});
+if (import.meta.hot) import.meta.hot.dispose(() => htmlCache.dispose());
 
 export function markdownToHtml(value, options = {}) {
   const mentionKey = (options.mentionUsernames || []).join(',').toLowerCase();
@@ -54,7 +60,6 @@ export function markdownToHtml(value, options = {}) {
   if (cached) return cached;
   const html = renderMarkdownHtml(value, options);
   htmlCache.set(cacheKey, html);
-  if (htmlCache.size > HTML_CACHE_LIMIT) htmlCache.delete(htmlCache.keys().next().value);
   return html;
 }
 

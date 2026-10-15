@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { getPublicServers } from '../../app/dmApi';
 import { Avatar } from './DmPrimitives';
+import DisplayName from './DisplayName';
 import { ChevronLeftIcon } from './icons';
 
 export const DISCOVER_FILTERS = [
@@ -30,7 +31,7 @@ function PersonCard({ person, onAdd, onAccept, onDecline, onCancel, onMessage })
       <Avatar user={person} />
       <div className="dm-discover-card-copy">
         <div className="dm-discover-card-head">
-          <strong>{person.username}</strong>
+          <strong><DisplayName user={person} /></strong>
           {person.relation !== 'none' ? <span className={`dm-discover-chip is-${tone}`}>{chip}</span> : null}
         </div>
         {bio ? <small>{bio}</small> : null}

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { pendingImagePreviews, withLocalImagePreviews, retainLocalImagePreviews } from '../app/attachmentPreviews';
 import {
   assignMemberRole,
   createChannel,
@@ -144,6 +145,7 @@ function mergeLoadedServerMembers(server, current) {
 }
 
 const MEMBER_CHUNK_SIZE = 50;
+let pendingMessageSequence = -Date.now();
 
 function sortServerRoles(roles) {
   return [...roles].sort((left, right) => (
@@ -157,15 +159,11 @@ function messageId(value) {
 }
 
 function isPendingChannelMessage(item) {
-  return item?.status === 'sending' || messageId(item) < 0;
-}
-
-function mutedServerStorageKey(id) { return `glean.mutedServer.${Number(id)}`; }
-function isServerMuted(id) {
-  try { return window.localStorage.getItem(mutedServerStorageKey(id)) === '1'; } catch { return false; }
+  return item?.status === 'sending' || item?.status === 'failed' || messageId(item) < 0;
 }
 
 function matchesPendingChannelMessage(pending, incoming) {
+  if (pending?.independentSend) return false;
   if (!isPendingChannelMessage(pending) || !incoming) return false;
   if (Number(pending.author?.id) !== Number(incoming.author?.id)) return false;
   if (String(pending.body || '') !== String(incoming.body || '')) return false;
@@ -225,7 +223,7 @@ function upsertChannelMessage(current, incoming, { appendIfMissing = true } = {}
   const index = current.findIndex((item) => messageId(item) === id);
   if (index >= 0) {
     const next = current.slice();
-    next[index] = { ...incoming, status: 'sent' };
+    next[index] = { ...retainLocalImagePreviews(incoming, current[index]), status: 'sent' };
     return next;
   }
   if (id > 0) {
@@ -322,6 +320,8 @@ function reconcileServerSummaries(nextServers, currentServers, revisionsAtStart,
 export default function CommunityScreen({ account, goTo, onAccountUpdated, onSignedOut }) {
   const cachedServers = peekCachedServers();
   const [servers, setServers] = useState(() => cachedServers?.servers || []);
+  const serversRef = useRef(servers);
+  serversRef.current = servers;
   const [activeServer, setActiveServer] = useState(() => pickActiveServer(cachedServers?.servers || [], account));
   const [activeChannelId, setActiveChannelId] = useState(null);
   const [messages, setMessages] = useState([]);
@@ -453,12 +453,6 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
     setDirectory(activeServer?.members || []);
   }, [activeServer?.members, setDirectory]);
   useEffect(() => () => setDirectory([]), [setDirectory]);
-  useEffect(() => {
-    for (const server of servers) {
-      if (!server.muted) continue;
-      try { window.localStorage.setItem(mutedServerStorageKey(server.id), '1'); } catch { /* server state remains authoritative */ }
-    }
-  }, [servers]);
   const liveChannel = useMemo(
     () => voiceCall?.channel || channels.find((item) => Number(item.id) === Number(voiceLiveId)) || null,
     [channels, voiceCall, voiceLiveId],
@@ -950,7 +944,7 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
       }
       if ((eventName === 'unread' && payload.kind === 'channel') || (eventName === 'channel-message' && payload.action === 'created')) {
         const eventServerId = Number(payload.serverId);
-        const muted = isServerMuted(eventServerId);
+        const muted = Boolean(serversRef.current.find(server => Number(server.id) === eventServerId)?.muted);
         if (Number.isInteger(eventServerId) && eventServerId > 0) {
           serverUnreadRevisionsRef.current.set(eventServerId, serverUnreadRevision(serverUnreadRevisionsRef.current, eventServerId) + 1);
         }
@@ -1006,22 +1000,14 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
           refreshServerSummaries().catch(() => {});
         }
       }
-      if (eventName === 'official-server-visibility') {
-        const affectedServerId = Number(payload.serverId);
-        if (payload.hidden === true) {
-          if (Number(activeServerIdRef.current) === affectedServerId) {
-            leaveVoiceRef.current?.();
-            setActiveServer(null);
-            setActiveChannelId(null);
-            setMobileChatOpen(false);
-            setShowSettings(false);
-            setNotice('The official Glean server is currently hidden.');
-          }
-          setServers((current) => current.filter((item) => Number(item.id) !== affectedServerId));
-        } else {
-          refreshServerSummaries().catch(() => {});
+      if (eventName === 'notification-settings') {
+        if (payload.serverId) {
+          const patch = item => Number(item.id) === Number(payload.serverId) ? { ...item, muted: payload.muted, unread: false, unreadCount: 0, mentionCount: 0 } : item;
+          serversRef.current = serversRef.current.map(patch);
+          setServers(current => current.map(patch));
+          setActiveServer(current => current ? patch(current) : current);
         }
-        return;
+        refreshServerSummaries().catch(() => {});
       }
       if (eventName === 'server-membership') {
         const affectedServerId = Number(payload.serverId);
@@ -1674,14 +1660,15 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
     }
     const totalSize = attachments.reduce((sum, file) => sum + Number(file.size || 0), 0);
     if (totalSize > 250 * 1024 * 1024 || attachments.some((file) => Number(file.size || 0) > 100 * 1024 * 1024)) {
-      setNotice('Each attachment and the total message can be up to 2 GB.');
+      setNotice('Each attachment can be up to 100 MB, with 250 MB total per message.');
       return;
     }
     sendingRef.current = true;
     setIsSending(true);
-    const pendingId = -Date.now();
+    const pendingId = --pendingMessageSequence;
     const pendingMessage = {
       id: pendingId,
+      independentSend: true,
       body: draft,
       createdAt: new Date().toISOString(),
       editedAt: null,
@@ -1692,7 +1679,7 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
         body: String(replyTo.body || ''),
       } : null,
       author: { id: Number(account.id), username: account.username, avatarUrl: account.avatarUrl || null, nameStyle: account.nameStyle || null },
-      attachments: [],
+      attachments: pendingImagePreviews(attachments),
       reactions: [],
       poll: pollPayload ? {
         question: pollPayload.question,
@@ -1702,6 +1689,7 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
         voterCount: 0,
       } : null,
       status: 'sending',
+      sendLabel: attachments.length ? 'Preparing attachments…' : null,
     };
     setMessages((current) => [...current, pendingMessage]);
     const messageDraft = draft;
@@ -1712,25 +1700,33 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
     setAttachments([]);
     setPoll?.(null);
     setReplyTo(null);
-    try {
-      const { message, moderationAction, channel: updatedChannel } = await sendChannelMessage(channel.id, messageDraft, files, replyId, sentPoll);
-      setMessages((current) => message
-        ? upsertChannelMessage(current.filter((item) => messageId(item) !== pendingId), message)
-        : current.filter((item) => messageId(item) !== pendingId));
-      if (updatedChannel) applyChannelPatch(updatedChannel);
-      if (moderationAction === 'flag') setNotice('Your message was sent and flagged for moderator review.');
-      else if (moderationAction === 'warn') setNotice('Your message was sent. Please keep server rules in mind.');
-    } catch (error) {
-      setMessages((current) => current.filter((item) => messageId(item) !== pendingId));
-      setDraft(messageDraft);
-      setAttachments(files);
-      if (sentPoll) setPoll?.(sentPoll);
-      setNotice(error.message);
-    }
-    finally {
-      sendingRef.current = false;
-      setIsSending(false);
-    }
+    sendingRef.current = false;
+    setIsSending(false);
+    const send = async () => {
+      if (pendingMessage.inFlight) return;
+      pendingMessage.inFlight = true;
+      const isCurrent = () => Number(channelRef.current?.id) === Number(channel.id);
+      if (isCurrent()) setMessages(current => current.map(item => item.id === pendingId ? { ...item, status: 'sending' } : item));
+      try {
+        const onProgress = percent => setMessages(current => current.map(item => item.id === pendingId ? { ...item, sendLabel: percent === 100 ? 'Upload complete · Sending…' : percent == null ? 'Uploading…' : `Uploading ${percent}%` } : item));
+        const { message, moderationAction, channel: updatedChannel } = await sendChannelMessage(channel.id, messageDraft, files, replyId, sentPoll, onProgress);
+        if (!isCurrent()) return;
+        setMessages((current) => message
+          ? upsertChannelMessage(current.filter((item) => item.id !== pendingId), withLocalImagePreviews(message, files))
+          : current.filter((item) => item.id !== pendingId));
+        if (updatedChannel) applyChannelPatch(updatedChannel);
+        if (moderationAction === 'flag') setNotice('Your message was sent and flagged for moderator review.');
+        else if (moderationAction === 'warn') setNotice('Your message was sent. Please keep server rules in mind.');
+      } catch (error) {
+        if (isCurrent()) {
+          setMessages(current => current.map(item => item.id === pendingId ? { ...item, status: 'failed', retrySend: send } : item));
+          setNotice(error.message);
+        }
+      } finally {
+        pendingMessage.inFlight = false;
+      }
+    };
+    void send();
   };
 
   const beginEdit = (message) => {
@@ -1756,13 +1752,12 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
   const submitEdit = async (event, message) => {
     event.preventDefault();
     if (!channel || (!editDraft.trim() && !message.attachments?.length)) return;
-    try {
-      const { message: updated, moderationAction } = await editChannelMessage(channel.id, message.id, editDraft);
-      setMessages((current) => upsertChannelMessage(current, updated));
-      if (moderationAction === 'flag') setNotice('Your edit was sent and flagged for moderator review.');
-      else if (moderationAction === 'warn') setNotice('Your edit was sent. Please keep server rules in mind.');
-      cancelEdit();
-    } catch (error) { setNotice(error.message); }
+    const { message: updated, moderationAction } = await editChannelMessage(channel.id, message.id, editDraft);
+    if (Number(channelRef.current?.id) !== Number(channel.id)) return;
+    setMessages((current) => upsertChannelMessage(current, updated));
+    if (moderationAction === 'flag') setNotice('Your edit was sent and flagged for moderator review.');
+    else if (moderationAction === 'warn') setNotice('Your edit was sent. Please keep server rules in mind.');
+    setEditingMessageId(current => Number(current) === Number(message.id) ? null : current);
   };
 
   const toggleReaction = async (message, emoji) => {
@@ -1801,10 +1796,6 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
   const muteServer = async (server, muted) => {
     try {
       await setServerMuted(server.id, muted);
-      try {
-        if (muted) window.localStorage.setItem(mutedServerStorageKey(server.id), '1');
-        else window.localStorage.removeItem(mutedServerStorageKey(server.id));
-      } catch { /* server preference remains authoritative */ }
       setServers((current) => current.map((item) => Number(item.id) === Number(server.id)
         ? { ...item, muted, unread: false, unreadCount: 0, mentionCount: 0 }
         : item));
@@ -1828,7 +1819,7 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
   );
 
   return (
-    <main className={`community-app community-workspace${mobileChatOpen ? ' mobile-chat-open' : ''}${voiceSessionActive ? ' has-voice' : ''}${membersVisible ? ' members-visible' : ' members-hidden'}`} aria-label="Glean servers">
+    <main className={`community-app community-workspace${mobileChatOpen ? ' mobile-chat-open' : ''}${voiceSessionActive ? ' has-voice' : ''}${channel?.voice && voiceSessionActive ? ' voice-room-visible' : ''}${membersVisible ? ' members-visible' : ' members-hidden'}`} aria-label="Glean servers">
       <AppRail
         account={account}
         servers={servers}
@@ -1859,6 +1850,7 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
             <div className="community-server-menu" role="menu">
               {canManageInvites ? <button type="button" role="menuitem" onClick={() => openSettings('invites')}><UserIcon size={16} /> Invite people</button> : null}
               <button type="button" role="menuitem" onClick={() => openSettings()}><SettingsIcon /> Server settings</button>
+              {!inspecting ? <button type="button" role="menuitem" onClick={() => { setShowServerMenu(false); void muteServer(activeServer, !serversRef.current.find(item => Number(item.id) === Number(activeServer.id))?.muted); }}>{servers.find(item => Number(item.id) === Number(activeServer.id))?.muted ? 'Unmute notifications' : 'Mute notifications'}</button> : null}
               <div className="community-server-menu-sep" />
               {isOwner ? <button type="button" className="is-danger" role="menuitem" onClick={removeCurrentServer}><TrashIcon /> Delete server</button> : inspecting ? null : <button type="button" className="is-danger" role="menuitem" onClick={leaveCurrentServer}><LeaveIcon /> Leave server</button>}
             </div>
@@ -1927,10 +1919,19 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
           {voiceSessionActive ? (
             <VoiceDock
               channel={liveChannel}
+              connecting={!voiceRoomOccupants.some(user => Number(user.id) === Number(account.id))}
               muted={voiceFlags.muted}
               deafened={voiceFlags.deafened}
               camera={voiceFlags.camera}
               sharing={voiceFlags.sharing}
+              onReturn={() => {
+                const server = servers.find(item => Number(item.id) === Number(voiceCall.serverId));
+                try { localStorage.setItem(`glean.lastChannel.${account.id}.${voiceCall.serverId}`, String(liveChannel.id)); } catch { /* Storage can be unavailable. */ }
+                if (server && Number(activeServer?.id) !== Number(server.id)) selectServer(server);
+                setActiveChannelId(liveChannel.id);
+                setMobileChatOpen(true);
+                setMembersVisible(false);
+              }}
               onMute={() => voiceApiRef.current?.toggleMute()}
               onDeafen={() => voiceApiRef.current?.toggleDeafen()}
               onCamera={() => voiceApiRef.current?.toggleCamera()}
@@ -1938,7 +1939,7 @@ export default function CommunityScreen({ account, goTo, onAccountUpdated, onSig
               onDisconnect={() => voiceApiRef.current?.hangUp() || leaveVoice()}
             />
           ) : null}
-          <AccountChrome account={account} onAccountUpdated={onAccountUpdated} onSignedOut={onSignedOut} />
+          <AccountChrome account={account} onAccountUpdated={onAccountUpdated} onSignedOut={onSignedOut} goTo={goTo} />
         </div>
       </aside>
 

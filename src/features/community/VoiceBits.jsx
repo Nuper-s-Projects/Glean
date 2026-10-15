@@ -6,10 +6,10 @@ import { useUserPopout } from '../dm/userPopout';
 export function VoiceBadges({ user }) {
   return (
     <span className="community-voice-badges">
-      {user?.muted || user?.deafened ? <MicOffIcon /> : null}
-      {user?.deafened ? <HeadphonesIcon /> : null}
-      {user?.camera ? <VideoIcon /> : null}
-      {user?.sharing ? <ScreenIcon /> : null}
+      {user?.muted || user?.deafened ? <span title="Microphone muted" aria-label="Microphone muted"><MicOffIcon /></span> : null}
+      {user?.deafened ? <span title="Sound off" aria-label="Sound off"><HeadphonesIcon /></span> : null}
+      {user?.camera ? <span title="Camera on" aria-label="Camera on"><VideoIcon /></span> : null}
+      {user?.sharing ? <span title="Sharing screen" aria-label="Sharing screen"><ScreenIcon /></span> : null}
     </span>
   );
 }

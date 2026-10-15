@@ -53,7 +53,7 @@ export function mainThemeBackdropStyle(theme, preview = false) {
   }
   if (theme?.kind === 'image' && typeof theme.imageUrl === 'string' && (MAIN_THEME_IMAGE_URL.test(theme.imageUrl) || (preview && /^blob:[^\s"'\\]+$/.test(theme.imageUrl)))) {
     const { contrast, saturation, blur } = profileImageAdjustments(theme);
-    return { '--glean-theme-background': `url("${theme.imageUrl}")`, '--glean-theme-filter': `contrast(${contrast}%) saturate(${saturation}%) blur(${blur}px)`, '--glean-theme-bleed': `${blur * 2}px` };
+    return { '--glean-theme-background': `url("${theme.imageUrl}")`, '--glean-theme-filter': `contrast(${contrast}%) saturate(${saturation}%) blur(${blur}px)`, '--glean-theme-contrast': `${contrast}%`, '--glean-theme-saturation': `${saturation}%`, '--glean-theme-bleed': `${blur * 2}px` };
   }
   return {};
 }
