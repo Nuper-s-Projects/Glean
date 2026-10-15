@@ -52,3 +52,7 @@ SQLite uses foreign keys, WAL mode, a busy timeout, defensive mode, and indexes 
 - `src/screens/` — Glean screens.
 - `src/styles/global.css` — shared UI styles.
 - `scripts/server-smoke.mjs` — isolated auth/friends/E2EE server smoke test.
+
+## License
+
+Glean is distributed under the MIT License. You may use, edit, share, and distribute it, subject to the terms in [LICENSE](LICENSE).
