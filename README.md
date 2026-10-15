@@ -1,5 +1,10 @@
 # Glean
 
+> [!WARNING]
+> I made Glean open source for users who want to host it themselves. I strongly recommend that you **do not host or use Glean at school, work, or on any network where public chatrooms or conversations are not allowed or would be considered unprofessional or against policy.**
+>
+> You are responsible for how and where you host and use Glean. **I am not liable for any trouble, disciplinary action, network violations, or other consequences that may result from hosting or using it.**
+
 Glean is a React + Vite messaging app backed by Node.js and SQLite. This rebuild keeps the original Glean UX while replacing the prototype server path with versioned APIs, WebSocket real-time delivery, stronger request security, paginated DMs, and client-side encrypted private messages.
 
 ## Run
@@ -19,20 +24,6 @@ npm run check
 npm test
 npm start
 ```
-
-## Security model
-
-Passwords are salted and hashed with Node `scrypt`. Sessions use random server-side tokens stored as SHA-256 hashes; the browser receives an `HttpOnly`, `SameSite=Lax` cookie (`Secure` in production). State-changing requests are protected by same-origin checks and endpoint-class rate limits.
-
-Private DMs use browser-side end-to-end encryption. Each browser identity creates a P-256 ECDH key. The private key is imported as non-extractable and stored in IndexedDB. Message and attachment keys are derived with ECDH + HKDF-SHA-256 and encrypted with AES-256-GCM using fresh random salts and IVs. The server stores ciphertext, public keys, delivery metadata, and encrypted attachment bytes; it does not receive new DM plaintext. Attachment filenames and MIME types are inside the encrypted message payload; the server can still observe unavoidable transport metadata such as timing and encrypted byte sizes.
-
-Existing plaintext rows from the old prototype remain readable for migration compatibility and are marked as legacy by the API. New DM writes require E2EE. Contact profiles expose a safety-key fingerprint and users are warned when an identity key changes.
-
-Community/server channels are intentionally **not** end-to-end encrypted because server-side moderation, roles, edits, deletion, and reactions depend on server-readable channel content. Do not describe community channels as E2EE.
-
-Current E2EE limitation: Glean uses one active encryption identity per account. It is strong device-bound E2EE, but it is not a Signal-style multi-device Double Ratchet implementation. Replacing a device identity can make older encrypted history unavailable on the new device. If multi-device forward secrecy/post-compromise security is required, the next upgrade should use a mature protocol such as Signal Protocol rather than extending this custom envelope design.
-
-Account settings can rotate the active DM key after verifying the account password. The browser generates the private key and a private sync code locally; only the public key and code-encrypted key envelope are sent to the server. The web settings UI no longer exposes cross-device key linking. The prior encrypted vault is archived and message rows are left unchanged. A reset enables new encrypted messages, but does not recover old messages when their original private key is missing.
 
 ## Server and routing
 
